@@ -37,6 +37,16 @@ export interface PlanSummary {
 }
 
 const MAX_LCS_CELLS = 250_000;
+const DIFF_CACHE = new Map<string, DiffResult>();
+const MAX_DIFF_CACHE_ENTRIES = 512;
+
+function cacheSetBounded<V>(cache: Map<string, V>, key: string, value: V, maxEntries: number): void {
+  if (cache.size >= maxEntries) {
+    const oldest = cache.keys().next().value;
+    if (oldest !== undefined) cache.delete(oldest);
+  }
+  cache.set(key, value);
+}
 
 function splitLines(text: string): string[] {
   if (!text) return [];
@@ -97,6 +107,12 @@ function lcsOps(oldBody: string[], newBody: string[], oldOffset: number, newOffs
 
 /** Build unified diff hunks and +/- line counts from before/after text. */
 export function buildUnifiedDiffHunks(oldText: string, newText: string, contextLines = 3): DiffResult {
+  const canCache = contextLines === 3 && oldText.length + newText.length <= 200_000;
+  const cacheKey = canCache ? `${oldText}\0${newText}` : '';
+  if (canCache) {
+    const cached = DIFF_CACHE.get(cacheKey);
+    if (cached) return cached;
+  }
   const oldLines = splitLines(oldText);
   const newLines = splitLines(newText);
 
@@ -160,7 +176,9 @@ export function buildUnifiedDiffHunks(oldText: string, newText: string, contextL
     };
   });
 
-  return { hunks, added, removed };
+  const result: DiffResult = { hunks, added, removed };
+  if (canCache) cacheSetBounded(DIFF_CACHE, cacheKey, result, MAX_DIFF_CACHE_ENTRIES);
+  return result;
 }
 
 /** Prefer a workspace-relative path label when inside cwd. */
@@ -587,9 +605,17 @@ export function isRunnableCodeLang(lang?: string): boolean {
   return !!normalized && RUNNABLE_LANGS.has(normalized);
 }
 
+const MD_SEGMENT_CACHE = new Map<string, MarkdownSegment[]>();
+const MAX_MD_CACHE_ENTRIES = 256;
+
 /** Split Markdown into prose chunks and fenced code blocks for per-block copy and run controls. */
 export function splitMarkdownSegments(markdown: string): MarkdownSegment[] {
   if (!markdown) return [];
+  const canCache = markdown.length <= 50_000;
+  if (canCache) {
+    const cached = MD_SEGMENT_CACHE.get(markdown);
+    if (cached) return cached;
+  }
   const lines = markdown.replace(/\r\n?/g, '\n').split('\n');
   const segments: MarkdownSegment[] = [];
   let proseLines: string[] = [];
@@ -658,6 +684,7 @@ export function splitMarkdownSegments(markdown: string): MarkdownSegment[] {
   } else {
     flushProse();
   }
+  if (canCache) cacheSetBounded(MD_SEGMENT_CACHE, markdown, segments, MAX_MD_CACHE_ENTRIES);
   return segments;
 }
 

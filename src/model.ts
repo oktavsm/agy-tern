@@ -77,10 +77,26 @@ export class Conversation {
   private plan?: AgentPlan;
   private activeThought?: ThoughtEntry;
   private sequence = 0;
+  private _revision = 0;
+  private readonly revisions = new WeakMap<TranscriptEntry, number>();
+
+  get revision(): number {
+    return this._revision;
+  }
+
+  revisionOf(entry: TranscriptEntry): number {
+    return this.revisions.get(entry) ?? 0;
+  }
+
+  private touch(entry?: TranscriptEntry): void {
+    this._revision++;
+    if (entry) this.revisions.set(entry, this._revision);
+  }
 
   private closeThought(now = Date.now()): void {
     if (this.activeThought && this.activeThought.endedAt === undefined) {
       this.activeThought.endedAt = now;
+      this.touch(this.activeThought);
     }
     this.activeThought = undefined;
   }
@@ -97,12 +113,25 @@ export class Conversation {
     this.closeThought();
     this.messages.clear();
     this.plan = undefined;
-    this.entries.push({ type: 'message', id: `entry-${++this.sequence}`, role: 'user', text, ...(time ? { time } : {}) });
+    const entry: ChatMessage = { type: 'message', id: `entry-${++this.sequence}`, role: 'user', text, ...(time ? { time } : {}) };
+    this.entries.push(entry);
+    this.touch(entry);
   }
 
-  notice(text: string, error = false, retryable = false): void {
+  notice(text: string, error = false, retryable = false): NoticeEntry {
     this.closeThought();
-    this.entries.push({ type: 'notice', id: `entry-${++this.sequence}`, text, error, ...(retryable ? { retryable } : {}) });
+    const entry: NoticeEntry = { type: 'notice', id: `entry-${++this.sequence}`, text, error, ...(retryable ? { retryable } : {}) };
+    this.entries.push(entry);
+    this.touch(entry);
+    return entry;
+  }
+
+  removeNotice(id: string): boolean {
+    const idx = this.entries.findIndex(entry => entry.type === 'notice' && entry.id === id);
+    if (idx < 0) return false;
+    this.entries.splice(idx, 1);
+    this.touch();
+    return true;
   }
 
   getTool(toolCallId: string): ToolStep | undefined {
@@ -132,6 +161,7 @@ export class Conversation {
       (step.call.status === 'completed' || step.call.status === 'failed')) {
       step.endedAt = now;
     }
+    this.touch(step);
     return step;
   }
 
@@ -152,6 +182,7 @@ export class Conversation {
           this.entries.push(this.activeThought);
         }
         this.activeThought.text += text;
+        this.touch(this.activeThought);
         break;
       }
       case 'agent_message_chunk':
@@ -174,6 +205,7 @@ export class Conversation {
         } else {
           message.text += text;
         }
+        this.touch(message);
         break;
       }
       case 'tool_call':
@@ -188,6 +220,7 @@ export class Conversation {
           this.entries.push(this.plan);
         }
         this.plan.entries = update.entries;
+        this.touch(this.plan);
         break;
       case 'notice':
         this.notice(update.description ? `${update.title}: ${update.description}` : update.title, update.severity === 'error');
@@ -211,6 +244,7 @@ export class Conversation {
           entry.text = update.summary.map(contentText).filter(Boolean).join('\n');
         }
         if (update.error !== undefined) entry.error = update.error ?? undefined;
+        this.touch(entry);
         break;
       }
       case 'compaction_summary_chunk': {
@@ -229,6 +263,7 @@ export class Conversation {
         }
         const chunk = contentText(update.content);
         if (chunk) entry.text += chunk;
+        this.touch(entry);
         break;
       }
     }

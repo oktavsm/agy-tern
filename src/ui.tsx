@@ -6,7 +6,7 @@ import type { AuthMethodTerminal, SessionConfigOption, SessionInfo } from '@agen
 import { connectAgent } from './agent';
 import type { AgentAuthentication, AgentMetadata, AgentOptions, AgentSession, PermissionPrompt, ResourceAttachment } from './contracts';
 import { draftKey, editDraft, isCursorOnFirstRow, isCursorOnLastRow, type Draft } from './draft';
-import { Conversation } from './model';
+import { Conversation, type TranscriptEntry } from './model';
 import { commandCatalog, commandCategory, commandQuery, configLabel, configValues, filterCommands, modelOption, resolveCommand, type Command } from './commands';
 import {
   addMcpServer,
@@ -64,6 +64,7 @@ import {
   summarizeQuotaRows,
   summarizeToolCall,
   thinkingOption,
+  type SessionDiffItem,
 } from './ui-format';
 import {
   filterAgentsList,
@@ -208,6 +209,18 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
   let toastMessage: { text: string; sub?: string } | undefined;
   let toastTimer: NodeJS.Timeout | undefined;
   let liveTickTimer: NodeJS.Timeout | undefined;
+  let renderTimer: NodeJS.Timeout | undefined;
+  let lastRenderAt = 0;
+  let replaySettleTimer: NodeJS.Timeout | undefined;
+  let replayingHistory = false;
+  let replayPlaceholderId: string | undefined;
+  let replayCachedFallback: Conversation | undefined;
+  let replayNoticeMode: 'load' | 'resume' = 'load';
+  let historyVisibleCount = 80;
+  let cachedDiffsConversation: Conversation | undefined;
+  let cachedDiffsRev = -1;
+  let cachedSessionDiffs: SessionDiffItem[] = [];
+  const entryRenderCache = new WeakMap<TranscriptEntry, { key: string; node: JSX.Element }>();
   let turnStartedAt: number | undefined;
   const queuedPrompts: QueuedPrompt[] = [];
   let queueSequence = 0;
@@ -342,10 +355,74 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     outcome = { kind: 'quit' };
     if (quitting) return;
     quitting = true;
+    clearTimeout(renderTimer);
+    renderTimer = undefined;
+    clearTimeout(replaySettleTimer);
+    replaySettleTimer = undefined;
     syncLiveTick(false);
     clearPermissions();
     controller.abort();
     stopped.resolve(null);
+  }
+
+  function clearReplayState(): void {
+    clearTimeout(replaySettleTimer);
+    replaySettleTimer = undefined;
+    replayingHistory = false;
+    replayPlaceholderId = undefined;
+    replayCachedFallback = undefined;
+  }
+
+  function finishHistoryReplay(): void {
+    if (quitting) return;
+    clearTimeout(replaySettleTimer);
+    replaySettleTimer = undefined;
+    const placeholderId = replayPlaceholderId;
+    const fallback = replayCachedFallback;
+    const mode = replayNoticeMode;
+    replayingHistory = false;
+    replayPlaceholderId = undefined;
+    replayCachedFallback = undefined;
+    if (!conversation.entries.some(entry => entry.type !== 'notice')) {
+      if (placeholderId) conversation.removeNotice(placeholderId);
+      if (fallback) conversation = fallback;
+      else conversation.notice(mode === 'resume'
+        ? 'Resumed the active ACP context without replaying earlier history. Only new messages appear here.'
+        : 'agy restored the session context but did not replay earlier messages. Only new messages will appear here.');
+    }
+    if (!busy && !sessionOperation && !disconnected && !agentConnecting) phase = 'Ready';
+    render();
+    if (!panel) surface?.scroll('main.conversation', 'end');
+  }
+
+  function beginHistoryReplay(mode: 'load' | 'resume', fallback?: Conversation): void {
+    clearReplayState();
+    if (mode !== 'load') return;
+    replayingHistory = true;
+    replayNoticeMode = mode;
+    replayCachedFallback = fallback;
+  }
+
+  function markReplayActivity(): void {
+    if (!replayingHistory || quitting) return;
+    clearTimeout(replaySettleTimer);
+    replaySettleTimer = setTimeout(finishHistoryReplay, 350);
+  }
+
+  function scheduleRender(): void {
+    if (quitting || !surface || surface.closed) return;
+    const now = Date.now();
+    if (!surface.blocked && now - lastRenderAt >= 20 && !renderTimer) {
+      render();
+      return;
+    }
+    if (!renderTimer) {
+      const waitMs = Math.max(8, 20 - (now - lastRenderAt));
+      renderTimer = setTimeout(() => {
+        renderTimer = undefined;
+        if (!quitting) render();
+      }, waitMs);
+    }
   }
 
   function terminate(): void {
@@ -787,15 +864,28 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     if (id === activeSessionId) { closePanel(); return; }
     runSessionAction(mode === 'resume' ? 'Resuming conversation' : 'Opening conversation', async connected => {
       const cached = conversations.get(id);
-      if (mode === 'resume' && connected.resumeSession) await connected.resumeSession(id);
-      else await connected.loadSession(id);
-      if (!conversation.entries.some(entry => entry.type !== 'notice')) {
-        if (cached) conversation = cached;
-        else conversation.notice(mode === 'resume'
-          ? 'Resumed the active ACP context without replaying earlier history. Only new messages appear here.'
-          : 'agy restored the session context but did not replay earlier messages. Only new messages will appear here.');
+      beginHistoryReplay(mode, cached);
+      try {
+        if (mode === 'resume' && connected.resumeSession) await connected.resumeSession(id);
+        else await connected.loadSession(id);
+      } catch (err) {
+        clearReplayState();
+        throw err;
       }
-      phase = 'Ready';
+      const hasHistory = conversation.entries.some(entry => entry.type !== 'notice');
+      if (mode === 'load') {
+        if (!hasHistory && !cached) {
+          replayPlaceholderId = conversation.notice('Loading session history...').id;
+        }
+        phase = hasHistory ? 'Syncing history' : 'Loading history';
+        markReplayActivity();
+      } else if (!hasHistory) {
+        if (cached) conversation = cached;
+        else conversation.notice('Resumed the active ACP context without replaying earlier history. Only new messages appear here.');
+        phase = 'Ready';
+      } else {
+        phase = 'Ready';
+      }
       closePanel();
       surface?.scroll('main.conversation', 'end');
     });
@@ -814,6 +904,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
 
   function newConversation(): void {
     runSessionAction('Starting conversation', async connected => {
+      clearReplayState();
       await connected.newSession();
       phase = 'Ready';
       closePanel();
@@ -1895,6 +1986,11 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         jump: () => {
           if (!highlighted) return;
           const targetEntry = highlighted.entry;
+          const idx = conversation.entries.indexOf(targetEntry);
+          if (idx >= 0) {
+            const needed = conversation.entries.length - idx;
+            if (needed > historyVisibleCount) historyVisibleCount = needed + 20;
+          }
           if (targetEntry.type === 'thought') thoughtFoldOverrides.set(targetEntry.id, true);
           else if (targetEntry.type === 'tool') toolFoldOverrides.set(targetEntry.id, false);
           closePanel();
@@ -2485,7 +2581,12 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
   }
 
   function render(): void {
+    if (renderTimer) {
+      clearTimeout(renderTimer);
+      renderTimer = undefined;
+    }
     if (!surface || surface.closed || quitting) return;
+    lastRenderAt = Date.now();
     const permission = permissions[0];
     const approvalCall = permission && (conversation.getTool(permission.request.toolCall.toolCallId)?.call ?? permission.request.toolCall);
     const approvalSummary = approvalCall ? summarizeToolCall(approvalCall, options.cwd) : undefined;
@@ -2509,13 +2610,19 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     const activePlan = conversation.currentPlan;
     const planSummary = formatPlanSummary(activePlan);
     const contextUsage = formatContextUsage(metadata.usage);
-    const sessionDiffs = collectSessionDiffs(conversation.entries, options.cwd);
+    if (cachedDiffsConversation !== conversation || cachedDiffsRev !== conversation.revision) {
+      cachedDiffsConversation = conversation;
+      cachedDiffsRev = conversation.revision;
+      cachedSessionDiffs = collectSessionDiffs(conversation.entries, options.cwd);
+    }
+    const sessionDiffs = cachedSessionDiffs;
     const loginAvailable = !!loginMethod() && !terminalLoginProblem(loginMethod()!) && !!agent && !disconnected && authentication.logout;
     const agentStatus: Tone = disconnected || phase.includes('failed') ? 'error' : busy ? 'warning' : agent ? 'success' : 'muted';
+    const renderNow = lastRenderAt || Date.now();
     const entryCallbacks: EntryCallbacks = {
       cwd: options.cwd,
       working: busy,
-      now: Date.now(),
+      now: renderNow,
       agentStatus,
       prefs: userPrefs,
       thoughtFoldOverrides,
@@ -2591,17 +2698,48 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       (showHud ? 2 : 0) +
       (viewportCols < 80 ? 10 : 8);
     const scrollMaxH = `${Math.max(10, viewportRows - dockLines)}lines` as const;
+    const allEntries = conversation.entries;
+    const totalEntries = allEntries.length;
+    const hiddenCount = Math.max(0, totalEntries - historyVisibleCount);
+    const visibleEntries = hiddenCount > 0 ? allEntries.slice(hiddenCount) : allEntries;
     let turnCounter = 0;
+    for (let i = 0; i < hiddenCount; i++) {
+      const earlier = allEntries[i]!;
+      if (earlier.type === 'message' && earlier.role === 'user') turnCounter++;
+    }
+    const renderEntryNode = (entry: TranscriptEntry, idxInVisible: number): JSX.Element => {
+      const globalIdx = hiddenCount + idxInVisible;
+      const prev = globalIdx > 0 ? allEntries[globalIdx - 1] : undefined;
+      const continued = entry.type === 'message' && prev?.type === 'message' && prev.role === entry.role;
+      const streaming = busy && globalIdx === totalEntries - 1 && entry.type === 'message' && entry.role === 'agent';
+      const turnNumber = entry.type === 'message' && entry.role === 'user' ? ++turnCounter : undefined;
+      const isRunning = streaming ||
+        (entry.type === 'thought' && entry.endedAt === undefined && busy) ||
+        (entry.type === 'tool' && (entry.call.status === 'in_progress' || entry.call.status === 'pending')) ||
+        (entry.type === 'compaction' && (entry.status === 'in_progress' || entry.status === 'queued'));
+      const foldKey = entry.type === 'thought' || entry.type === 'compaction'
+        ? String(thoughtFoldOverrides.get(entry.id) ?? '')
+        : entry.type === 'tool' ? String(toolFoldOverrides.get(entry.id) ?? '') : '';
+      const errorKey = entry.type === 'notice' && entry.error
+        ? `${Number(entryCallbacks.canRetry)}${Number(entryCallbacks.canReconnect)}${Number(entryCallbacks.canSwitchAccount)}` : '';
+      const sig = `${conversation.revisionOf(entry)}|${continued ? 1 : 0}|${streaming ? 1 : 0}|${turnNumber ?? ''}|${isRunning ? Math.floor(renderNow / 1000) : 0}|${foldKey}|${errorKey}|${agentStatus}|${userPrefs.diffMode}|${userPrefs.toolDisplay}|${Number(userPrefs.thoughtExpanded)}|${userPrefs.transcriptDensity}|${Number(userPrefs.showTimestamps)}`;
+      const cached = entryRenderCache.get(entry);
+      if (cached && cached.key === sig) return cached.node;
+      const node = <Entry key={entry.id} entry={entry} continued={continued} streaming={streaming} turnNumber={turnNumber} callbacks={entryCallbacks} />;
+      entryRenderCache.set(entry, { key: sig, node });
+      return node;
+    };
     surface.render({
       main: <col>
         <scroll key="conversation" stick="end" max={{ h: scrollMaxH }} gap="md" aria="Conversation">
-          {conversation.entries.length ? conversation.entries.map((entry, idx) => {
-            const prev = idx > 0 ? conversation.entries[idx - 1] : undefined;
-            const continued = entry.type === 'message' && prev?.type === 'message' && prev.role === entry.role;
-            const streaming = busy && idx === conversation.entries.length - 1 && entry.type === 'message' && entry.role === 'agent';
-            const turnNumber = entry.type === 'message' && entry.role === 'user' ? ++turnCounter : undefined;
-            return <Entry key={entry.id} entry={entry} continued={continued} streaming={streaming} turnNumber={turnNumber} callbacks={entryCallbacks} />;
-          }) :
+          {hiddenCount > 0 && <row key="older-history" justify="between" align="center" gap="sm" wrap>
+            <text><span s="muted">{hiddenCount} earlier {hiddenCount === 1 ? 'entry' : 'entries'} hidden for speed</span></text>
+            <row gap="xs">
+              <button size="sm" variant="quiet" onClick={() => { historyVisibleCount += 120; render(); }}>Load 120 more</button>
+              <button size="sm" variant="quiet" onClick={() => { historyVisibleCount = totalEntries; render(); }}>Show all ({totalEntries})</button>
+            </row>
+          </row>}
+          {visibleEntries.length ? visibleEntries.map(renderEntryNode) :
             <col key="empty-wrap" gap="md" align="center">
               <empty icon="tern" title={agent ? 'Ask Antigravity about this project' : disconnected ? 'Antigravity is unavailable' : 'Opening an ACP session'}
                 text={agent ? 'Type / for commands or @ to attach files and images. Thoughts, diffs, and one-time approvals appear here.' :
@@ -2913,6 +3051,8 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
             expandedThoughts.clear();
             thoughtFoldOverrides.clear();
             toolFoldOverrides.clear();
+            historyVisibleCount = 80;
+            cachedDiffsConversation = undefined;
           }
           activeSessionId = id;
           clearPermissions();
@@ -2930,7 +3070,15 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
           if (!busy || update.sessionUpdate !== 'user_message_chunk') {
             conversation.update(update, Date.now(), busy ? clockTime() : undefined);
           }
-          if (userPrefs.autoPreviewMedia && !panel && !permissions.length) {
+          if (replayingHistory && update.sessionUpdate !== 'session_info_update' &&
+            update.sessionUpdate !== 'available_commands_update' && update.sessionUpdate !== 'usage_update') {
+            if (replayPlaceholderId) {
+              conversation.removeNotice(replayPlaceholderId);
+              replayPlaceholderId = undefined;
+            }
+            markReplayActivity();
+          }
+          if (busy && !replayingHistory && userPrefs.autoPreviewMedia && !panel && !permissions.length) {
             if (update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update') {
               const call = conversation.getTool(update.toolCallId)?.call;
               if (call) {
@@ -2966,7 +3114,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
               }
             }
           }
-          render();
+          scheduleRender();
         },
         permission(prompt) {
           if (quitting || authBusy || cancelling || disconnected) { prompt.answer(null); return; }
@@ -3036,10 +3184,17 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         const targetId = resumeId ?? launch?.conversationId;
         if (targetId && targetId !== connected.sessionId) {
           try {
-            if (connected.capabilities.loadSession) await connected.loadSession(targetId);
-            else if (connected.capabilities.resumeSession && connected.resumeSession) await connected.resumeSession(targetId);
-            else if (!resumeId) conversation.notice(`Cannot open --conversation ${targetId}: session load/resume not advertised.`, true);
+            if (connected.capabilities.loadSession) {
+              beginHistoryReplay('load');
+              await connected.loadSession(targetId);
+              markReplayActivity();
+            } else if (connected.capabilities.resumeSession && connected.resumeSession) {
+              await connected.resumeSession(targetId);
+            } else if (!resumeId) {
+              conversation.notice(`Cannot open --conversation ${targetId}: session load/resume not advertised.`, true);
+            }
           } catch (err) {
+            clearReplayState();
             conversation.notice(`Failed to open conversation ${targetId}: ${err instanceof Error ? err.message : String(err)}`, true);
           }
         } else if (!resumeId && launch?.continueLast && connected.capabilities.listSessions) {
@@ -3048,18 +3203,25 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
             const sorted = [...list.sessions].sort((a, b) => (Date.parse(b.updatedAt ?? '') || 0) - (Date.parse(a.updatedAt ?? '') || 0));
             const latest = sorted[0];
             if (latest && latest.sessionId !== connected.sessionId) {
-              if (connected.capabilities.loadSession) await connected.loadSession(latest.sessionId);
-              else if (connected.capabilities.resumeSession && connected.resumeSession) await connected.resumeSession(latest.sessionId);
+              if (connected.capabilities.loadSession) {
+                beginHistoryReplay('load');
+                await connected.loadSession(latest.sessionId);
+                markReplayActivity();
+              } else if (connected.capabilities.resumeSession && connected.resumeSession) {
+                await connected.resumeSession(latest.sessionId);
+              }
             } else if (!latest) {
               conversation.notice('No previous conversation found in this workspace for --continue; started a new session.');
             }
           } catch (err) {
+            clearReplayState();
             conversation.notice(`Failed to continue latest conversation: ${err instanceof Error ? err.message : String(err)}`, true);
           }
         }
         if (quitting) return;
-        phase = 'Ready';
+        phase = replayingHistory ? 'Syncing history' : 'Ready';
         render();
+        if (!replayingHistory) surface?.scroll('main.conversation', 'end');
         if (resumeId) showToast('Reconnected to Antigravity');
         else if (launch?.initialPrompt && !disconnected) submitPrompt(launch.initialPrompt);
       }).catch(error => {
