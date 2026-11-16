@@ -4,13 +4,17 @@ import {
   collectSessionDiffs,
   extractToolImagePaths,
   extractToolInlineImages,
+  extractToolOutputText,
   formatCompactTokens,
   formatContextUsage,
   formatPathLabel,
   formatPlanSummary,
   formatTranscriptJson,
   formatTranscriptMarkdown,
+  isRunnableCodeLang,
+  parseUnifiedGitDiff,
   searchTranscript,
+  splitMarkdownSegments,
   summarizeQuotaRows,
   summarizeToolCall,
   thinkingOption,
@@ -235,5 +239,55 @@ describe('ui formatting helpers', () => {
       { type: 'message', id: 'm1', role: 'user', text: 'Inspect screenshot' },
       { type: 'tool', id: 't1', call: toolCall },
     ], '/repo', 'screen').map(m => m.id)).toEqual(['t1', 'm1']);
+  });
+
+  test('segments fenced markdown code blocks, identifies runnable shells, parses git diffs, and extracts tool output', () => {
+    expect(isRunnableCodeLang('bash')).toBe(true);
+    expect(isRunnableCodeLang('sh')).toBe(true);
+    expect(isRunnableCodeLang('typescript')).toBe(false);
+
+    const segs = splitMarkdownSegments([
+      'Run the checks:',
+      '```bash',
+      'bun run typecheck',
+      'bun test',
+      '```',
+      'And review:',
+      '```ts',
+      'export const x = 1;',
+      '```',
+    ].join('\n'));
+    expect(segs).toEqual([
+      { kind: 'prose', text: 'Run the checks:' },
+      { kind: 'code', lang: 'bash', text: 'bun run typecheck\nbun test', runnable: true, closed: true },
+      { kind: 'prose', text: 'And review:' },
+      { kind: 'code', lang: 'ts', text: 'export const x = 1;', runnable: false, closed: true },
+    ]);
+
+    const openStreaming = splitMarkdownSegments('Intro\n```sh\necho hi');
+    expect(openStreaming).toEqual([
+      { kind: 'prose', text: 'Intro' },
+      { kind: 'code', lang: 'sh', text: 'echo hi', runnable: false, closed: false },
+    ]);
+
+    const parsedDiff = parseUnifiedGitDiff([
+      'diff --git a/src/app.ts b/src/app.ts',
+      '--- a/src/app.ts',
+      '+++ b/src/app.ts',
+      '@@ -10,3 +10,4 @@ function run() {',
+      ' const a = 1;',
+      '-const b = 2;',
+      '+const b = 3;',
+      '+const c = 4;',
+    ].join('\n'));
+    expect(parsedDiff).toEqual({
+      added: 2,
+      removed: 1,
+      hunks: [{ oldStart: 10, newStart: 10, lines: [' const a = 1;', '-const b = 2;', '+const b = 3;', '+const c = 4;'] }],
+    });
+
+    expect(extractToolOutputText({ stdout: 'ok\n', stderr: 'warn\n' })).toBe('ok\nwarn');
+    expect(extractToolOutputText('')).toBeUndefined();
+    expect(extractToolOutputText({ code: 42 })).toBe('{\n  "code": 42\n}');
   });
 });

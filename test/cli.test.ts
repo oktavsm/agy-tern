@@ -39,6 +39,7 @@ describe('CLI argument parser', () => {
     expect(parsed).toEqual({
       help: false,
       doctor: false,
+      doctorJson: false,
       cwd: root,
       additionalDirectories: [extra1, extra2],
       agy: undefined,
@@ -74,5 +75,7 @@ describe('CLI argument parser', () => {
     expect(() => parseCliArgs(['one', 'two'], root)).toThrow('Unexpected extra arguments');
     expect(() => parseCliArgs(['--cwd', filePath], root)).toThrow('Not a workspace directory');
     expect(() => parseCliArgs(['--add-dir', 'missing-dir'], root)).toThrow('Not an additional workspace directory');
+    expect(() => parseCliArgs(['--json'], root)).toThrow('--doctor');
+    expect(parseCliArgs(['--doctor', '--json'], root)).toMatchObject({ doctor: true, doctorJson: true });
   });
 });

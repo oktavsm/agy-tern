@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { buildAttentionSequence, openInTernSplit, resolveTernTarget, sendTerminalAttention } from '../src/tern-window';
+import { buildAttentionSequence, openInTernSplit, resolveTernTarget, runCommandInTernSplit, sendTerminalAttention } from '../src/tern-window';
 
 const dirs: string[] = [];
 
@@ -47,6 +47,13 @@ exit 0
     const missing = await openInTernSplit(dir, 'nope.ts', { ternBin: fakeTern });
     expect(missing.ok).toBe(false);
     expect(missing.error).toContain('File not found on disk');
+
+    const cmdRes = await runCommandInTernSplit(dir, 'bun test', { ternBin: fakeTern });
+    expect(cmdRes).toEqual({ ok: true, target: 'bun test' });
+    expect(await readFile(logFile, 'utf8')).toContain(`split @focused right --cwd ${dir} --keep-open -- /bin/sh -lc bun test`);
+
+    const emptyCmd = await runCommandInTernSplit(dir, '   ', { ternBin: fakeTern });
+    expect(emptyCmd.ok).toBe(false);
   });
 
   test('sanitizes and emits OSC 9 attention sequence only on TTY streams', () => {

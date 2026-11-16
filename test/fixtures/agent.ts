@@ -696,6 +696,31 @@ const connection = agent({ name: 'local-protocol-fixture' })
         update: { sessionUpdate: 'notice', severity: 'info', title: 'Context trimmed cleanly' },
       });
       await text('Compaction completed.');
+    } else if (command === 'demo-code') {
+      const notify = (update: SessionNotification['update']) => client.notify(methods.client.session.update, { sessionId, update });
+      await notify({
+        sessionUpdate: 'tool_call',
+        toolCallId: 'demo-bash-1',
+        name: 'run_command',
+        kind: 'execute',
+        title: 'Run typecheck',
+        status: 'completed',
+        rawInput: { command: 'bun run typecheck' },
+        rawOutput: { exitCode: 0, stdout: '$ tsc --noEmit\nAll checks passed.\n' },
+      });
+      await text([
+        'Verify the workspace checks directly:',
+        '',
+        '```bash',
+        'bun run typecheck && bun test',
+        '```',
+        '',
+        'Example configuration helper:',
+        '',
+        '```ts',
+        'export const ready = true;',
+        '```',
+      ].join('\n'));
     } else if (images.length > 0 && resources.length > 0) {
       await text(`Synthetic fixture reply (${images.length} image, ${resources.length} resource): ${command}`);
     } else if (resources.length > 0) {

@@ -9,6 +9,7 @@ import {
   imageMimeType,
   listWorkspaceFiles,
   loadEmbeddedResourceAttachments,
+  readGitFileDiff,
   readImageAttachment,
   readWorkspaceTextPreview,
   resolvePastedImagePath,
@@ -129,5 +130,12 @@ describe('workspace @file mention helpers', () => {
     expect(embedded.resources[0]?.text).toBe('console.log(1);\n');
     expect(embedded.resources[1]?.text).toBe('export const x = 42;\n');
     expect(embedded.overflowPaths).toEqual(['bin.dat']);
+  });
+
+  test('guards git file diff lookups against invalid flags or workspace escapes', async () => {
+    const dir = await tempDir();
+    expect(await readGitFileDiff(dir, '--all')).toBe('');
+    expect(await readGitFileDiff(dir, '../outside.ts')).toBe('');
+    expect(await readGitFileDiff(dir, 'not-a-git-repo.ts')).toBe('');
   });
 });
