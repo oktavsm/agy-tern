@@ -1,7 +1,10 @@
 import { describe, expect, test } from 'bun:test';
 import {
   buildUnifiedDiffHunks,
+  clipDiffHunks,
+  clipInlinePreview,
   collectSessionDiffs,
+  countSessionDiffs,
   extractToolImagePaths,
   extractToolInlineImages,
   extractToolOutputText,
@@ -289,5 +292,19 @@ describe('ui formatting helpers', () => {
     expect(extractToolOutputText({ stdout: 'ok\n', stderr: 'warn\n' })).toBe('ok\nwarn');
     expect(extractToolOutputText('')).toBeUndefined();
     expect(extractToolOutputText({ code: 42 })).toBe('{\n  "code": 42\n}');
+
+    expect(countSessionDiffs([
+      { type: 'message', id: 'm1', role: 'user', text: 'hi' },
+      { type: 'tool', id: 't1', call: { toolCallId: 'c1', content: [{ type: 'diff', path: 'a.ts', oldText: 'a', newText: 'b' }] } },
+    ])).toBe(1);
+
+    const longLines = Array.from({ length: 40 }, (_, idx) => `line ${idx}`).join('\n');
+    const clippedText = clipInlinePreview(longLines, 10, 500);
+    expect(clippedText.truncated).toBe(true);
+    expect(clippedText.text.split('\n')).toHaveLength(10);
+
+    const clippedHunks = clipDiffHunks([{ oldStart: 1, newStart: 1, lines: Array.from({ length: 50 }, () => '+x') }], 15);
+    expect(clippedHunks.truncated).toBe(true);
+    expect(clippedHunks.hunks[0]?.lines).toHaveLength(15);
   });
 });
