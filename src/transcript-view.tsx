@@ -8,6 +8,8 @@ import { contentText, type TranscriptEntry } from './model';
 import type { DiffMode, UserPrefs } from './prefs';
 import {
   buildUnifiedDiffHunks,
+  clipDiffHunks,
+  clipInlinePreview,
   extractToolImagePaths,
   extractToolInlineImages,
   extractToolOutputText,
@@ -54,20 +56,31 @@ export type InspectTarget =
 
 export function ToolOutput({ rawOutput }: { rawOutput: unknown }): JSX.Element {
   if (typeof rawOutput === 'string') {
-    return <code wrap>{rawOutput}</code>;
+    const clipped = clipInlinePreview(rawOutput);
+    return <col gap="xs">
+      <code wrap>{clipped.text}</code>
+      {clipped.truncated && <text><span s="muted">Output truncated in card · click Copy output for full text</span></text>}
+    </col>;
   }
   if (typeof rawOutput === 'object' && rawOutput !== null && !Array.isArray(rawOutput)) {
     const record = rawOutput as Record<string, unknown>;
     const stdout = typeof record.stdout === 'string' ? record.stdout : undefined;
     const stderr = typeof record.stderr === 'string' ? record.stderr : undefined;
     if (stdout !== undefined || stderr !== undefined) {
+      const outClip = stdout ? clipInlinePreview(stdout) : undefined;
+      const errClip = stderr ? clipInlinePreview(stderr) : undefined;
       return <col gap="xs">
-        {stdout && <code wrap>{stdout}</code>}
-        {stderr && <code wrap>{stderr}</code>}
+        {outClip && <code wrap>{outClip.text}</code>}
+        {errClip && <code wrap>{errClip.text}</code>}
+        {(outClip?.truncated || errClip?.truncated) && <text><span s="muted">Output truncated in card · click Copy output for full text</span></text>}
       </col>;
     }
   }
-  return <code wrap>{JSON.stringify(rawOutput, null, 2)}</code>;
+  const jsonClip = clipInlinePreview(JSON.stringify(rawOutput, null, 2));
+  return <col gap="xs">
+    <code wrap>{jsonClip.text}</code>
+    {jsonClip.truncated && <text><span s="muted">Output truncated in card · click Copy output for full text</span></text>}
+  </col>;
 }
 
 export function ToolBody({ call, cwd, showRawInput, diffMode, getBlob, onInspect, onOpenSplit, onCopy }: {
@@ -111,8 +124,10 @@ export function ToolBody({ call, cwd, showRawInput, diffMode, getBlob, onInspect
       const absPath = isAbsolute(content.path) ? content.path : resolve(cwd, content.path);
       const canSplit = !!onOpenSplit && existsSync(absPath);
       if (content.oldText == null) {
+        const clippedFile = clipInlinePreview(content.newText, 24, 3_000);
         return <col key={`content-${index}`} gap="xs">
-          <code numbers path={pathLabel}>{content.newText}</code>
+          <code numbers path={pathLabel}>{clippedFile.text}</code>
+          {clippedFile.truncated && <text><span s="muted">Preview truncated · open Fullscreen for full file</span></text>}
           {(onInspect || onCopy || canSplit) && <row gap="xs">
             {onInspect && <button size="sm" variant="quiet" icon="expand"
               onClick={() => onInspect(basename(pathLabel), { type: 'file', path: pathLabel, content: content.newText }, pathLabel)}>
@@ -135,8 +150,10 @@ export function ToolBody({ call, cwd, showRawInput, diffMode, getBlob, onInspect
       }
       const firstChangedLine = diff.hunks[0]?.newStart;
       const diffCopyText = diff.hunks.flatMap(h => h.lines).join('\n');
+      const clippedDiff = clipDiffHunks(diff.hunks, 32);
       return <col key={`content-${index}`} gap="xs">
-        <diff path={pathLabel} hunks={diff.hunks} mode={diffMode} />
+        <diff path={pathLabel} hunks={clippedDiff.hunks} mode={diffMode} />
+        {clippedDiff.truncated && <text><span s="muted">Diff preview truncated · open Fullscreen diff for all hunks</span></text>}
         {(onInspect || onCopy || canSplit) && <row gap="xs">
           {onInspect && <button size="sm" variant="quiet" icon="expand"
             onClick={() => onInspect(basename(pathLabel), { type: 'diff', path: pathLabel, hunks: diff.hunks }, pathLabel)}>
@@ -203,10 +220,11 @@ export interface EntryCallbacks {
   onResend(text: string): void;
 }
 
-export function Entry({ entry, continued, streaming, turnNumber, callbacks }: {
+export function Entry({ entry, continued, streaming, recent, turnNumber, callbacks }: {
   entry: TranscriptEntry;
   continued?: boolean;
   streaming?: boolean;
+  recent?: boolean;
   turnNumber?: number;
   callbacks: EntryCallbacks;
 }): JSX.Element {
@@ -298,7 +316,7 @@ export function Entry({ entry, continued, streaming, turnNumber, callbacks }: {
         open={open}
         lines={[{ id: 'body', title: 'Reasoning', status: running ? 'running' : 'done' }]}
         onToggle={event => callbacks.onToggleThought(entry.id, event.open ?? !open)}>
-        <md key="body">{entry.text}</md>
+        {open ? <md key="body">{entry.text}</md> : <spacer key="body" size="none" />}
       </trace>;
     }
     case 'tool': {
@@ -306,7 +324,9 @@ export function Entry({ entry, continued, streaming, turnNumber, callbacks }: {
       const hasMedia = extractToolInlineImages(entry.call).length > 0 ||
         extractToolImagePaths(entry.call, callbacks.cwd).some(path => existsSync(path));
       const running = entry.call.status === 'in_progress' || entry.call.status === 'pending';
-      const defaultCollapsed = callbacks.prefs.toolDisplay === 'expanded' ? false : !summary.hasDiff && !hasMedia && entry.call.status !== 'failed';
+      const defaultCollapsed = callbacks.prefs.toolDisplay === 'expanded'
+        ? !recent && !running && entry.call.status !== 'failed'
+        : !((recent && (summary.hasDiff || hasMedia)) || running || entry.call.status === 'failed');
       const collapsed = callbacks.toolFoldOverrides.get(entry.id) ?? defaultCollapsed;
       const took = entry.startedAt !== undefined && entry.endedAt !== undefined
         ? Math.max(0, entry.endedAt - entry.startedAt)
@@ -337,8 +357,9 @@ export function Entry({ entry, continued, streaming, turnNumber, callbacks }: {
           ...(summary.hasDiff ? { 'Review in /changes': callbacks.onOpenChanges } : {}),
         }}
         onToggle={event => callbacks.onToggleTool(entry.id, event.collapsed ?? !collapsed)}>
-        <ToolBody call={entry.call} cwd={callbacks.cwd} showRawInput={summary.showRawInput} diffMode={callbacks.prefs.diffMode}
+        {!collapsed ? <ToolBody call={entry.call} cwd={callbacks.cwd} showRawInput={summary.showRawInput} diffMode={callbacks.prefs.diffMode}
           getBlob={callbacks.getBlob} onInspect={callbacks.onInspect} onOpenSplit={callbacks.onOpenSplit} onCopy={callbacks.onCopy} />
+          : <spacer key="lazy" size="none" />}
       </tool>;
     }
     case 'plan': return <checklist key={entry.id} phases={[{ title: 'Plan', items: entry.entries.map((item, index) => ({

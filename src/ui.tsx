@@ -51,6 +51,7 @@ import {
 import {
   buildUnifiedDiffHunks,
   collectSessionDiffs,
+  countSessionDiffs,
   detectGitBranch,
   extractToolImagePaths,
   extractToolInlineImages,
@@ -216,11 +217,24 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
   let replayPlaceholderId: string | undefined;
   let replayCachedFallback: Conversation | undefined;
   let replayNoticeMode: 'load' | 'resume' = 'load';
-  let historyVisibleCount = 80;
+  const DEFAULT_HISTORY_VISIBLE = 30;
+  let historyVisibleCount = DEFAULT_HISTORY_VISIBLE;
+  let cachedDiffCountConversation: Conversation | undefined;
+  let cachedDiffCountRev = -1;
+  let cachedDiffCount = 0;
   let cachedDiffsConversation: Conversation | undefined;
   let cachedDiffsRev = -1;
   let cachedSessionDiffs: SessionDiffItem[] = [];
   const entryRenderCache = new WeakMap<TranscriptEntry, { key: string; node: JSX.Element }>();
+
+  function getSessionDiffs(): SessionDiffItem[] {
+    if (cachedDiffsConversation !== conversation || cachedDiffsRev !== conversation.revision) {
+      cachedDiffsConversation = conversation;
+      cachedDiffsRev = conversation.revision;
+      cachedSessionDiffs = collectSessionDiffs(conversation.entries, options.cwd);
+    }
+    return cachedSessionDiffs;
+  }
   let turnStartedAt: number | undefined;
   const queuedPrompts: QueuedPrompt[] = [];
   let queueSequence = 0;
@@ -474,6 +488,10 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     if (!session || session.closed) return undefined;
     try {
       const id = session.blob(Buffer.from(base64, 'base64'), mimeType);
+      if (blobCache.size >= 32) {
+        const oldest = blobCache.keys().next().value;
+        if (oldest !== undefined) blobCache.delete(oldest);
+      }
       blobCache.set(cacheKey, id);
       return id;
     } catch {
@@ -511,6 +529,9 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     inspectReturnPanel = undefined;
     panel = undefined;
     panelError = '';
+    gitDiffCache.clear();
+    cachedDiffsConversation = undefined;
+    cachedSessionDiffs = [];
     autocompleteDismissed = true;
     render();
     surface?.focus('dock.draft');
@@ -1769,7 +1790,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
 
   function renderChangesPicker(): JSX.Element {
     const query = panelDraft.text.trim().toLowerCase();
-    const sessionDiffs = collectSessionDiffs(conversation.entries, options.cwd);
+    const sessionDiffs = getSessionDiffs();
     const filteredEdits = sessionDiffs.filter(item => item.path.toLowerCase().includes(query));
     const filteredGit = gitChanges.filter(item => `${item.status} ${item.path}`.toLowerCase().includes(query));
     const usingGit = pickerTab === 'git';
@@ -2610,12 +2631,12 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     const activePlan = conversation.currentPlan;
     const planSummary = formatPlanSummary(activePlan);
     const contextUsage = formatContextUsage(metadata.usage);
-    if (cachedDiffsConversation !== conversation || cachedDiffsRev !== conversation.revision) {
-      cachedDiffsConversation = conversation;
-      cachedDiffsRev = conversation.revision;
-      cachedSessionDiffs = collectSessionDiffs(conversation.entries, options.cwd);
+    if (cachedDiffCountConversation !== conversation || cachedDiffCountRev !== conversation.revision) {
+      cachedDiffCountConversation = conversation;
+      cachedDiffCountRev = conversation.revision;
+      cachedDiffCount = countSessionDiffs(conversation.entries);
     }
-    const sessionDiffs = cachedSessionDiffs;
+    const sessionDiffCount = cachedDiffCount;
     const loginAvailable = !!loginMethod() && !terminalLoginProblem(loginMethod()!) && !!agent && !disconnected && authentication.logout;
     const agentStatus: Tone = disconnected || phase.includes('failed') ? 'error' : busy ? 'warning' : agent ? 'success' : 'muted';
     const renderNow = lastRenderAt || Date.now();
@@ -2712,6 +2733,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       const prev = globalIdx > 0 ? allEntries[globalIdx - 1] : undefined;
       const continued = entry.type === 'message' && prev?.type === 'message' && prev.role === entry.role;
       const streaming = busy && globalIdx === totalEntries - 1 && entry.type === 'message' && entry.role === 'agent';
+      const recent = globalIdx >= Math.max(0, totalEntries - 8);
       const turnNumber = entry.type === 'message' && entry.role === 'user' ? ++turnCounter : undefined;
       const isRunning = streaming ||
         (entry.type === 'thought' && entry.endedAt === undefined && busy) ||
@@ -2722,10 +2744,10 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         : entry.type === 'tool' ? String(toolFoldOverrides.get(entry.id) ?? '') : '';
       const errorKey = entry.type === 'notice' && entry.error
         ? `${Number(entryCallbacks.canRetry)}${Number(entryCallbacks.canReconnect)}${Number(entryCallbacks.canSwitchAccount)}` : '';
-      const sig = `${conversation.revisionOf(entry)}|${continued ? 1 : 0}|${streaming ? 1 : 0}|${turnNumber ?? ''}|${isRunning ? Math.floor(renderNow / 1000) : 0}|${foldKey}|${errorKey}|${agentStatus}|${userPrefs.diffMode}|${userPrefs.toolDisplay}|${Number(userPrefs.thoughtExpanded)}|${userPrefs.transcriptDensity}|${Number(userPrefs.showTimestamps)}`;
+      const sig = `${conversation.revisionOf(entry)}|${continued ? 1 : 0}|${streaming ? 1 : 0}|${recent ? 1 : 0}|${turnNumber ?? ''}|${isRunning ? Math.floor(renderNow / 1000) : 0}|${foldKey}|${errorKey}|${agentStatus}|${userPrefs.diffMode}|${userPrefs.toolDisplay}|${Number(userPrefs.thoughtExpanded)}|${userPrefs.transcriptDensity}|${Number(userPrefs.showTimestamps)}`;
       const cached = entryRenderCache.get(entry);
       if (cached && cached.key === sig) return cached.node;
-      const node = <Entry key={entry.id} entry={entry} continued={continued} streaming={streaming} turnNumber={turnNumber} callbacks={entryCallbacks} />;
+      const node = <Entry key={entry.id} entry={entry} continued={continued} streaming={streaming} recent={recent} turnNumber={turnNumber} callbacks={entryCallbacks} />;
       entryRenderCache.set(entry, { key: sig, node });
       return node;
     };
@@ -2735,7 +2757,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
           {hiddenCount > 0 && <row key="older-history" justify="between" align="center" gap="sm" wrap>
             <text><span s="muted">{hiddenCount} earlier {hiddenCount === 1 ? 'entry' : 'entries'} hidden for speed</span></text>
             <row gap="xs">
-              <button size="sm" variant="quiet" onClick={() => { historyVisibleCount += 120; render(); }}>Load 120 more</button>
+              <button size="sm" variant="quiet" onClick={() => { historyVisibleCount += 50; render(); }}>Load 50 more</button>
               <button size="sm" variant="quiet" onClick={() => { historyVisibleCount = totalEntries; render(); }}>Show all ({totalEntries})</button>
             </row>
           </row>}
@@ -2953,9 +2975,9 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
               { k: 'Shortcut', v: 'Click or type /agents' },
             ])}
             onClick={() => { if (!permission && !authBusy) openPanel({ kind: 'agents' }); }} />}
-          {sessionDiffs.length > 0 && <seg key="changes" side="right" priority={8} icon="diff" tone="accent"
-            text={`Changes (${sessionDiffs.length})`}
-            title={`Inspect ${sessionDiffs.length} session edit${sessionDiffs.length === 1 ? '' : 's'} (/changes)`}
+          {sessionDiffCount > 0 && <seg key="changes" side="right" priority={8} icon="diff" tone="accent"
+            text={`Changes (${sessionDiffCount})`}
+            title={`Inspect ${sessionDiffCount} session edit${sessionDiffCount === 1 ? '' : 's'} (/changes)`}
             onClick={() => { if (!permission && !authBusy) openPanel({ kind: 'changes' }); }} />}
           <seg key="commands" side="right" priority={5} icon="slash" text="Commands"
             tone={(!agent || disconnected || !!permission) ? 'muted' : undefined}
@@ -3045,14 +3067,21 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         sessionChanged(id) {
           if (activeSessionId) {
             conversations.set(activeSessionId, conversation);
+            if (conversations.size > 3) {
+              const oldest = conversations.keys().next().value;
+              if (oldest !== undefined && oldest !== id) conversations.delete(oldest);
+            }
             drafts.set(activeSessionId, draft);
             conversation = new Conversation();
             draft = drafts.get(id) ?? { text: '', cursor: 0 };
             expandedThoughts.clear();
             thoughtFoldOverrides.clear();
             toolFoldOverrides.clear();
-            historyVisibleCount = 80;
+            gitDiffCache.clear();
+            historyVisibleCount = DEFAULT_HISTORY_VISIBLE;
+            cachedDiffCountConversation = undefined;
             cachedDiffsConversation = undefined;
+            cachedSessionDiffs = [];
           }
           activeSessionId = id;
           clearPermissions();
@@ -3336,7 +3365,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
             };
           } else if (current.kind === 'changes') {
             const needle = panelDraft.text.trim().toLowerCase();
-            const sessionDiffs = collectSessionDiffs(conversation.entries, options.cwd);
+            const sessionDiffs = getSessionDiffs();
             const usingGit = pickerTab === 'git';
             const filteredEdits = sessionDiffs.filter(item => item.path.toLowerCase().includes(needle));
             const filteredGit = gitChanges.filter(item => `${item.status} ${item.path}`.toLowerCase().includes(needle));

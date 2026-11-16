@@ -38,7 +38,8 @@ export interface PlanSummary {
 
 const MAX_LCS_CELLS = 250_000;
 const DIFF_CACHE = new Map<string, DiffResult>();
-const MAX_DIFF_CACHE_ENTRIES = 512;
+const MAX_DIFF_CACHE_ENTRIES = 64;
+const MAX_CACHE_INPUT_CHARS = 16_000;
 
 function cacheSetBounded<V>(cache: Map<string, V>, key: string, value: V, maxEntries: number): void {
   if (cache.size >= maxEntries) {
@@ -107,7 +108,7 @@ function lcsOps(oldBody: string[], newBody: string[], oldOffset: number, newOffs
 
 /** Build unified diff hunks and +/- line counts from before/after text. */
 export function buildUnifiedDiffHunks(oldText: string, newText: string, contextLines = 3): DiffResult {
-  const canCache = contextLines === 3 && oldText.length + newText.length <= 200_000;
+  const canCache = contextLines === 3 && oldText.length + newText.length <= MAX_CACHE_INPUT_CHARS;
   const cacheKey = canCache ? `${oldText}\0${newText}` : '';
   if (canCache) {
     const cached = DIFF_CACHE.get(cacheKey);
@@ -391,6 +392,18 @@ export interface SessionDiffItem {
   newFileText?: string;
 }
 
+/** Count recorded file edits/writes cheaply without computing diff hunks. */
+export function countSessionDiffs(entries: readonly TranscriptEntry[]): number {
+  let count = 0;
+  for (const entry of entries) {
+    if (entry.type !== 'tool') continue;
+    for (const content of entry.call.content ?? []) {
+      if (content.type === 'diff') count++;
+    }
+  }
+  return count;
+}
+
 /** Collect all file diff/write snapshots recorded during the current conversation. */
 export function collectSessionDiffs(entries: readonly TranscriptEntry[], cwd: string): SessionDiffItem[] {
   const items: SessionDiffItem[] = [];
@@ -606,12 +619,12 @@ export function isRunnableCodeLang(lang?: string): boolean {
 }
 
 const MD_SEGMENT_CACHE = new Map<string, MarkdownSegment[]>();
-const MAX_MD_CACHE_ENTRIES = 256;
+const MAX_MD_CACHE_ENTRIES = 64;
 
 /** Split Markdown into prose chunks and fenced code blocks for per-block copy and run controls. */
 export function splitMarkdownSegments(markdown: string): MarkdownSegment[] {
   if (!markdown) return [];
-  const canCache = markdown.length <= 50_000;
+  const canCache = markdown.length <= MAX_CACHE_INPUT_CHARS;
   if (canCache) {
     const cached = MD_SEGMENT_CACHE.get(markdown);
     if (cached) return cached;
@@ -720,6 +733,36 @@ export function parseUnifiedGitDiff(patchText: string): { hunks: DiffHunk[]; add
   }
   if (current) hunks.push(current);
   return { hunks, added, removed };
+}
+
+/** Clip multi-line preview text for compact inline tool cards while keeping full copy/fullscreen intact. */
+export function clipInlinePreview(text: string, maxLines = 24, maxChars = 3_000): { text: string; truncated: boolean } {
+  const sliced = text.length > maxChars ? text.slice(0, maxChars) : text;
+  const lines = sliced.split('\n');
+  if (lines.length <= maxLines && text.length <= maxChars) {
+    return { text, truncated: false };
+  }
+  return {
+    text: lines.slice(0, maxLines).join('\n'),
+    truncated: true,
+  };
+}
+
+/** Clip diff hunks to a bounded inline preview line count to keep Tern DOM light. */
+export function clipDiffHunks(hunks: readonly DiffHunk[], maxLines = 32): { hunks: DiffHunk[]; truncated: boolean } {
+  const out: DiffHunk[] = [];
+  let remaining = maxLines;
+  for (const hunk of hunks) {
+    if (remaining <= 0) return { hunks: out, truncated: true };
+    if (hunk.lines.length <= remaining) {
+      out.push(hunk);
+      remaining -= hunk.lines.length;
+    } else {
+      out.push({ oldStart: hunk.oldStart, newStart: hunk.newStart, lines: hunk.lines.slice(0, remaining) });
+      return { hunks: out, truncated: true };
+    }
+  }
+  return { hunks: out, truncated: false };
 }
 
 /** Extract clean copyable text from a tool call's rawOutput payload. */
