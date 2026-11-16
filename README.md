@@ -12,7 +12,7 @@ Native [Tern](https://docs.stencil.so/tern/protocol/index.md) terminal frontend 
 
 - **Native Tern Surface UI**: Renders conversations, collapsible `Thought` traces, multi-step `Plan` HUD, inline/card tool output, unified/split code diffs, and real-time context meters (`used/size` tokens) using Tern native elements and theme tokens.
 - **Full Keyboard Parity**: Shell-style composer editing (`Ctrl+A`/`E`, word jumps `Ctrl+Left`/`Right` or `Alt+B`/`F`, `Up`/`Down` line movement and prompt history with `History i/N`, `Ctrl+W`/`U`/`K`, `Ctrl+Z` undo), `Esc` cancellation, and explicit one-time approvals (`Tab`, `Ctrl+Y`, `Ctrl+N`; `Enter` never approves a tool).
-- **Rich Inspection & Side-by-Side Splits**: Centered modal viewer (`InspectOverlay`) for screenshots, inline images, full files, and diffs; automatic centered live preview when `agy` accesses images (`autoPreviewMedia`); and direct `tern open --split right` launch from tool cards, `/changes`, and overlays.
+- **Rich Inspection & Side-by-Side Splits**: Centered modal viewer (`InspectOverlay`) for screenshots, inline images, full files, and diffs; automatic centered live preview when `agy` accesses images (`autoPreviewMedia`); per-block `Copy`, `Fullscreen`, and confirmed `Run in split` (`tern split`) actions on fenced Markdown code/command blocks; `Copy output` / `Copy diff` inside tool cards; and direct `tern open --split right` launch from tool cards, `/changes`, and overlays.
 - **Official CLI Extension & Session Management**: Browse/toggle/add/remove MCP servers (`/mcp`), browse/toggle/validate/install/uninstall plugins & skills (`/plugins`), inspect agent profiles and `--add-dir` roots (`/agents`), manage ACP sessions (`/sessions`, `/new`, `/rename`), and read official `/usage`, `/credits`, and `/changelog` reports.
 - **Workspace Prompt Templates & Multi-Format Export**: Save/search/insert reusable workspace-scoped prompts (`/templates`), export transcripts as Markdown or JSON (`/export [file.md|json]`), and emit non-intrusive terminal attention notifications (`OSC 9` + BEL) when long turns (`>= 8s`) complete or approvals await.
 
@@ -80,7 +80,7 @@ agy-tern --agy /abs/path/to/agy --doctor
 | `--conversation <id>` | Load a specific saved ACP session ID |
 | `-i`, `--prompt-interactive`, `[PROMPT]` | Start interactively with an initial prompt |
 | `--agy <path>` | Override the `agy` executable path (absolute or PATH-resolved) |
-| `--doctor` | Verify `agy` binary and advertised ACP options without sending model prompts |
+| `--doctor [--json]` | Verify `agy`, `tern`, clipboard tools, and launcher symlink (with optional JSON output) without sending model prompts |
 | `-h`, `--help`, `-V`, `--version` | Show CLI usage help or package version |
 
 ---
@@ -90,7 +90,8 @@ agy-tern --agy /abs/path/to/agy --doctor
 - **Send / Queue**: `Enter` sends (or queues follow-up prompts while busy); `Shift+Enter` inserts a newline; multiline pastes remain in the draft.
 - **Attachments**: Type `@` to search and attach workspace files or images; pasting/dropping an existing image path attaches an image preview tile (requires server `promptCapabilities.image`).
 - **Composer Navigation**: `Ctrl+A` / `Ctrl+E` (line start/end), `Ctrl+Left`/`Right` or `Alt+B`/`F` (word jump), `Up`/`Down` (crosses wrapped lines or cycles prompt history when empty), `Ctrl+W`/`U`/`K` (delete word / to start / to end), `Ctrl+Z` (undo).
-- **Modals & Turns**: `Esc` closes modals, pickers, or previews without cancelling a running turn; in an active conversation, `Esc` cancels the turn.
+- **Modals & Turns**: `Esc` steps back from nested confirmation/input overlays to their parent picker or closes modals without cancelling a running turn; in an active conversation, `Esc` cancels the turn.
+- **Disconnect Recovery**: Clicking **Reconnect ACP** on a connection-failure card or the `Disconnected` status segment re-establishes the official ACP subprocess while keeping your draft.
 - **Transcript**: `PgUp` / `PgDn` scroll conversation history.
 - **Approvals**: `Tab` / `Shift+Tab` cycle options; `Ctrl+Y` approves once; `Ctrl+N` denies. `Enter` never approves a tool call.
 - **Quit**: `Ctrl+Q` (or `Quit` status segment) cleanly shuts down pending approvals, the ACP subprocess, and the Tern surface.
@@ -104,8 +105,8 @@ agy-tern --agy /abs/path/to/agy --doctor
 | `/model [id\|name]` | Switch active ACP model using server-advertised `configOptions` |
 | `/settings`, `/config` | Open 4-page `<prefs>` modal (`Appearance & UI`, `Session & Model`, `Permissions & Sandbox`, `Keybindings`) persisted under `$XDG_STATE_HOME/agy-tern/prefs.json` |
 | `/templates [query]`, `/snippets [query]` | Save, browse, filter, insert, or delete workspace-scoped prompt templates |
-| `/find [query]`, `/search [query]` | Search messages, thoughts, tools, diffs, plans, and notices in the current transcript |
-| `/changes`, `/diff` | Inspect session edits and workspace `git status` with `Fullscreen` and `Tern split` (`tern open --split right`) actions |
+| `/find [query]`, `/search [query]` | Search messages, thoughts, tools, diffs, plans, and notices with `Jump to chat`, `Copy`, and `Inspect` actions |
+| `/changes`, `/diff` | Inspect session edits and workspace `git status` (including live `git diff` previews) with `Fullscreen` and `Tern split` (`tern open --split right`) actions |
 | `/mcp` | List `agy mcp list` servers; enable, disable, add (`[--type stdio\|http] <name> <target> [args...]`), or remove servers with confirmation |
 | `/plugins`, `/skills` | Browse `agy plugin list --json`; toggle state, insert `/<skill>`, validate manifests (`InspectOverlay` report), install, or uninstall |
 | `/agents`, `/agent` | Inspect custom `agy agent` profiles and active `--add-dir` workspace roots |
