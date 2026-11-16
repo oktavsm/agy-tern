@@ -103,3 +103,25 @@ test('projects ACP notices and context compaction summary updates in order', () 
     { type: 'notice', id: 'entry-3', text: 'Sandbox denied', error: true },
   ]);
 });
+
+test('tracks monotonic revision per entry and removes temporary replay notices cleanly', () => {
+  const chat = new Conversation();
+  expect(chat.revision).toBe(0);
+  const placeholder = chat.notice('Loading session history...');
+  expect(chat.revision).toBe(1);
+  expect(chat.revisionOf(placeholder)).toBe(1);
+
+  chat.startPrompt('Hello');
+  const firstPrompt = chat.entries[1]!;
+  const revPrompt = chat.revisionOf(firstPrompt);
+  chat.update({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Hi ' } });
+  const reply = chat.entries[2]!;
+  const revReply1 = chat.revisionOf(reply);
+  chat.update({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'there' } });
+
+  expect(chat.revisionOf(firstPrompt)).toBe(revPrompt);
+  expect(chat.revisionOf(reply)).toBeGreaterThan(revReply1);
+  expect(chat.removeNotice(placeholder.id)).toBe(true);
+  expect(chat.removeNotice('missing-id')).toBe(false);
+  expect(chat.entries.map(e => e.id)).toEqual([firstPrompt.id, reply.id]);
+});
