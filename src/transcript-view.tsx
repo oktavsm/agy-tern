@@ -10,7 +10,9 @@ import {
   buildUnifiedDiffHunks,
   extractToolImagePaths,
   extractToolInlineImages,
+  extractToolOutputText,
   formatPathLabel,
+  splitMarkdownSegments,
   summarizeToolCall,
 } from './ui-format';
 
@@ -68,7 +70,7 @@ export function ToolOutput({ rawOutput }: { rawOutput: unknown }): JSX.Element {
   return <code wrap>{JSON.stringify(rawOutput, null, 2)}</code>;
 }
 
-export function ToolBody({ call, cwd, showRawInput, diffMode, getBlob, onInspect, onOpenSplit }: {
+export function ToolBody({ call, cwd, showRawInput, diffMode, getBlob, onInspect, onOpenSplit, onCopy }: {
   call: ToolCallUpdate;
   cwd: string;
   showRawInput: boolean;
@@ -76,8 +78,10 @@ export function ToolBody({ call, cwd, showRawInput, diffMode, getBlob, onInspect
   getBlob?(key: string, data: string, mimeType: string): string | undefined;
   onInspect?(title: string, target: InspectTarget, subtitle?: string): void;
   onOpenSplit?(path: string, line?: number): void;
+  onCopy?(text: string): void;
 }): JSX.Element {
   const imagePaths = extractToolImagePaths(call, cwd).filter(path => existsSync(path));
+  const copyableOutput = extractToolOutputText(call.rawOutput);
   return <col gap="sm">
     {showRawInput && call.rawInput !== undefined && <col key="input" gap="xs">
       <text><span s="muted">Input</span></text>
@@ -109,10 +113,14 @@ export function ToolBody({ call, cwd, showRawInput, diffMode, getBlob, onInspect
       if (content.oldText == null) {
         return <col key={`content-${index}`} gap="xs">
           <code numbers path={pathLabel}>{content.newText}</code>
-          {(onInspect || canSplit) && <row gap="xs">
+          {(onInspect || onCopy || canSplit) && <row gap="xs">
             {onInspect && <button size="sm" variant="quiet" icon="expand"
               onClick={() => onInspect(basename(pathLabel), { type: 'file', path: pathLabel, content: content.newText }, pathLabel)}>
               Fullscreen
+            </button>}
+            {onCopy && <button size="sm" variant="quiet" icon="copy"
+              onClick={() => onCopy(content.newText)}>
+              Copy
             </button>}
             {canSplit && <button size="sm" variant="quiet" icon="split"
               onClick={() => onOpenSplit(absPath)}>
@@ -126,12 +134,17 @@ export function ToolBody({ call, cwd, showRawInput, diffMode, getBlob, onInspect
         return <text key={`content-${index}`} wrap="char"><span s="muted">No line changes in {pathLabel}</span></text>;
       }
       const firstChangedLine = diff.hunks[0]?.newStart;
+      const diffCopyText = diff.hunks.flatMap(h => h.lines).join('\n');
       return <col key={`content-${index}`} gap="xs">
         <diff path={pathLabel} hunks={diff.hunks} mode={diffMode} />
-        {(onInspect || canSplit) && <row gap="xs">
+        {(onInspect || onCopy || canSplit) && <row gap="xs">
           {onInspect && <button size="sm" variant="quiet" icon="expand"
             onClick={() => onInspect(basename(pathLabel), { type: 'diff', path: pathLabel, hunks: diff.hunks }, pathLabel)}>
             Fullscreen diff
+          </button>}
+          {onCopy && diffCopyText && <button size="sm" variant="quiet" icon="copy"
+            onClick={() => onCopy(diffCopyText)}>
+            Copy diff
           </button>}
           {canSplit && <button size="sm" variant="quiet" icon="split"
             onClick={() => onOpenSplit(absPath, firstChangedLine)}>
@@ -152,6 +165,11 @@ export function ToolBody({ call, cwd, showRawInput, diffMode, getBlob, onInspect
     })}
     {call.rawOutput !== undefined && call.rawOutput !== null && call.rawOutput !== '' && <col key="output" gap="xs">
       <ToolOutput rawOutput={call.rawOutput} />
+      {onCopy && copyableOutput && <row gap="xs">
+        <button size="sm" variant="quiet" icon="copy" onClick={() => onCopy(copyableOutput)}>
+          Copy output
+        </button>
+      </row>}
     </col>}
   </col>;
 }
@@ -165,17 +183,20 @@ export interface EntryCallbacks {
   thoughtFoldOverrides: Map<string, boolean>;
   toolFoldOverrides: Map<string, boolean>;
   canRetry: boolean;
+  canReconnect: boolean;
   canSwitchAccount: boolean;
   getBlob(key: string, data: string, mimeType: string): string | undefined;
   onInspect(title: string, target: InspectTarget, subtitle?: string): void;
   onToggleThought(id: string, open: boolean): void;
   onToggleTool(id: string, collapsed: boolean): void;
   onRetry(): void;
+  onReconnect(): void;
   onSwitchModel(): void;
   onSwitchAccount(): void;
   onOpenAccount(): void;
   onOpenChanges(): void;
   onOpenSplit?(path: string, line?: number): void;
+  onRunCommand?(command: string): void;
   onAttachPath(path: string): void;
   onExport(): void;
   onCopy(text: string): void;
@@ -192,7 +213,10 @@ export function Entry({ entry, continued, streaming, turnNumber, callbacks }: {
   const showAvatar = callbacks.prefs.transcriptDensity !== 'compact';
   switch (entry.type) {
     case 'message': {
-      const msgNode = <message key={entry.id} variant="auto"
+      const withDivider = entry.role === 'user' && !!turnNumber && turnNumber > 1 && showAvatar;
+      const segments = entry.role === 'agent' && entry.text ? splitMarkdownSegments(entry.text) : undefined;
+      const hasCodeBlocks = !!segments?.some(seg => seg.kind === 'code');
+      const msgNode = <message key={withDivider ? 'msg' : entry.id} variant="auto"
         side={entry.role === 'user' ? 'end' : 'start'} author={entry.role === 'user' ? 'You' : 'Antigravity'}
         continued={continued}
         time={callbacks.prefs.showTimestamps ? entry.time : undefined}
@@ -224,12 +248,36 @@ export function Entry({ entry, continued, streaming, turnNumber, callbacks }: {
             </button>
           </col> : <text key={`img-${idx}`}><span s="muted">{`[Image: ${img.mimeType}]`}</span></text>;
         })}
-        {entry.text && (entry.role === 'user' ? <text wrap="char">{entry.text}</text> :
-          <md stream={callbacks.working} max={{ w: '80ch' }}>{entry.text}</md>)}
+        {entry.text && (entry.role === 'user'
+          ? <text wrap="char">{entry.text}</text>
+          : hasCodeBlocks && segments
+            ? <col gap="xs">
+              {segments.map((seg, idx) => seg.kind === 'prose'
+                ? <md key={`prose-${idx}`} max={{ w: '80ch' }}>{seg.text}</md>
+                : <col key={`code-${idx}`} gap="xs">
+                  <code lang={seg.lang} wrap>{seg.text}</code>
+                  <row gap="xs" align="center" wrap>
+                    {seg.lang && <text><span s="muted">{seg.lang}</span></text>}
+                    <button size="sm" variant="quiet" icon="copy" onClick={() => callbacks.onCopy(seg.text)}>
+                      Copy
+                    </button>
+                    <button size="sm" variant="quiet" icon="expand"
+                      onClick={() => callbacks.onInspect(seg.lang ? `Snippet (${seg.lang})` : 'Code snippet',
+                        { type: 'file', path: seg.lang ? `snippet.${seg.lang}` : 'snippet.txt', content: seg.text })}>
+                      Fullscreen
+                    </button>
+                    {!streaming && seg.closed !== false && seg.runnable && callbacks.onRunCommand && <button size="sm" variant="quiet" icon="terminal"
+                      onClick={() => callbacks.onRunCommand?.(seg.text)}>
+                      Run in split
+                    </button>}
+                  </row>
+                </col>)}
+            </col>
+            : <md stream={streaming} max={{ w: '80ch' }}>{entry.text}</md>)}
       </message>;
-      if (entry.role === 'user' && turnNumber && turnNumber > 1 && showAvatar) {
+      if (withDivider) {
         const turnLabel = callbacks.prefs.showTimestamps && entry.time ? `Turn ${turnNumber} · ${entry.time}` : `Turn ${turnNumber}`;
-        return <col key={`turn-${entry.id}`} gap="sm">
+        return <col key={entry.id} gap="sm">
           <rule variant="note" label={turnLabel} />
           {msgNode}
         </col>;
@@ -290,7 +338,7 @@ export function Entry({ entry, continued, streaming, turnNumber, callbacks }: {
         }}
         onToggle={event => callbacks.onToggleTool(entry.id, event.collapsed ?? !collapsed)}>
         <ToolBody call={entry.call} cwd={callbacks.cwd} showRawInput={summary.showRawInput} diffMode={callbacks.prefs.diffMode}
-          getBlob={callbacks.getBlob} onInspect={callbacks.onInspect} onOpenSplit={callbacks.onOpenSplit} />
+          getBlob={callbacks.getBlob} onInspect={callbacks.onInspect} onOpenSplit={callbacks.onOpenSplit} onCopy={callbacks.onCopy} />
       </tool>;
     }
     case 'plan': return <checklist key={entry.id} phases={[{ title: 'Plan', items: entry.entries.map((item, index) => ({
@@ -302,6 +350,7 @@ export function Entry({ entry, continued, streaming, turnNumber, callbacks }: {
         return <card key={entry.id} tone="error" icon="x-circle" head="Request failed">
           <text wrap="word">{entry.text}</text>
           <buttons variant="toolbar" label="Recovery actions">
+            {callbacks.canReconnect && <button size="sm" icon="repeat" onClick={callbacks.onReconnect}>Reconnect ACP</button>}
             {entry.retryable && callbacks.canRetry && <button size="sm" icon="repeat" onClick={callbacks.onRetry}>Retry</button>}
             <button variant="quiet" size="sm" icon="model" onClick={callbacks.onSwitchModel}>Switch model</button>
             {callbacks.canSwitchAccount && <button variant="quiet" size="sm" icon="user" onClick={callbacks.onSwitchAccount}>Switch account</button>}

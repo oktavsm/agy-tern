@@ -28,7 +28,7 @@ import {
 import { parseQuotaReport, readOfficialReport, type OfficialReport } from './reports';
 import { SessionNames } from './session-names';
 import { PromptTemplatesStore, type PromptTemplate } from './templates';
-import { openInTernSplit, sendTerminalAttention } from './tern-window';
+import { openInTernSplit, runCommandInTernSplit, sendTerminalAttention } from './tern-window';
 import { terminalLoginProblem } from './auth';
 import { DEFAULT_PREFS, PrefsStore, type ComposerLines, type DiffMode, type ToolDisplay, type TranscriptDensity, type UserPrefs } from './prefs';
 import {
@@ -40,6 +40,7 @@ import {
   listWorkspaceFiles,
   loadEmbeddedResourceAttachments,
   readImageAttachment,
+  readGitFileDiff,
   readWorkspaceTextPreview,
   resolvePastedImagePath,
   stripAtMention,
@@ -58,6 +59,7 @@ import {
   formatPlanSummary,
   formatTranscriptJson,
   formatTranscriptMarkdown,
+  parseUnifiedGitDiff,
   searchTranscript,
   summarizeQuotaRows,
   summarizeToolCall,
@@ -102,7 +104,7 @@ type Panel = { kind: 'commands' } | { kind: 'settings' } | { kind: 'config'; id:
   { kind: 'rename'; sessionId: string } | { kind: 'account' } | { kind: 'account-switch' } |
   { kind: 'changes' } | { kind: 'find' } | { kind: 'mcp' } | { kind: 'plugins' } | { kind: 'agents' } |
   { kind: 'templates' } | { kind: 'template-save' } | { kind: 'mcp-add' } | { kind: 'plugin-install' } |
-  { kind: 'confirm'; title: string; detail: string; actionLabel: string; returnTo: Panel; onConfirm(): void } |
+  { kind: 'confirm'; title: string; detail: string; actionLabel: string; returnTo?: Panel; onConfirm(): void } |
   { kind: 'inspect'; title: string; subtitle?: string; item: InspectTarget };
 
 interface QueuedPrompt {
@@ -145,6 +147,11 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
   let surface: Surface | undefined;
   let agent: AgentSession | undefined;
   let startup: Promise<void> | undefined;
+  let connectRunner: ((resumeId?: string) => Promise<void>) | undefined;
+  function reconnectAgent(): void {
+    if (quitting || !disconnected || agentConnecting || authBusy || busy || permissions.length || !connectRunner) return;
+    startup = connectRunner(activeSessionId || undefined);
+  }
   let turn: Promise<void> | undefined;
   let draft: Draft = launch?.draft ?? { text: '', cursor: 0 };
   let phase = 'Connecting to Antigravity';
@@ -152,6 +159,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
   let busy = false;
   let cancelling = false;
   let disconnected = false;
+  let agentConnecting = false;
   let quitting = false;
   let metadata: AgentMetadata = { configOptions: [], availableCommands: [] };
   let panel: Panel | undefined;
@@ -190,6 +198,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
   let attachedFiles: string[] = [];
   let attachedImages: LoadedImageAttachment[] = [];
   let gitChanges: GitStatusEntry[] = [];
+  const gitDiffCache = new Map<string, { status: 'loading' | 'ready'; hunks: DiffHunk[]; error?: string }>();
   let mcpServers: McpServerEntry[] = [];
   let pluginsList: PluginEntry[] = [];
   let agentsList: AgentEntry[] = [];
@@ -402,6 +411,16 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     openPanel({ kind: 'inspect', title, subtitle, item });
   }
 
+  function parentPanel(current: Panel): Panel | undefined {
+    if (current.kind === 'inspect') return inspectReturnPanel;
+    if (current.kind === 'confirm') return current.returnTo;
+    if (current.kind === 'template-save') return { kind: 'templates' };
+    if (current.kind === 'mcp-add') return { kind: 'mcp' };
+    if (current.kind === 'plugin-install') return { kind: 'plugins' };
+    if (current.kind === 'account-switch') return { kind: 'account' };
+    return undefined;
+  }
+
   function closePanel(): void {
     if (authBusy) return;
     reportAbort?.abort();
@@ -418,6 +437,17 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     autocompleteDismissed = true;
     render();
     surface?.focus('dock.draft');
+  }
+
+  function stepBackPanel(): void {
+    if (authBusy || !panel) return;
+    const back = parentPanel(panel);
+    if (back) {
+      inspectReturnPanel = undefined;
+      openPanel(back);
+      return;
+    }
+    closePanel();
   }
 
   function loadReport(command: OfficialReport): void {
@@ -707,6 +737,52 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     });
   }
 
+  function refreshWorkspaceFiles(): void {
+    void listWorkspaceFiles(options.cwd, 600, options.additionalDirectories).then(files => {
+      if (!quitting) { workspaceFiles = files; render(); }
+    }).catch(() => {});
+  }
+
+  function loadGitDiffPreview(entry: GitStatusEntry): void {
+    if (gitDiffCache.has(entry.path) || entry.status === '?' || entry.status === '??') return;
+    gitDiffCache.set(entry.path, { status: 'loading', hunks: [] });
+    void readGitFileDiff(options.cwd, entry.path).then(patch => {
+      if (quitting) return;
+      const parsed = parseUnifiedGitDiff(patch);
+      gitDiffCache.set(entry.path, { status: 'ready', hunks: parsed.hunks });
+      render();
+    }).catch(() => {
+      if (!quitting) {
+        gitDiffCache.set(entry.path, { status: 'ready', hunks: [], error: 'Unable to read git diff' });
+        render();
+      }
+    });
+  }
+
+  function promptRunCommand(command: string): void {
+    const trimmed = command.trim();
+    if (!trimmed || permissions.length || quitting) return;
+    const preview = trimmed.replace(/\s+/g, ' ').slice(0, 120);
+    openPanel({
+      kind: 'confirm',
+      title: 'Run command in Tern split?',
+      detail: `Executes in ${options.cwd}: ${preview}${trimmed.length > 120 ? '...' : ''}`,
+      actionLabel: 'Run in split',
+      returnTo: panel,
+      onConfirm: () => {
+        panel = undefined;
+        panelError = '';
+        render();
+        surface?.focus('dock.draft');
+        void runCommandInTernSplit(options.cwd, trimmed).then(result => {
+          if (quitting) return;
+          if (result.ok) showToast('Running in Tern split', preview.slice(0, 48));
+          else showToast('Could not run in Tern split', result.error ?? 'Unknown error');
+        });
+      },
+    });
+  }
+
   function openConversation(id: string, mode: 'load' | 'resume' = 'load'): void {
     if (id === activeSessionId) { closePanel(); return; }
     runSessionAction(mode === 'resume' ? 'Resuming conversation' : 'Opening conversation', async connected => {
@@ -789,6 +865,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     if (next.kind === 'templates') loadTemplates();
     if (next.kind === 'sessions' && agent?.capabilities.listSessions) loadSessions();
     if (next.kind === 'changes') {
+      gitDiffCache.clear();
       void detectGitStatus(options.cwd).then(rows => {
         if (!quitting) { gitChanges = rows; render(); }
       }).catch(() => {});
@@ -942,6 +1019,9 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       clearPermissions();
       if (!quitting && userPrefs.notifyOnTurnComplete && elapsed >= 8_000) {
         sendTerminalAttention('agy-tern', completedNormally ? 'Turn complete' : phase);
+      }
+      if (!quitting && !disconnected) {
+        refreshWorkspaceFiles();
       }
       if (completedNormally && !quitting && !disconnected && !permissions.length && queuedPrompts.length > 0) {
         const next = queuedPrompts.shift()!;
@@ -1118,7 +1198,8 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       const confirmPanel = panel;
       return [
         { label: confirmPanel.actionLabel, detail: confirmPanel.detail, disabled: extLoading, choose: confirmPanel.onConfirm },
-        { label: 'Cancel', detail: 'Return without making changes.', choose: () => openPanel(confirmPanel.returnTo) },
+        { label: 'Cancel', detail: 'Return without making changes.',
+          choose: () => { if (confirmPanel.returnTo) openPanel(confirmPanel.returnTo); else closePanel(); } },
       ];
     }
     if (panel.kind === 'sessions') {
@@ -1608,6 +1689,10 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     const highlightedGitDiff = highlightedGit
       ? [...sessionDiffs].reverse().find(item => item.path === highlightedGit.path)
       : undefined;
+    if (highlightedGit && !highlightedGitDiff) {
+      loadGitDiffPreview(highlightedGit);
+    }
+    const cachedGitDiff = highlightedGit ? gitDiffCache.get(highlightedGit.path) : undefined;
     const highlightedPath = highlightedEdit?.path ?? highlightedGit?.path;
 
     const items: PickerItem[] = usingGit
@@ -1664,12 +1749,14 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
           if (typeof event.value === 'string') { pickerTab = event.value; pickerSelected = ''; render(); }
         },
         refresh: () => {
+          gitDiffCache.clear();
           void detectGitStatus(options.cwd).then(rows => {
             if (!quitting) { gitChanges = rows; render(); }
           }).catch(() => {});
         },
         split: () => {
-          if (highlightedPath) openSplit(highlightedPath, highlightedEdit?.hunks[0]?.newStart);
+          const line = highlightedEdit?.hunks[0]?.newStart ?? cachedGitDiff?.hunks[0]?.newStart;
+          if (highlightedPath) openSplit(highlightedPath, line);
         },
         inspect: () => {
           const targetEdit = highlightedEdit ?? highlightedGitDiff;
@@ -1679,6 +1766,8 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
             } else {
               openInspect(basename(targetEdit.path), { type: 'diff', path: targetEdit.path, hunks: targetEdit.hunks }, targetEdit.path);
             }
+          } else if (highlightedGit && cachedGitDiff?.hunks.length) {
+            openInspect(basename(highlightedGit.path), { type: 'diff', path: highlightedGit.path, hunks: cachedGitDiff.hunks }, highlightedGit.path);
           } else if (highlightedGit) {
             void readWorkspaceTextPreview(options.cwd, highlightedGit.path).then(preview => {
               if (!quitting) openInspect(basename(highlightedGit.path), { type: 'file', path: preview.path, content: preview.text, truncated: preview.truncated }, highlightedGit.path);
@@ -1698,11 +1787,15 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         ? (highlightedGitDiff.newFileText !== undefined
           ? <code key="pv" numbers path={highlightedGitDiff.path}>{highlightedGitDiff.newFileText}</code>
           : <diff key="pv" mode={userPrefs.diffMode} path={highlightedGitDiff.path} hunks={highlightedGitDiff.hunks} />)
-        : <kv key="pv" items={[
-          { k: 'Path', v: highlightedGit.path },
-          { k: 'Git status', v: highlightedGit.status },
-          { k: 'Workspace', v: options.cwd },
-        ]} />)}
+        : cachedGitDiff?.status === 'loading'
+          ? <spinner key="pv" label={`Reading git diff for ${highlightedGit.path}`} />
+          : cachedGitDiff?.hunks.length
+            ? <diff key="pv" mode={userPrefs.diffMode} path={highlightedGit.path} hunks={cachedGitDiff.hunks} />
+            : <kv key="pv" items={[
+              { k: 'Path', v: highlightedGit.path },
+              { k: 'Git status', v: highlightedGit.status },
+              { k: 'Diff', v: 'No text diff (untracked or binary)' },
+            ]} />)}
     </picker>;
   }
 
@@ -1781,6 +1874,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       preview={highlighted ? 'below' : 'none'}
       actions={[
         { id: 'copy', label: 'Copy', disabled: !highlighted ? (true as const) : undefined },
+        { id: 'jump', label: 'Jump to chat', disabled: !highlighted ? (true as const) : undefined },
         { id: 'close', label: 'Close', keys: ['esc'] },
         { id: 'inspect', label: 'Inspect', primary: true, keys: ['enter'],
           disabled: !highlighted ? (true as const) : undefined },
@@ -1797,6 +1891,14 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
           void copyToClipboard(highlighted.preview || highlighted.detail).then(copied => {
             if (!quitting) showToast(copied ? 'Copied match to clipboard' : 'Clipboard unavailable');
           });
+        },
+        jump: () => {
+          if (!highlighted) return;
+          const targetEntry = highlighted.entry;
+          if (targetEntry.type === 'thought') thoughtFoldOverrides.set(targetEntry.id, true);
+          else if (targetEntry.type === 'tool') toolFoldOverrides.set(targetEntry.id, false);
+          closePanel();
+          surface?.reveal(`main.conversation.${targetEntry.id}`, 'start');
         },
         inspect: () => { if (highlighted) inspectFindMatch(highlighted); },
       }}>
@@ -2419,6 +2521,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       thoughtFoldOverrides,
       toolFoldOverrides,
       canRetry: !!(lastPrompt || lastImages.length) && !busy && !!agent && !disconnected && !permission,
+      canReconnect: disconnected && !agentConnecting && !authBusy && !busy,
       canSwitchAccount: loginAvailable && !busy && !authBusy,
       getBlob: blobForImage,
       onInspect: openInspect,
@@ -2432,6 +2535,9 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       },
       onRetry() {
         if (lastPrompt || lastImages.length) submitPrompt(lastPrompt, lastImages, lastFiles);
+      },
+      onReconnect() {
+        reconnectAgent();
       },
       onSwitchModel() {
         openPanel(currentModel ? { kind: 'config', id: currentModel.id } : { kind: 'settings' });
@@ -2447,6 +2553,9 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       },
       onOpenSplit(path, line) {
         openSplit(path, line);
+      },
+      onRunCommand(command) {
+        promptRunCommand(command);
       },
       onAttachPath(path) {
         attachFile(path);
@@ -2638,8 +2747,10 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
           onAction={{ send, stop }} />
         <status key="bar">
           <seg key="state" priority={10}
-            tone={busy || authBusy || !!sessionOperation ? 'accent' : disconnected || phase.includes('failed') ? 'error' : agent ? 'success' : 'muted'}
-            text={authBusy ? 'Signing in' : sessionOperation ?? phase} />
+            tone={busy || authBusy || agentConnecting || !!sessionOperation ? 'accent' : disconnected || phase.includes('failed') ? 'error' : agent ? 'success' : 'muted'}
+            text={authBusy ? 'Signing in' : sessionOperation ?? phase}
+            title={disconnected && !agentConnecting ? 'Click to reconnect agy ACP' : undefined}
+            onClick={() => { if (disconnected && !agentConnecting && !authBusy) reconnectAgent(); }} />
           {historyIndex !== undefined && <seg key="history" priority={6} icon="history" tone="accent"
             text={`History ${historyIndex + 1}/${promptHistory.length}`}
             title="Up/Down cycles sent prompts; type to keep editing" />}
@@ -2779,177 +2890,193 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     }
     render();
     surface.focus(launch?.openAccount ? null : 'dock.draft');
-    startup = connectAgent({ ...options, signal }, {
-      authentication(next) {
-        if (!quitting) { authentication = next; authenticationKnown = true; render(); }
-      },
-      metadata(next) {
-        if (!quitting) { metadata = next; commandSelection = 0; render(); }
-      },
-      sessionChanged(id) {
-        if (activeSessionId) {
-          conversations.set(activeSessionId, conversation);
-          drafts.set(activeSessionId, draft);
-          conversation = new Conversation();
-          draft = drafts.get(id) ?? { text: '', cursor: 0 };
-          expandedThoughts.clear();
-          thoughtFoldOverrides.clear();
-          toolFoldOverrides.clear();
-        }
-        activeSessionId = id;
-        clearPermissions();
-        render();
-      },
-      update(notification) {
-        if (quitting) return;
-        const update = notification.update;
-        if (update.sessionUpdate === 'session_info_update') {
-          const info = sessionInfo.get(notification.sessionId) ?? { sessionId: notification.sessionId, cwd: options.cwd };
-          if (update.title !== undefined) info.title = update.title;
-          if (update.updatedAt !== undefined) info.updatedAt = update.updatedAt;
-          sessionInfo.set(notification.sessionId, info);
-        }
-        // Live prompts are already inserted locally; replayed user messages are not.
-        if (!busy || update.sessionUpdate !== 'user_message_chunk') {
-          conversation.update(update, Date.now(), busy ? clockTime() : undefined);
-        }
-        if (userPrefs.autoPreviewMedia && !panel && !permissions.length) {
-          if (update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update') {
-            const call = conversation.getTool(update.toolCallId)?.call;
-            if (call) {
-              const imgPath = extractToolImagePaths(call, options.cwd).find(p => existsSync(p) && !previewedMedia.has(`path:${p}`));
-              if (imgPath) {
-                previewedMedia.add(`path:${imgPath}`);
-                const label = formatPathLabel(imgPath, options.cwd);
-                openInspect(basename(label), { type: 'image-path', path: imgPath }, label);
-                return;
-              }
-              const inlineImg = extractToolInlineImages(call)[0];
-              if (inlineImg) {
-                const imgKey = `tool-inline:${call.toolCallId}:${inlineImg.data.slice(0, 48)}`;
-                if (!previewedMedia.has(imgKey)) {
-                  previewedMedia.add(imgKey);
-                  const blob = blobForImage(imgKey, inlineImg.data, inlineImg.mimeType);
-                  if (blob) {
-                    openInspect(call.title ?? 'Live image preview', { type: 'image-blob', blob, mimeType: inlineImg.mimeType }, inlineImg.mimeType);
-                    return;
+
+    const startAgentConnection = (resumeId?: string): Promise<void> => {
+      if (quitting || agentConnecting) return Promise.resolve();
+      agentConnecting = true;
+      disconnected = false;
+      phase = resumeId ? 'Reconnecting to Antigravity' : 'Connecting to Antigravity';
+      render();
+      return connectAgent({ ...options, signal }, {
+        authentication(next) {
+          if (!quitting) { authentication = next; authenticationKnown = true; render(); }
+        },
+        metadata(next) {
+          if (!quitting) { metadata = next; commandSelection = 0; render(); }
+        },
+        sessionChanged(id) {
+          if (activeSessionId) {
+            conversations.set(activeSessionId, conversation);
+            drafts.set(activeSessionId, draft);
+            conversation = new Conversation();
+            draft = drafts.get(id) ?? { text: '', cursor: 0 };
+            expandedThoughts.clear();
+            thoughtFoldOverrides.clear();
+            toolFoldOverrides.clear();
+          }
+          activeSessionId = id;
+          clearPermissions();
+          render();
+        },
+        update(notification) {
+          if (quitting) return;
+          const update = notification.update;
+          if (update.sessionUpdate === 'session_info_update') {
+            const info = sessionInfo.get(notification.sessionId) ?? { sessionId: notification.sessionId, cwd: options.cwd };
+            if (update.title !== undefined) info.title = update.title;
+            if (update.updatedAt !== undefined) info.updatedAt = update.updatedAt;
+            sessionInfo.set(notification.sessionId, info);
+          }
+          if (!busy || update.sessionUpdate !== 'user_message_chunk') {
+            conversation.update(update, Date.now(), busy ? clockTime() : undefined);
+          }
+          if (userPrefs.autoPreviewMedia && !panel && !permissions.length) {
+            if (update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update') {
+              const call = conversation.getTool(update.toolCallId)?.call;
+              if (call) {
+                const imgPath = extractToolImagePaths(call, options.cwd).find(p => existsSync(p) && !previewedMedia.has(`path:${p}`));
+                if (imgPath) {
+                  previewedMedia.add(`path:${imgPath}`);
+                  const label = formatPathLabel(imgPath, options.cwd);
+                  openInspect(basename(label), { type: 'image-path', path: imgPath }, label);
+                  return;
+                }
+                const inlineImg = extractToolInlineImages(call)[0];
+                if (inlineImg) {
+                  const imgKey = `tool-inline:${call.toolCallId}:${inlineImg.data.slice(0, 48)}`;
+                  if (!previewedMedia.has(imgKey)) {
+                    previewedMedia.add(imgKey);
+                    const blob = blobForImage(imgKey, inlineImg.data, inlineImg.mimeType);
+                    if (blob) {
+                      openInspect(call.title ?? 'Live image preview', { type: 'image-blob', blob, mimeType: inlineImg.mimeType }, inlineImg.mimeType);
+                      return;
+                    }
                   }
                 }
               }
-            }
-          } else if (update.sessionUpdate === 'agent_message_chunk' && update.content.type === 'image') {
-            const imgKey = `msg-inline:${notification.sessionId}:${update.content.data.slice(0, 48)}`;
-            if (!previewedMedia.has(imgKey)) {
-              previewedMedia.add(imgKey);
-              const blob = blobForImage(imgKey, update.content.data, update.content.mimeType);
-              if (blob) {
-                openInspect('Live image preview', { type: 'image-blob', blob, mimeType: update.content.mimeType }, update.content.mimeType);
-                return;
+            } else if (update.sessionUpdate === 'agent_message_chunk' && update.content.type === 'image') {
+              const imgKey = `msg-inline:${notification.sessionId}:${update.content.data.slice(0, 48)}`;
+              if (!previewedMedia.has(imgKey)) {
+                previewedMedia.add(imgKey);
+                const blob = blobForImage(imgKey, update.content.data, update.content.mimeType);
+                if (blob) {
+                  openInspect('Live image preview', { type: 'image-blob', blob, mimeType: update.content.mimeType }, update.content.mimeType);
+                  return;
+                }
               }
             }
           }
-        }
-        render();
-      },
-      permission(prompt) {
-        if (quitting || authBusy || cancelling || disconnected) { prompt.answer(null); return; }
-        closePanel();
-        conversation.tool(prompt.request.toolCall);
-        if (!prompt.request.options.some(option => option.kind === 'allow_once')) {
-          const deny = prompt.request.options.find(option => option.kind === 'reject_once');
-          conversation.tool(prompt.request.toolCall).approved = 'denied';
-          conversation.notice(`${prompt.request.toolCall.title ?? prompt.request.toolCall.toolCallId}: no one-time allowance offered; request denied.`);
-          prompt.answer(deny?.optionId ?? null);
-        } else {
-          permissions.push(prompt);
-          if (userPrefs.notifyOnTurnComplete) {
-            sendTerminalAttention('agy-tern', `Approval required: ${prompt.request.toolCall.title ?? 'tool call'}`);
+          render();
+        },
+        permission(prompt) {
+          if (quitting || authBusy || cancelling || disconnected) { prompt.answer(null); return; }
+          closePanel();
+          conversation.tool(prompt.request.toolCall);
+          if (!prompt.request.options.some(option => option.kind === 'allow_once')) {
+            const deny = prompt.request.options.find(option => option.kind === 'reject_once');
+            conversation.tool(prompt.request.toolCall).approved = 'denied';
+            conversation.notice(`${prompt.request.toolCall.title ?? prompt.request.toolCall.toolCallId}: no one-time allowance offered; request denied.`);
+            prompt.answer(deny?.optionId ?? null);
+          } else {
+            permissions.push(prompt);
+            if (userPrefs.notifyOnTurnComplete) {
+              sendTerminalAttention('agy-tern', `Approval required: ${prompt.request.toolCall.title ?? 'tool call'}`);
+            }
+          }
+          render();
+        },
+        diagnostic(text) {
+          if (!quitting) { conversation.notice(text); render(); }
+        },
+        disconnected(message) {
+          if (quitting) return;
+          agent = undefined;
+          agentConnecting = false;
+          disconnected = true;
+          phase = 'Disconnected';
+          clearPermissions();
+          conversation.notice(message, true);
+          process.exitCode = 1;
+          render();
+        },
+      }).then(async connected => {
+        if (quitting) { await connected.close(); return; }
+        agent = connected;
+        agentConnecting = false;
+        process.exitCode = undefined;
+        metadata = connected.metadata;
+        activeSessionId = connected.sessionId;
+        if (!resumeId && options.initialConfig) {
+          const requests: Array<{ opt: SessionConfigOption | undefined; wanted: string; label: string }> = [
+            ...(options.initialConfig.model ? [{ opt: modelOption(connected.metadata.configOptions), wanted: options.initialConfig.model, label: 'model' }] : []),
+            ...(options.initialConfig.mode ? [{ opt: connected.metadata.configOptions.find(o => o.category === 'mode' || o.id === 'mode'), wanted: options.initialConfig.mode, label: 'mode' }] : []),
+            ...(options.initialConfig.thinking ? [{ opt: thinkingOption(connected.metadata.configOptions), wanted: options.initialConfig.thinking, label: 'thinking level' }] : []),
+          ];
+          for (const item of requests) {
+            if (quitting) break;
+            if (!item.opt) {
+              conversation.notice(`Requested --${item.label.replace(' level', '')} "${item.wanted}", but this ACP session did not advertise that option.`);
+              continue;
+            }
+            const matched = configValues(item.opt).find(val =>
+              val.value === item.wanted || val.name.toLowerCase() === item.wanted.toLowerCase());
+            if (!matched) {
+              conversation.notice(`Requested --${item.label.replace(' level', '')} "${item.wanted}" was not among session options.`, true);
+              continue;
+            }
+            try {
+              await connected.setConfigOption(item.opt.id, matched.value);
+              metadata = connected.metadata;
+            } catch (err) {
+              conversation.notice(`Failed to apply --${item.label.replace(' level', '')}: ${err instanceof Error ? err.message : String(err)}`, true);
+            }
           }
         }
-        render();
-      },
-      diagnostic(text) {
-        if (!quitting) { conversation.notice(text); render(); }
-      },
-      disconnected(message) {
         if (quitting) return;
+        const targetId = resumeId ?? launch?.conversationId;
+        if (targetId && targetId !== connected.sessionId) {
+          try {
+            if (connected.capabilities.loadSession) await connected.loadSession(targetId);
+            else if (connected.capabilities.resumeSession && connected.resumeSession) await connected.resumeSession(targetId);
+            else if (!resumeId) conversation.notice(`Cannot open --conversation ${targetId}: session load/resume not advertised.`, true);
+          } catch (err) {
+            conversation.notice(`Failed to open conversation ${targetId}: ${err instanceof Error ? err.message : String(err)}`, true);
+          }
+        } else if (!resumeId && launch?.continueLast && connected.capabilities.listSessions) {
+          try {
+            const list = await connected.listSessions();
+            const sorted = [...list.sessions].sort((a, b) => (Date.parse(b.updatedAt ?? '') || 0) - (Date.parse(a.updatedAt ?? '') || 0));
+            const latest = sorted[0];
+            if (latest && latest.sessionId !== connected.sessionId) {
+              if (connected.capabilities.loadSession) await connected.loadSession(latest.sessionId);
+              else if (connected.capabilities.resumeSession && connected.resumeSession) await connected.resumeSession(latest.sessionId);
+            } else if (!latest) {
+              conversation.notice('No previous conversation found in this workspace for --continue; started a new session.');
+            }
+          } catch (err) {
+            conversation.notice(`Failed to continue latest conversation: ${err instanceof Error ? err.message : String(err)}`, true);
+          }
+        }
+        if (quitting) return;
+        phase = 'Ready';
+        render();
+        if (resumeId) showToast('Reconnected to Antigravity');
+        else if (launch?.initialPrompt && !disconnected) submitPrompt(launch.initialPrompt);
+      }).catch(error => {
+        if (quitting) return;
+        agent = undefined;
+        agentConnecting = false;
         disconnected = true;
-        phase = 'Disconnected';
+        phase = 'Connection failed';
         clearPermissions();
-        conversation.notice(message, true);
+        conversation.notice(error instanceof Error ? error.message : String(error), true);
         process.exitCode = 1;
         render();
-      },
-    }).then(async connected => {
-      if (quitting) { await connected.close(); return; }
-      agent = connected;
-      metadata = connected.metadata;
-      activeSessionId = connected.sessionId;
-      if (options.initialConfig) {
-        const requests: Array<{ opt: SessionConfigOption | undefined; wanted: string; label: string }> = [
-          ...(options.initialConfig.model ? [{ opt: modelOption(connected.metadata.configOptions), wanted: options.initialConfig.model, label: 'model' }] : []),
-          ...(options.initialConfig.mode ? [{ opt: connected.metadata.configOptions.find(o => o.category === 'mode' || o.id === 'mode'), wanted: options.initialConfig.mode, label: 'mode' }] : []),
-          ...(options.initialConfig.thinking ? [{ opt: thinkingOption(connected.metadata.configOptions), wanted: options.initialConfig.thinking, label: 'thinking level' }] : []),
-        ];
-        for (const item of requests) {
-          if (quitting) break;
-          if (!item.opt) {
-            conversation.notice(`Requested --${item.label.replace(' level', '')} "${item.wanted}", but this ACP session did not advertise that option.`);
-            continue;
-          }
-          const matched = configValues(item.opt).find(val =>
-            val.value === item.wanted || val.name.toLowerCase() === item.wanted.toLowerCase());
-          if (!matched) {
-            conversation.notice(`Requested --${item.label.replace(' level', '')} "${item.wanted}" was not among session options.`, true);
-            continue;
-          }
-          try {
-            await connected.setConfigOption(item.opt.id, matched.value);
-            metadata = connected.metadata;
-          } catch (err) {
-            conversation.notice(`Failed to apply --${item.label.replace(' level', '')}: ${err instanceof Error ? err.message : String(err)}`, true);
-          }
-        }
-      }
-      if (quitting) return;
-      if (launch?.conversationId) {
-        try {
-          if (connected.capabilities.loadSession) await connected.loadSession(launch.conversationId);
-          else if (connected.capabilities.resumeSession && connected.resumeSession) await connected.resumeSession(launch.conversationId);
-          else conversation.notice(`Cannot open --conversation ${launch.conversationId}: session load/resume not advertised.`, true);
-        } catch (err) {
-          conversation.notice(`Failed to open --conversation ${launch.conversationId}: ${err instanceof Error ? err.message : String(err)}`, true);
-        }
-      } else if (launch?.continueLast && connected.capabilities.listSessions) {
-        try {
-          const list = await connected.listSessions();
-          const sorted = [...list.sessions].sort((a, b) => (Date.parse(b.updatedAt ?? '') || 0) - (Date.parse(a.updatedAt ?? '') || 0));
-          const latest = sorted[0];
-          if (latest && latest.sessionId !== connected.sessionId) {
-            if (connected.capabilities.loadSession) await connected.loadSession(latest.sessionId);
-            else if (connected.capabilities.resumeSession && connected.resumeSession) await connected.resumeSession(latest.sessionId);
-          } else if (!latest) {
-            conversation.notice('No previous conversation found in this workspace for --continue; started a new session.');
-          }
-        } catch (err) {
-          conversation.notice(`Failed to continue latest conversation: ${err instanceof Error ? err.message : String(err)}`, true);
-        }
-      }
-      if (quitting) return;
-      phase = 'Ready';
-      render();
-      if (launch?.initialPrompt && !disconnected) {
-        submitPrompt(launch.initialPrompt);
-      }
-    }).catch(error => {
-      if (quitting) return;
-      disconnected = true;
-      phase = 'Connection failed';
-      clearPermissions();
-      conversation.notice(error instanceof Error ? error.message : String(error), true);
-      process.exitCode = 1;
-      render();
-    });
+      });
+    };
+
+    connectRunner = startAgentConnection;
+    startup = startAgentConnection();
     while (!quitting) {
       const input = await Promise.race([session.next(), stopped.promise]);
       if (!input || surface.closed) break;
@@ -2967,7 +3094,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       const key = input.key;
       if (((key.ctrl || key.meta) && key.name === 'q') || (key.ctrl && key.name === 'c')) { quit(); continue; }
       if (key.name === 'escape') {
-        if (panel) closePanel();
+        if (panel) stepBackPanel();
         else if (autocomplete().length) { autocompleteDismissed = true; render(); }
         else stop();
         continue;

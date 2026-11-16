@@ -571,3 +571,145 @@ export function searchTranscript(entries: readonly TranscriptEntry[], cwd: strin
   }
   return matches.reverse();
 }
+
+const RUNNABLE_LANGS = new Set(['sh', 'bash', 'zsh', 'shell', 'fish', 'console', 'terminal']);
+
+export interface MarkdownSegment {
+  kind: 'prose' | 'code';
+  text: string;
+  lang?: string;
+  runnable?: boolean;
+  closed?: boolean;
+}
+
+export function isRunnableCodeLang(lang?: string): boolean {
+  const normalized = lang?.trim().toLowerCase();
+  return !!normalized && RUNNABLE_LANGS.has(normalized);
+}
+
+/** Split Markdown into prose chunks and fenced code blocks for per-block copy and run controls. */
+export function splitMarkdownSegments(markdown: string): MarkdownSegment[] {
+  if (!markdown) return [];
+  const lines = markdown.replace(/\r\n?/g, '\n').split('\n');
+  const segments: MarkdownSegment[] = [];
+  let proseLines: string[] = [];
+  let fenceChar: '`' | '~' | undefined;
+  let fenceLen = 0;
+  let fenceLang = '';
+  let codeLines: string[] = [];
+
+  const flushProse = (): void => {
+    const text = proseLines.join('\n').trim();
+    if (text) segments.push({ kind: 'prose', text });
+    proseLines = [];
+  };
+
+  for (const line of lines) {
+    if (!fenceChar) {
+      const openMatch = /^\s{0,3}(`{3,}|~{3,})([^\n]*)$/.exec(line);
+      if (openMatch) {
+        const marker = openMatch[1]!;
+        const info = openMatch[2]!.trim();
+        if (marker[0] === '`' && info.includes('`')) {
+          proseLines.push(line);
+          continue;
+        }
+        flushProse();
+        fenceChar = marker[0] as '`' | '~';
+        fenceLen = marker.length;
+        fenceLang = info.split(/\s+/)[0] ?? '';
+        codeLines = [];
+      } else {
+        proseLines.push(line);
+      }
+      continue;
+    }
+
+    const closeMatch = /^\s{0,3}(`{3,}|~{3,})\s*$/.exec(line);
+    if (closeMatch && closeMatch[1]![0] === fenceChar && closeMatch[1]!.length >= fenceLen) {
+      const code = codeLines.join('\n');
+      const lang = fenceLang || undefined;
+      segments.push({
+        kind: 'code',
+        text: code,
+        ...(lang ? { lang } : {}),
+        runnable: isRunnableCodeLang(lang) && code.trim().length > 0,
+        closed: true,
+      });
+      fenceChar = undefined;
+      fenceLen = 0;
+      fenceLang = '';
+      codeLines = [];
+    } else {
+      codeLines.push(line);
+    }
+  }
+
+  if (fenceChar) {
+    const code = codeLines.join('\n');
+    const lang = fenceLang || undefined;
+    segments.push({
+      kind: 'code',
+      text: code,
+      ...(lang ? { lang } : {}),
+      runnable: false,
+      closed: false,
+    });
+  } else {
+    flushProse();
+  }
+  return segments;
+}
+
+/** Parse standard `git diff` unified output into Tern DiffHunk blocks. */
+export function parseUnifiedGitDiff(patchText: string): { hunks: DiffHunk[]; added: number; removed: number } {
+  const hunks: DiffHunk[] = [];
+  let added = 0;
+  let removed = 0;
+  let current: { oldStart: number; newStart: number; lines: string[] } | undefined;
+
+  for (const line of patchText.replace(/\r\n?/g, '\n').split('\n')) {
+    const hdr = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
+    if (hdr) {
+      if (current) hunks.push(current);
+      current = { oldStart: Number(hdr[1]), newStart: Number(hdr[2]), lines: [] };
+      continue;
+    }
+    if (!current) continue;
+    if (line.startsWith('diff --git ') || line.startsWith('--- ') || line.startsWith('+++ ')) {
+      hunks.push(current);
+      current = undefined;
+      continue;
+    }
+    if (line.startsWith('+')) {
+      added++;
+      current.lines.push(line);
+    } else if (line.startsWith('-')) {
+      removed++;
+      current.lines.push(line);
+    } else if (line.startsWith(' ')) {
+      current.lines.push(line);
+    }
+  }
+  if (current) hunks.push(current);
+  return { hunks, added, removed };
+}
+
+/** Extract clean copyable text from a tool call's rawOutput payload. */
+export function extractToolOutputText(rawOutput: unknown): string | undefined {
+  if (rawOutput === undefined || rawOutput === null || rawOutput === '') return undefined;
+  if (typeof rawOutput === 'string') {
+    const cleaned = rawOutput.trimEnd();
+    return cleaned ? cleaned : undefined;
+  }
+  if (typeof rawOutput === 'object' && !Array.isArray(rawOutput)) {
+    const rec = rawOutput as Record<string, unknown>;
+    const stdout = typeof rec.stdout === 'string' ? rec.stdout.trimEnd() : undefined;
+    const stderr = typeof rec.stderr === 'string' ? rec.stderr.trimEnd() : undefined;
+    if (stdout !== undefined || stderr !== undefined) {
+      const joined = [stdout, stderr].filter(Boolean).join('\n');
+      return joined || undefined;
+    }
+  }
+  return JSON.stringify(rawOutput, null, 2);
+}
