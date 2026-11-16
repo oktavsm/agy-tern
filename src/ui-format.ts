@@ -1,5 +1,7 @@
 import { spawn } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { extname, isAbsolute, relative, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import type { SessionConfigOption, ToolCallUpdate, UsageUpdate } from '@agentclientprotocol/sdk';
 import type { Chip, DiffHunk } from '@stencil-hq/tern';
 import { contentText, type AgentPlan, type InlineImage, type TranscriptEntry } from './model';
@@ -514,25 +516,55 @@ function looksLikeImagePath(candidate: string): boolean {
   return TOOL_IMAGE_EXTS.has(extname(candidate.trim()).toLowerCase());
 }
 
-/** Extract unique image/screenshot paths referenced by a tool call's locations, inputs, or diffs. */
+function resolveLocalImageCandidate(raw: string, cwd: string): string | undefined {
+  let candidate = raw.trim();
+  if (!candidate || /^https?:\/\//i.test(candidate) || /^data:/i.test(candidate)) return undefined;
+  if (candidate.startsWith('file://')) {
+    try {
+      candidate = fileURLToPath(candidate);
+    } catch {
+      return undefined;
+    }
+  }
+  if (!looksLikeImagePath(candidate)) return undefined;
+  return isAbsolute(candidate) ? resolve(candidate) : resolve(cwd, candidate);
+}
+
+/** Extract unique image/screenshot paths referenced by a tool call's locations, inputs, diffs, or outputs. */
 export function extractToolImagePaths(call: ToolCallUpdate, cwd: string): string[] {
   const seen = new Set<string>();
   const add = (raw?: string): void => {
-    if (!raw || !looksLikeImagePath(raw)) return;
-    const trimmed = raw.trim();
-    const resolved = isAbsolute(trimmed) ? trimmed : resolve(cwd, trimmed);
-    seen.add(resolved);
+    if (!raw) return;
+    const resolved = resolveLocalImageCandidate(raw, cwd);
+    if (resolved) seen.add(resolved);
   };
   for (const loc of call.locations ?? []) add(loc.path);
-  const input = call.rawInput;
-  if (typeof input === 'object' && input !== null && !Array.isArray(input)) {
-    const rec = input as Record<string, unknown>;
-    for (const key of ['path', 'file_path', 'filePath', 'target_file', 'TargetFile', 'Path', 'output', 'outputPath', 'screenshotPath']) {
+  for (const container of [call.rawInput, call.rawOutput]) {
+    const rec = asRecord(container);
+    if (!rec) continue;
+    for (const key of ['path', 'file', 'file_path', 'filePath', 'target_file', 'TargetFile', 'Path', 'output', 'outputPath', 'screenshotPath', 'imagePath', 'url']) {
       if (typeof rec[key] === 'string') add(rec[key]);
     }
   }
   for (const item of call.content ?? []) {
     if (item.type === 'diff') add(item.path);
+  }
+  return [...seen];
+}
+
+/** Extract existing local image paths referenced via Markdown images or backticked paths inside prose. */
+export function extractMarkdownImagePaths(text: string, cwd: string): string[] {
+  if (!text) return [];
+  const seen = new Set<string>();
+  const addIfExists = (raw: string): void => {
+    const resolved = resolveLocalImageCandidate(raw, cwd);
+    if (resolved && existsSync(resolved)) seen.add(resolved);
+  };
+  for (const match of text.matchAll(/!\[[^\]]*]\(([^)\s]+)\)/g)) {
+    if (match[1]) addIfExists(match[1]);
+  }
+  for (const match of text.matchAll(/`([^\n`]+\.(?:png|jpe?g|webp|gif))`/gi)) {
+    if (match[1]) addIfExists(match[1]);
   }
   return [...seen];
 }

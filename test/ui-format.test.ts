@@ -5,6 +5,7 @@ import {
   clipInlinePreview,
   collectSessionDiffs,
   countSessionDiffs,
+  extractMarkdownImagePaths,
   extractToolImagePaths,
   extractToolInlineImages,
   extractToolOutputText,
@@ -306,5 +307,15 @@ describe('ui formatting helpers', () => {
     const clippedHunks = clipDiffHunks([{ oldStart: 1, newStart: 1, lines: Array.from({ length: 50 }, () => '+x') }], 15);
     expect(clippedHunks.truncated).toBe(true);
     expect(clippedHunks.hunks[0]?.lines).toHaveLength(15);
+
+    const cwd = process.cwd();
+    const toolImgs = extractToolImagePaths({
+      toolCallId: 'shot-1',
+      rawOutput: { screenshotPath: 'docs/screenshots/missing-not-checked.png' },
+    }, cwd);
+    expect(toolImgs).toEqual([`${cwd}/docs/screenshots/missing-not-checked.png`]);
+
+    // Real existing repo path matches via backticked or markdown image only when present on disk.
+    expect(extractMarkdownImagePaths('See ![remote](https://example.com/a.png) and `docs/nonexistent.png`', cwd)).toEqual([]);
   });
 });

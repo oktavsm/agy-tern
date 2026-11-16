@@ -1,5 +1,5 @@
 /** @jsxImportSource @stencil-hq/tern */
-import { existsSync } from 'node:fs';
+import { existsSync, statSync } from 'node:fs';
 import { basename, resolve } from 'node:path';
 import { connect, type DiffHunk, type JSX, type PickerGroup, type PickerItem, type PrefsRow, type Session, type Surface, type Tone } from '@stencil-hq/tern';
 import type { AuthMethodTerminal, SessionConfigOption, SessionInfo } from '@agentclientprotocol/sdk';
@@ -30,14 +30,26 @@ import { SessionNames } from './session-names';
 import { PromptTemplatesStore, type PromptTemplate } from './templates';
 import { openInTernSplit, runCommandInTernSplit, sendTerminalAttention } from './tern-window';
 import { terminalLoginProblem } from './auth';
-import { DEFAULT_PREFS, PrefsStore, type ComposerLines, type DiffMode, type ToolDisplay, type TranscriptDensity, type UserPrefs } from './prefs';
+import {
+  DEFAULT_MODEL_ID,
+  DEFAULT_PREFS,
+  DEFAULT_THINKING_ID,
+  PrefsStore,
+  type ComposerLines,
+  type DiffMode,
+  type ToolDisplay,
+  type TranscriptDensity,
+  type UserPrefs,
+} from './prefs';
 import {
   atMentionQuery,
   detectGitStatus,
-  filterWorkspaceFiles,
+  filterWorkspaceEntries,
   formatPromptWithAttachments,
   imageMimeType,
-  listWorkspaceFiles,
+  listDirectoryEntriesPreview,
+  listWorkspaceEntries,
+  loadDirectorySummaryResources,
   loadEmbeddedResourceAttachments,
   readImageAttachment,
   readGitFileDiff,
@@ -47,6 +59,7 @@ import {
   writeTranscriptExport,
   type GitStatusEntry,
   type LoadedImageAttachment,
+  type WorkspaceEntry,
 } from './files';
 import {
   buildUnifiedDiffHunks,
@@ -113,6 +126,7 @@ interface QueuedPrompt {
   id: string;
   text: string;
   files: string[];
+  dirs: string[];
   images: LoadedImageAttachment[];
 }
 interface Choice {
@@ -182,6 +196,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
   let lastPrompt = '';
   let lastImages: LoadedImageAttachment[] = [];
   let lastFiles: string[] = [];
+  let lastDirs: string[] = [];
   const undoStack: Draft[] = [];
   const promptHistory: string[] = [];
   let historyIndex: number | undefined;
@@ -189,6 +204,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
   let gitBranch: string | undefined;
   const workspaceName = basename(options.cwd) || options.cwd;
   const prefsStore = new PrefsStore();
+  let prefsReady: Promise<void> = Promise.resolve();
   const templatesStore = new PromptTemplatesStore(options.cwd);
   let templatesList: PromptTemplate[] = [];
   let userPrefs: UserPrefs = { ...DEFAULT_PREFS };
@@ -196,8 +212,10 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
   let pickerTab = 'all';
   let pickerSelected = '';
   let usageTab = 'overview';
-  let workspaceFiles: string[] = [];
+  let workspaceEntries: WorkspaceEntry[] = [];
+  let ignoredPathsSet = new Set<string>();
   let attachedFiles: string[] = [];
+  let attachedDirs: string[] = [];
   let attachedImages: LoadedImageAttachment[] = [];
   let gitChanges: GitStatusEntry[] = [];
   const gitDiffCache = new Map<string, { status: 'loading' | 'ready'; hunks: DiffHunk[]; error?: string }>();
@@ -835,10 +853,64 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     });
   }
 
+  function setWorkspaceEntries(entries: WorkspaceEntry[]): void {
+    workspaceEntries = entries;
+    ignoredPathsSet = new Set(entries.filter(item => item.ignored).map(item => item.path));
+  }
+
   function refreshWorkspaceFiles(): void {
-    void listWorkspaceFiles(options.cwd, 600, options.additionalDirectories).then(files => {
-      if (!quitting) { workspaceFiles = files; render(); }
+    void listWorkspaceEntries(options.cwd, 2_400, options.additionalDirectories).then(entries => {
+      if (!quitting) { setWorkspaceEntries(entries); render(); }
     }).catch(() => {});
+  }
+
+  async function applyPreferredConfigOptions(
+    connected: AgentSession,
+    allowExplicitWarnings: boolean,
+    applyDefaults = true,
+  ): Promise<void> {
+    const requestedModel = options.initialConfig?.model;
+    const requestedThinking = options.initialConfig?.thinking;
+    const requestedMode = options.initialConfig?.mode;
+    const preferredModel = requestedModel ?? (applyDefaults ? (userPrefs.rememberModel && userPrefs.lastModel ? userPrefs.lastModel : DEFAULT_MODEL_ID) : undefined);
+    const preferredThinking = requestedThinking ?? (applyDefaults ? (userPrefs.rememberModel && userPrefs.lastThinking ? userPrefs.lastThinking : DEFAULT_THINKING_ID) : undefined);
+
+    const requests: Array<{ opt: SessionConfigOption | undefined; wanted: string; label: string; explicit: boolean }> = [
+      ...(preferredModel ? [{ opt: modelOption(connected.metadata.configOptions), wanted: preferredModel, label: 'model', explicit: !!requestedModel }] : []),
+      ...(requestedMode ? [{
+        opt: connected.metadata.configOptions.find(o => o.category === 'mode' || o.id === 'mode'),
+        wanted: requestedMode,
+        label: 'mode',
+        explicit: true,
+      }] : []),
+      ...(preferredThinking ? [{ opt: thinkingOption(connected.metadata.configOptions), wanted: preferredThinking, label: 'thinking level', explicit: !!requestedThinking }] : []),
+    ];
+    for (const item of requests) {
+      if (quitting) break;
+      if (!item.opt) {
+        if (item.explicit && allowExplicitWarnings) {
+          conversation.notice(`Requested --${item.label.replace(' level', '')} "${item.wanted}", but this ACP session did not advertise that option.`);
+        }
+        continue;
+      }
+      const matched = configValues(item.opt).find(val =>
+        val.value === item.wanted || val.name.toLowerCase() === item.wanted.toLowerCase());
+      if (!matched) {
+        if (item.explicit && allowExplicitWarnings) {
+          conversation.notice(`Requested --${item.label.replace(' level', '')} "${item.wanted}" was not among session options.`, true);
+        }
+        continue;
+      }
+      if (item.opt.currentValue === matched.value) continue;
+      try {
+        await connected.setConfigOption(item.opt.id, matched.value);
+        metadata = connected.metadata;
+      } catch (err) {
+        if (item.explicit && allowExplicitWarnings) {
+          conversation.notice(`Failed to apply --${item.label.replace(' level', '')}: ${err instanceof Error ? err.message : String(err)}`, true);
+        }
+      }
+    }
   }
 
   function loadGitDiffPreview(entry: GitStatusEntry): void {
@@ -927,6 +999,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     runSessionAction('Starting conversation', async connected => {
       clearReplayState();
       await connected.newSession();
+      await applyPreferredConfigOptions(connected, false);
       phase = 'Ready';
       closePanel();
     });
@@ -990,6 +1063,10 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     panelError = '';
     render();
     configTask = agent.setConfigOption(option.id, value).then(() => {
+      if (!quitting && userPrefs.rememberModel && typeof value === 'string') {
+        if (option.category === 'model' || option.id === 'model') updatePrefs({ lastModel: value });
+        else if (option.category === 'thought_level' || option.id === 'thought_level') updatePrefs({ lastThinking: value });
+      }
       if (!quitting && panel?.kind !== 'settings') closePanel();
       else if (!quitting) showToast(`${option.name} updated`);
     }).catch(error => {
@@ -1087,11 +1164,13 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     text: string,
     images: readonly LoadedImageAttachment[] = [],
     attachedFilePaths: readonly string[] = [],
+    attachedDirPaths: readonly string[] = [],
   ): void {
     if (!agent || busy || changingConfig || sessionOperation || authBusy || disconnected || permissions.length) return;
     lastPrompt = text;
     lastImages = [...images];
     lastFiles = [...attachedFilePaths];
+    lastDirs = [...attachedDirPaths];
     busy = true;
     turnStartedAt = Date.now();
     cancelling = false;
@@ -1108,10 +1187,16 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     const promptBody = text || 'Inspect the attached image.';
     let completedNormally = false;
     turn = (async () => {
-      let resources: ResourceAttachment[] = [];
-      if (attachedFilePaths.length && activeAgent.promptCapabilities?.embeddedContext) {
-        const loaded = await loadEmbeddedResourceAttachments(options.cwd, attachedFilePaths);
-        resources = loaded.resources;
+      const resources: ResourceAttachment[] = [];
+      if (activeAgent.promptCapabilities?.embeddedContext) {
+        if (attachedFilePaths.length) {
+          const loaded = await loadEmbeddedResourceAttachments(options.cwd, attachedFilePaths);
+          resources.push(...loaded.resources);
+        }
+        if (attachedDirPaths.length) {
+          const dirResources = await loadDirectorySummaryResources(options.cwd, attachedDirPaths);
+          resources.push(...dirResources);
+        }
       }
       const reason = await activeAgent.prompt(promptBody, images, resources);
       if (quitting || disconnected) return;
@@ -1137,7 +1222,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       }
       if (completedNormally && !quitting && !disconnected && !permissions.length && queuedPrompts.length > 0) {
         const next = queuedPrompts.shift()!;
-        submitPrompt(formatPromptWithAttachments(next.text, next.files), next.images, next.files);
+        submitPrompt(formatPromptWithAttachments(next.text, next.files, next.dirs), next.images, next.files, next.dirs);
         return;
       }
       render();
@@ -1147,9 +1232,9 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
 
   function send(): void {
     if (changingConfig || sessionOperation || authBusy || permissions.length) return;
-    if (!draft.text.trim() && !attachedFiles.length && !attachedImages.length) return;
+    if (!draft.text.trim() && !attachedFiles.length && !attachedDirs.length && !attachedImages.length) return;
     const text = draft.text;
-    if (text.trimStart().startsWith('/') && !attachedFiles.length && !attachedImages.length) {
+    if (text.trimStart().startsWith('/') && !attachedFiles.length && !attachedDirs.length && !attachedImages.length) {
       const match = resolveCommand(text, availableCommands());
       if (match) {
         if (busy && !match.command.local) {
@@ -1168,20 +1253,22 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     const trimmedPrompt = text.trim();
     if (trimmedPrompt && promptHistory.at(-1) !== trimmedPrompt) promptHistory.push(trimmedPrompt);
     const filesToSend = attachedFiles;
+    const dirsToSend = attachedDirs;
     const imagesToSend = attachedImages;
     draft = { text: '', cursor: 0 };
     undoStack.length = 0;
     historyIndex = undefined;
     historyStash = undefined;
     attachedFiles = [];
+    attachedDirs = [];
     attachedImages = [];
     if (busy) {
-      queuedPrompts.push({ id: `q-${++queueSequence}`, text, files: filesToSend, images: imagesToSend });
+      queuedPrompts.push({ id: `q-${++queueSequence}`, text, files: filesToSend, dirs: dirsToSend, images: imagesToSend });
       showToast('Queued follow-up prompt', trimmedPrompt || `${imagesToSend.length} image(s)`);
       render();
       return;
     }
-    submitPrompt(formatPromptWithAttachments(text, filesToSend), imagesToSend, filesToSend);
+    submitPrompt(formatPromptWithAttachments(text, filesToSend, dirsToSend), imagesToSend, filesToSend, dirsToSend);
   }
 
   function autocomplete(): Command[] {
@@ -1196,18 +1283,49 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     return atMentionQuery(draft.text, draft.cursor);
   }
 
-  function atFileMatches(): string[] {
+  function atFileMatches(): WorkspaceEntry[] {
     const mention = activeAtMention();
     if (!mention) return [];
     const imagePaths = new Set(attachedImages.map(image => image.path));
-    return filterWorkspaceFiles(workspaceFiles.filter(file => !attachedFiles.includes(file) && !imagePaths.has(file)), mention.query, 8);
+    return filterWorkspaceEntries(
+      workspaceEntries.filter(entry =>
+        entry.kind === 'dir'
+          ? !attachedDirs.includes(entry.path)
+          : !attachedFiles.includes(entry.path) && !imagePaths.has(entry.path)),
+      mention.query,
+      10,
+    );
   }
 
-  function attachFile(filePath: string): void {
+  function isDirectoryTarget(targetPath: string): boolean {
+    if (targetPath.endsWith('/')) return true;
+    try {
+      return statSync(resolve(options.cwd, targetPath)).isDirectory();
+    } catch {
+      return false;
+    }
+  }
+
+  function attachFile(target: string | WorkspaceEntry): void {
+    const entry: WorkspaceEntry = typeof target === 'string'
+      ? {
+        path: isDirectoryTarget(target) ? (target.endsWith('/') ? target : `${target}/`) : target,
+        kind: isDirectoryTarget(target) ? 'dir' : 'file',
+        ignored: ignoredPathsSet.has(target) || ignoredPathsSet.has(`${target}/`),
+      }
+      : target;
     const mention = activeAtMention();
     if (mention) draft = stripAtMention(draft, mention);
     fileSelection = 0;
     autocompleteDismissed = true;
+    if (entry.kind === 'dir') {
+      const dirPath = entry.path.endsWith('/') ? entry.path : `${entry.path}/`;
+      if (!attachedDirs.includes(dirPath)) attachedDirs = [...attachedDirs, dirPath];
+      render();
+      surface?.focus('dock.draft');
+      return;
+    }
+    const filePath = entry.path;
     if (imageMimeType(filePath)) {
       if (!agent?.promptCapabilities?.image) {
         render();
@@ -1234,6 +1352,12 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
 
   function removeAttachment(filePath: string): void {
     attachedFiles = attachedFiles.filter(item => item !== filePath);
+    render();
+    surface?.focus('dock.draft');
+  }
+
+  function removeDirAttachment(dirPath: string): void {
+    attachedDirs = attachedDirs.filter(item => item !== dirPath);
     render();
     surface?.focus('dock.draft');
   }
@@ -1469,8 +1593,8 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
             },
             {
               id: 'autoPreviewMedia',
-              label: 'Auto-open centered live image preview',
-              hint: 'Automatically center-preview screenshots or images accessed by agy during a turn',
+              label: 'Auto-open modal popup for images during turns',
+              hint: 'Default off: screenshots and images display inline; click any image to open its modal preview',
               changed: userPrefs.autoPreviewMedia !== DEFAULT_PREFS.autoPreviewMedia,
               control: { k: 'switch', on: userPrefs.autoPreviewMedia },
             },
@@ -1531,6 +1655,29 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
           }],
         },
         {
+          id: 'model-memory',
+          title: 'Model Defaults & Memory',
+          page: 'session',
+          rows: [
+            {
+              id: 'rememberModel',
+              label: 'Remember last selected model & thinking level',
+              hint: `Falls back to ${DEFAULT_MODEL_ID} (${DEFAULT_THINKING_ID}) for new sessions until changed`,
+              changed: userPrefs.rememberModel !== DEFAULT_PREFS.rememberModel,
+              control: { k: 'switch', on: userPrefs.rememberModel },
+            },
+            {
+              id: 'clearRememberedModel',
+              label: 'Reset remembered model choice',
+              hint: userPrefs.lastModel || userPrefs.lastThinking
+                ? `Saved: ${userPrefs.lastModel ?? DEFAULT_MODEL_ID} · ${userPrefs.lastThinking ?? DEFAULT_THINKING_ID}`
+                : `Using built-in default (${DEFAULT_MODEL_ID} · ${DEFAULT_THINKING_ID})`,
+              changed: !!(userPrefs.lastModel || userPrefs.lastThinking),
+              control: { k: 'action', act: 'clear-remembered-model', label: 'Use default' },
+            },
+          ],
+        },
+        {
           id: 'perms-summary',
           title: 'Sandbox & Mode',
           page: 'permissions',
@@ -1588,6 +1735,10 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
           if (typeof event.value === 'string') { prefsPage = event.value; render(); }
         },
         'reset-prefs': resetPrefs,
+        'clear-remembered-model': () => {
+          updatePrefs({ lastModel: undefined, lastThinking: undefined });
+          showToast('Remembered model cleared', `Default for new sessions: ${DEFAULT_MODEL_ID} (${DEFAULT_THINKING_ID})`);
+        },
         'open-permissions': () => openPanel({ kind: 'permissions' }),
         'open-account': () => openPanel({ kind: 'account' }),
       }}
@@ -1608,6 +1759,8 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
           updatePrefs({ autoPreviewMedia: event.value });
         } else if (key === 'notifyOnTurnComplete' && typeof event.value === 'boolean') {
           updatePrefs({ notifyOnTurnComplete: event.value });
+        } else if (key === 'rememberModel' && typeof event.value === 'boolean') {
+          updatePrefs({ rememberModel: event.value });
         } else if (key === 'showKeyLegend' && typeof event.value === 'boolean') {
           updatePrefs({ showKeyLegend: event.value });
         } else if (key === 'composerLines') {
@@ -2030,22 +2183,37 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
   function renderInspectOverlay(p: Extract<Panel, { kind: 'inspect' }>): JSX.Element {
     const item = p.item;
     const isMedia = item.type === 'image-path' || item.type === 'image-blob';
+    const isDir = item.type === 'dir';
     const isLarge = !isMedia && viewportCols >= 104;
     const bodyMaxH = `${Math.max(12, viewportRows - 10)}lines` as const;
-    const copyText = item.type === 'file' ? item.content : item.type === 'diff'
-      ? item.hunks.flatMap(h => h.lines).join('\n')
+    const copyText = item.type === 'file' ? item.content
+      : item.type === 'diff' ? item.hunks.flatMap(h => h.lines).join('\n')
+      : isDir ? item.preview.entries.map(e => `${e.kind === 'dir' ? `${e.name}/` : e.name}${e.ignored ? ' [gitignored]' : ''}`).join('\n')
       : undefined;
     const attachablePath = item.type === 'image-path' || item.type === 'diff' || item.type === 'file'
-      ? item.path : undefined;
+      ? item.path
+      : isDir ? item.preview.path : undefined;
+    const cleanInspectDir = isDir ? item.preview.path.replace(/\/+$/, '') : '';
+    const parentInspectDir = isDir && cleanInspectDir.includes('/')
+      ? `${cleanInspectDir.slice(0, cleanInspectDir.lastIndexOf('/'))}/`
+      : isDir && cleanInspectDir && cleanInspectDir !== '.'
+        ? '.'
+        : undefined;
 
     return <overlay key="panel" anchor="center" modal size={isLarge ? 'full' : 'lg'}
       head={p.title}
-      icon={isMedia ? 'file-image' : item.type === 'diff' ? 'diff' : 'file'}
+      icon={isMedia ? 'file-image' : isDir ? 'folder' : item.type === 'diff' ? 'diff' : 'file'}
       meta={p.subtitle}
       end={<button keys={['esc']} variant="quiet" onClick={closePanel}>Close</button>}
       foot={<row gap="xs" justify="between" align="center" wrap>
-        <text><span s="muted">{item.type === 'file' && item.truncated ? 'Preview truncated at 64 KB · ' : ''}Esc closes without cancelling</span></text>
+        <text><span s="muted">{item.type === 'file' && item.truncated ? 'Preview truncated at 64 KB · '
+          : isDir && item.preview.truncated ? `Showing ${item.preview.entries.length} of ${item.preview.totalCount} entries · ` : ''}Esc closes without cancelling</span></text>
         <row gap="xs">
+          {parentInspectDir && <button size="sm" icon="back" onClick={() => {
+            void listDirectoryEntriesPreview(options.cwd, parentInspectDir).then(pv => {
+              if (!quitting) openInspect(pv.path, { type: 'dir', preview: pv }, pv.path);
+            }).catch(() => {});
+          }}>Up</button>}
           {item.type === 'diff' && <button size="sm" onClick={() => {
             const next: DiffMode = userPrefs.diffMode === 'auto' ? 'unified' : userPrefs.diffMode === 'unified' ? 'split' : 'auto';
             updatePrefs({ diffMode: next });
@@ -2055,8 +2223,8 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
               if (!quitting) showToast(copied ? 'Copied to clipboard' : 'Clipboard unavailable');
             });
           }}>Copy</button>}
-          {attachablePath && !isMedia && existsSync(resolve(options.cwd, attachablePath)) && <>
-            <button size="sm" icon="split" onClick={() => openSplit(attachablePath)}>Tern split</button>
+          {attachablePath && !isMedia && existsSync(resolve(options.cwd, attachablePath.replace(/\/+$/, ''))) && <>
+            {!isDir && <button size="sm" icon="split" onClick={() => openSplit(attachablePath)}>Tern split</button>}
             <button size="sm" variant="primary" onClick={() => {
               closePanel();
               attachFile(attachablePath);
@@ -2075,6 +2243,31 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         : <text><span s="muted">No diff hunks recorded.</span></text>)}
       {item.type === 'file' && <scroll max={{ h: bodyMaxH }}>
         <code numbers path={item.path}>{item.content}</code>
+      </scroll>}
+      {isDir && <scroll max={{ h: bodyMaxH }}>
+        <col gap="xs">
+          <kv items={[
+            { k: 'Directory', v: item.preview.path },
+            { k: 'Items', v: String(item.preview.totalCount) },
+          ]} />
+          <list max={{ lines: 20 }} empty="Directory is empty.">
+            {item.preview.entries.map(entry => <item key={entry.path}
+              icon={entry.kind === 'dir' ? 'folder' : imageMimeType(entry.name) ? 'file-image' : 'file'}
+              label={entry.kind === 'dir' ? `${entry.name}/` : entry.name}
+              detail={entry.ignored ? `${entry.path} [gitignored]` : entry.path}
+              value={entry.ignored ? 'gitignored' : entry.kind === 'dir' ? 'Dir' : 'File'}
+              onClick={() => {
+                if (entry.kind === 'dir') {
+                  void listDirectoryEntriesPreview(options.cwd, entry.path).then(pv => {
+                    if (!quitting) openInspect(pv.path, { type: 'dir', preview: pv }, pv.path);
+                  }).catch(() => {});
+                } else {
+                  closePanel();
+                  attachFile(entry.path);
+                }
+              }} />)}
+          </list>
+        </col>
       </scroll>}
     </overlay>;
   }
@@ -2622,7 +2815,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     const currentThinking = thinkingOption(metadata.configOptions);
     const currentMode = modeOption();
     const draftCommand = resolveCommand(draft.text, availableCommands());
-    const hasAttachments = attachedFiles.length > 0 || attachedImages.length > 0;
+    const hasAttachments = attachedFiles.length > 0 || attachedDirs.length > 0 || attachedImages.length > 0;
     const hasDraftContent = !!(draft.text.trim() || hasAttachments);
     const canSend = hasDraftContent && !busy && !changingConfig && !sessionOperation && !authBusy && !permission &&
       !!((agent && !disconnected) || (draftCommand && !hasAttachments));
@@ -2662,7 +2855,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         render();
       },
       onRetry() {
-        if (lastPrompt || lastImages.length) submitPrompt(lastPrompt, lastImages, lastFiles);
+        if (lastPrompt || lastImages.length || lastFiles.length || lastDirs.length) submitPrompt(lastPrompt, lastImages, lastFiles, lastDirs);
       },
       onReconnect() {
         reconnectAgent();
@@ -2764,7 +2957,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
           {visibleEntries.length ? visibleEntries.map(renderEntryNode) :
             <col key="empty-wrap" gap="md" align="center">
               <empty icon="tern" title={agent ? 'Ask Antigravity about this project' : disconnected ? 'Antigravity is unavailable' : 'Opening an ACP session'}
-                text={agent ? 'Type / for commands or @ to attach files and images. Thoughts, diffs, and one-time approvals appear here.' :
+                text={agent ? 'Type / for commands or @ to attach files, directories, and images (including gitignored entries). Thoughts, diffs, and one-time approvals appear here.' :
                   disconnected ? 'Open /account to sign in, or Quit to return to your shell.' : 'The official agy process handles authentication and tools.'} />
               {agent && !disconnected && !permission && <suggestions variant="chips"
                 items={[
@@ -2832,11 +3025,21 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
             onClick={() => chooseCommand(command)} />)}
         </list>}
         {atMatches.length > 0 && <list key="files" selected={`dock.files.row-${selectedFile}`} max={{ lines: 6 }}>
-          {atMatches.map((file, index) => {
-            const isImg = !!imageMimeType(file);
-            return <item key={`row-${index}`} icon={isImg ? 'file-image' : 'file'} label={basename(file)}
-              detail={file} value={isImg ? 'Image' : 'Attach'} title={`Attach ${file}`}
-              onClick={() => attachFile(file)} />;
+          {atMatches.map((entry, index) => {
+            const isDir = entry.kind === 'dir';
+            const cleanPath = isDir ? entry.path.replace(/\/+$/, '') : entry.path;
+            const isImg = !isDir && !!imageMimeType(entry.path);
+            const icon = isDir ? 'folder' : isImg ? 'file-image' : 'file';
+            const label = isDir ? `${basename(cleanPath) || cleanPath}/` : basename(entry.path);
+            const detail = entry.ignored ? `${entry.path} [gitignored]` : entry.path;
+            const value = isDir
+              ? (entry.ignored ? 'Dir · gitignored' : 'Directory')
+              : isImg
+                ? (entry.ignored ? 'Image · gitignored' : 'Image')
+                : (entry.ignored ? 'gitignored' : 'Attach');
+            return <item key={`row-${index}`} icon={icon} label={label}
+              detail={detail} value={value} title={`Attach ${detail}`}
+              onClick={() => attachFile(entry)} />;
           })}
         </list>}
         {queuedPrompts.length > 0 && <col key="queue" gap="xs">
@@ -2845,6 +3048,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
             const preview = label.length > 64 ? `${label.slice(0, 61)}...` : (label || `${item.images.length} image(s)`);
             const metaParts = [
               ...(item.files.length ? [`${item.files.length} file${item.files.length === 1 ? '' : 's'}`] : []),
+              ...(item.dirs.length ? [`${item.dirs.length} dir${item.dirs.length === 1 ? '' : 's'}`] : []),
               ...(item.images.length ? [`${item.images.length} image${item.images.length === 1 ? '' : 's'}`] : []),
             ];
             return <row key={item.id} justify="between" align="center" gap="sm">
@@ -2859,6 +3063,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
                   if (!pulled) return;
                   draft = { text: pulled.text, cursor: pulled.text.length };
                   attachedFiles = [...pulled.files];
+                  attachedDirs = [...pulled.dirs];
                   attachedImages = [...pulled.images];
                   render();
                   surface?.focus('dock.draft');
@@ -2884,21 +3089,41 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
               },
               remove: () => removeImageAttachment(image.path),
             }} />)}
-          {attachedFiles.map(file => <attachment key={file} variant="chip" name={basename(file)}
-            path={file} meta={file}
-            actions={[{ act: 'preview', icon: 'expand', title: 'Inspect file' }]}
-            removable
-            onAction={{
-              preview: () => {
-                void readWorkspaceTextPreview(options.cwd, file).then(pv => {
-                  if (!quitting) openInspect(basename(file), { type: 'file', path: pv.path, content: pv.text, truncated: pv.truncated }, file);
-                }).catch(() => {});
-              },
-              remove: () => removeAttachment(file),
-            }} />)}
+          {attachedDirs.map(dir => {
+            const clean = dir.replace(/\/+$/, '');
+            const isIgnored = ignoredPathsSet.has(dir);
+            return <attachment key={`dir:${dir}`} variant="chip" ext="DIR" mime="inode/directory"
+              name={`${basename(clean) || clean}/`}
+              path={dir} meta={isIgnored ? `${dir} · gitignored` : `${dir} · directory`}
+              actions={[{ act: 'preview', icon: 'expand', title: 'Inspect directory' }]}
+              removable
+              onAction={{
+                preview: () => {
+                  void listDirectoryEntriesPreview(options.cwd, dir).then(pv => {
+                    if (!quitting) openInspect(pv.path, { type: 'dir', preview: pv }, pv.path);
+                  }).catch(() => {});
+                },
+                remove: () => removeDirAttachment(dir),
+              }} />;
+          })}
+          {attachedFiles.map(file => {
+            const isIgnored = ignoredPathsSet.has(file);
+            return <attachment key={file} variant="chip" name={basename(file)}
+              path={file} meta={isIgnored ? `${file} · gitignored` : file}
+              actions={[{ act: 'preview', icon: 'expand', title: 'Inspect file' }]}
+              removable
+              onAction={{
+                preview: () => {
+                  void readWorkspaceTextPreview(options.cwd, file).then(pv => {
+                    if (!quitting) openInspect(basename(file), { type: 'file', path: pv.path, content: pv.text, truncated: pv.truncated }, file);
+                  }).catch(() => {});
+                },
+                remove: () => removeAttachment(file),
+              }} />;
+          })}
         </row>}
         <editor key="draft" aria="Message to Antigravity" text={draft.text} cursor={draft.cursor} anchor={draft.anchor}
-          placeholder={disconnected ? 'Use /account to sign in, or draft a message' : busy ? 'Draft your next message' : 'Message Antigravity, / for commands, @ for files'}
+          placeholder={disconnected ? 'Use /account to sign in, or draft a message' : busy ? 'Draft your next message' : 'Message Antigravity, / for commands, @ for files & dirs'}
           readonly={authBusy} maxLines={userPrefs.composerLines} variant="field"
           buttons={editorButtons}
           onFocus={() => surface?.focus('dock.draft')}
@@ -3005,7 +3230,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         {(userPrefs.showKeyLegend || !!permission) && <text key="keys" wrap="word">
           <span s="key">Enter</span><span s="muted"> send  </span>
           <span s="key">/</span><span s="muted"> commands  </span>
-          <span s="key">@</span><span s="muted"> files  </span>
+          <span s="key">@</span><span s="muted"> files/dirs  </span>
           <span s="key">Shift+Enter</span><span s="muted"> newline  </span>
           <span s="key">Esc</span><span s="muted"> stop  </span>
           <span s="key">PgUp/PgDn</span><span s="muted"> scroll  </span>
@@ -3035,12 +3260,10 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     if (!session) return quitting ? outcome : { kind: 'unavailable' };
     if (signal.aborted || quitting) return outcome;
     surface = session.open({ mode: 'screen', title: 'Antigravity · agy-tern', font: 'sans' });
-    void prefsStore.load().then(loaded => {
+    prefsReady = prefsStore.load().then(loaded => {
       if (!quitting) { userPrefs = loaded; render(); }
     }).catch(() => {});
-    void listWorkspaceFiles(options.cwd, 600, options.additionalDirectories).then(files => {
-      if (!quitting) { workspaceFiles = files; render(); }
-    }).catch(() => {});
+    refreshWorkspaceFiles();
     void detectGitBranch(options.cwd).then(branch => {
       if (!quitting && branch) { gitBranch = branch; render(); }
     });
@@ -3178,39 +3401,21 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         },
       }).then(async connected => {
         if (quitting) { await connected.close(); return; }
+        await prefsReady;
+        if (quitting) { await connected.close(); return; }
         agent = connected;
         agentConnecting = false;
         process.exitCode = undefined;
         metadata = connected.metadata;
         activeSessionId = connected.sessionId;
-        if (!resumeId && options.initialConfig) {
-          const requests: Array<{ opt: SessionConfigOption | undefined; wanted: string; label: string }> = [
-            ...(options.initialConfig.model ? [{ opt: modelOption(connected.metadata.configOptions), wanted: options.initialConfig.model, label: 'model' }] : []),
-            ...(options.initialConfig.mode ? [{ opt: connected.metadata.configOptions.find(o => o.category === 'mode' || o.id === 'mode'), wanted: options.initialConfig.mode, label: 'mode' }] : []),
-            ...(options.initialConfig.thinking ? [{ opt: thinkingOption(connected.metadata.configOptions), wanted: options.initialConfig.thinking, label: 'thinking level' }] : []),
-          ];
-          for (const item of requests) {
-            if (quitting) break;
-            if (!item.opt) {
-              conversation.notice(`Requested --${item.label.replace(' level', '')} "${item.wanted}", but this ACP session did not advertise that option.`);
-              continue;
-            }
-            const matched = configValues(item.opt).find(val =>
-              val.value === item.wanted || val.name.toLowerCase() === item.wanted.toLowerCase());
-            if (!matched) {
-              conversation.notice(`Requested --${item.label.replace(' level', '')} "${item.wanted}" was not among session options.`, true);
-              continue;
-            }
-            try {
-              await connected.setConfigOption(item.opt.id, matched.value);
-              metadata = connected.metadata;
-            } catch (err) {
-              conversation.notice(`Failed to apply --${item.label.replace(' level', '')}: ${err instanceof Error ? err.message : String(err)}`, true);
-            }
-          }
+        const targetId = resumeId ?? launch?.conversationId;
+        const loadingExisting = Boolean((targetId && targetId !== connected.sessionId) || (!resumeId && launch?.continueLast));
+        if (!resumeId && !loadingExisting) {
+          await applyPreferredConfigOptions(connected, true, true);
+        } else if (!resumeId && options.initialConfig) {
+          await applyPreferredConfigOptions(connected, true, false);
         }
         if (quitting) return;
-        const targetId = resumeId ?? launch?.conversationId;
         if (targetId && targetId !== connected.sessionId) {
           try {
             if (connected.capabilities.loadSession) {

@@ -5,11 +5,13 @@ import { basename, isAbsolute, resolve } from 'node:path';
 import type { DiffHunk, JSX, NodeJson, Tone } from '@stencil-hq/tern';
 import type { ToolCallUpdate } from '@agentclientprotocol/sdk';
 import { contentText, type TranscriptEntry } from './model';
+import type { DirectoryPreview } from './files';
 import type { DiffMode, UserPrefs } from './prefs';
 import {
   buildUnifiedDiffHunks,
   clipDiffHunks,
   clipInlinePreview,
+  extractMarkdownImagePaths,
   extractToolImagePaths,
   extractToolInlineImages,
   extractToolOutputText,
@@ -52,7 +54,36 @@ export type InspectTarget =
   | { type: 'image-path'; path: string }
   | { type: 'image-blob'; blob: string; mimeType: string; name?: string }
   | { type: 'diff'; path: string; hunks: DiffHunk[]; newFileText?: string }
-  | { type: 'file'; path: string; content: string; truncated?: boolean };
+  | { type: 'file'; path: string; content: string; truncated?: boolean }
+  | { type: 'dir'; preview: DirectoryPreview };
+
+function InlineMediaPreview({
+  caption,
+  blob,
+  mimeType,
+  path,
+  onOpen,
+}: {
+  caption: string;
+  blob?: string;
+  mimeType?: string;
+  path?: string;
+  onOpen?: () => void;
+}): JSX.Element {
+  return <col align="start" gap="xs" title={onOpen ? 'Click image to open modal preview' : undefined} onClick={onOpen}>
+    {blob
+      ? <image blob={blob} alt={mimeType ?? caption} title="Click image to open modal preview" onClick={onOpen} />
+      : path
+        ? <media path={path} title="Click image to open modal preview" onClick={onOpen} />
+        : null}
+    <row gap="xs" align="center" wrap>
+      <text><span s="muted">{caption}</span></text>
+      {onOpen && <button size="sm" variant="quiet" icon="expand" onClick={onOpen}>
+        Open modal
+      </button>}
+    </row>
+  </col>;
+}
 
 export function ToolOutput({ rawOutput }: { rawOutput: unknown }): JSX.Element {
   if (typeof rawOutput === 'string') {
@@ -106,13 +137,8 @@ export function ToolBody({ call, cwd, showRawInput, diffMode, getBlob, onInspect
           const imageMime = content.content.mimeType;
           const blob = getBlob?.(`tool:${call.toolCallId}:${index}`, content.content.data, imageMime);
           if (blob) {
-            return <col key={`img-${index}`} align="center" gap="xs">
-              <image blob={blob} alt={imageMime} />
-              {onInspect && <button size="sm" variant="quiet" icon="expand"
-                onClick={() => onInspect('Live image preview', { type: 'image-blob', blob, mimeType: imageMime }, imageMime)}>
-                Center preview
-              </button>}
-            </col>;
+            return <InlineMediaPreview key={`img-${index}`} caption={imageMime} blob={blob} mimeType={imageMime}
+              onOpen={onInspect ? () => onInspect('Live image preview', { type: 'image-blob', blob, mimeType: imageMime }, imageMime) : undefined} />;
           }
         }
         return <md key={`content-${index}`}>{contentText(content.content)}</md>;
@@ -172,13 +198,8 @@ export function ToolBody({ call, cwd, showRawInput, diffMode, getBlob, onInspect
     })}
     {imagePaths.map((imgPath, index) => {
       const label = formatPathLabel(imgPath, cwd);
-      return <col key={`media-${index}`} align="center" gap="xs">
-        <media path={imgPath} />
-        {onInspect && <button size="sm" variant="quiet" icon="expand"
-          onClick={() => onInspect(basename(label), { type: 'image-path', path: imgPath }, label)}>
-          Center preview
-        </button>}
-      </col>;
+      return <InlineMediaPreview key={`media-${index}`} caption={label} path={imgPath}
+        onOpen={onInspect ? () => onInspect(basename(label), { type: 'image-path', path: imgPath }, label) : undefined} />;
     })}
     {call.rawOutput !== undefined && call.rawOutput !== null && call.rawOutput !== '' && <col key="output" gap="xs">
       <ToolOutput rawOutput={call.rawOutput} />
@@ -234,6 +255,7 @@ export function Entry({ entry, continued, streaming, recent, turnNumber, callbac
       const withDivider = entry.role === 'user' && !!turnNumber && turnNumber > 1 && showAvatar;
       const segments = entry.role === 'agent' && entry.text ? splitMarkdownSegments(entry.text) : undefined;
       const hasCodeBlocks = !!segments?.some(seg => seg.kind === 'code');
+      const mdImagePaths = entry.role === 'agent' && entry.text ? extractMarkdownImagePaths(entry.text, callbacks.cwd) : [];
       const msgNode = <message key={withDivider ? 'msg' : entry.id} variant="auto"
         side={entry.role === 'user' ? 'end' : 'start'} author={entry.role === 'user' ? 'You' : 'Antigravity'}
         continued={continued}
@@ -258,13 +280,10 @@ export function Entry({ entry, continued, streaming, recent, turnNumber, callbac
         }}>
         {entry.images?.map((img, idx) => {
           const blob = callbacks.getBlob(`${entry.id}:img:${idx}`, img.data, img.mimeType);
-          return blob ? <col key={`img-${idx}`} align="center" gap="xs">
-            <image blob={blob} alt={img.mimeType} />
-            <button size="sm" variant="quiet" icon="expand"
-              onClick={() => callbacks.onInspect('Message image', { type: 'image-blob', blob, mimeType: img.mimeType }, img.mimeType)}>
-              Center preview
-            </button>
-          </col> : <text key={`img-${idx}`}><span s="muted">{`[Image: ${img.mimeType}]`}</span></text>;
+          return blob
+            ? <InlineMediaPreview key={`img-${idx}`} caption={img.mimeType} blob={blob} mimeType={img.mimeType}
+              onOpen={() => callbacks.onInspect('Message image', { type: 'image-blob', blob, mimeType: img.mimeType }, img.mimeType)} />
+            : <text key={`img-${idx}`}><span s="muted">{`[Image: ${img.mimeType}]`}</span></text>;
         })}
         {entry.text && (entry.role === 'user'
           ? <text wrap="char">{entry.text}</text>
@@ -292,6 +311,11 @@ export function Entry({ entry, continued, streaming, recent, turnNumber, callbac
                 </col>)}
             </col>
             : <md stream={streaming} max={{ w: '80ch' }}>{entry.text}</md>)}
+        {mdImagePaths.map((imgPath, idx) => {
+          const label = formatPathLabel(imgPath, callbacks.cwd);
+          return <InlineMediaPreview key={`md-img-${idx}`} caption={label} path={imgPath}
+            onOpen={() => callbacks.onInspect(basename(label), { type: 'image-path', path: imgPath }, label)} />;
+        })}
       </message>;
       if (withDivider) {
         const turnLabel = callbacks.prefs.showTimestamps && entry.time ? `Turn ${turnNumber} · ${entry.time}` : `Turn ${turnNumber}`;
