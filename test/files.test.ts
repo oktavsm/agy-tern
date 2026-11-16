@@ -1,13 +1,18 @@
 import { afterEach, describe, expect, test } from 'bun:test';
+import { spawnSync } from 'node:child_process';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   atMentionQuery,
+  filterWorkspaceEntries,
   filterWorkspaceFiles,
   formatPromptWithAttachments,
   imageMimeType,
+  listDirectoryEntriesPreview,
+  listWorkspaceEntries,
   listWorkspaceFiles,
+  loadDirectorySummaryResources,
   loadEmbeddedResourceAttachments,
   readGitFileDiff,
   readImageAttachment,
@@ -61,15 +66,17 @@ describe('workspace @file mention helpers', () => {
     );
   });
 
-  test('walks directory while skipping ignored directories when not a git repo', async () => {
+  test('walks directory cleanly when not a git repo while deferring vendor directories', async () => {
     const dir = await tempDir();
     await mkdir(join(dir, 'src'), { recursive: true });
     await mkdir(join(dir, 'node_modules', 'pkg'), { recursive: true });
     await writeFile(join(dir, 'README.md'), 'hi');
     await writeFile(join(dir, 'src', 'app.ts'), 'export {}');
     await writeFile(join(dir, 'node_modules', 'pkg', 'index.js'), 'x');
-    const files = await listWorkspaceFiles(dir);
+    const files = await listWorkspaceFiles(dir, 2);
     expect(files).toEqual(['README.md', 'src/app.ts']);
+    const allFiles = await listWorkspaceFiles(dir);
+    expect(allFiles).toEqual(['README.md', 'src/app.ts', 'node_modules/pkg/index.js']);
   });
 
   test('detects image mime types and loads base64 image attachments safely', async () => {
@@ -137,5 +144,54 @@ describe('workspace @file mention helpers', () => {
     expect(await readGitFileDiff(dir, '--all')).toBe('');
     expect(await readGitFileDiff(dir, '../outside.ts')).toBe('');
     expect(await readGitFileDiff(dir, 'not-a-git-repo.ts')).toBe('');
+  });
+
+  test('lists all files and directories including gitignored entries with explicit flags', async () => {
+    const dir = await tempDir();
+    await mkdir(join(dir, 'src'), { recursive: true });
+    await mkdir(join(dir, 'docs', 'screenshots'), { recursive: true });
+    await mkdir(join(dir, 'dist'), { recursive: true });
+    await writeFile(join(dir, '.gitignore'), '.env\ndist/\ndocs/screenshots/\n');
+    await writeFile(join(dir, 'src', 'app.ts'), 'export const ok = true;\n');
+    await writeFile(join(dir, 'docs', 'guide.md'), '# Guide\n');
+    await writeFile(join(dir, 'docs', 'screenshots', 'home.png'), 'png');
+    await writeFile(join(dir, 'dist', 'bundle.js'), 'console.log(1)\n');
+    await writeFile(join(dir, '.env'), 'API_KEY=secret\n');
+
+    const init = spawnSync('git', ['init'], { cwd: dir, stdio: 'ignore' });
+    expect(init.status).toBe(0);
+    spawnSync('git', ['add', '.gitignore', 'src/app.ts', 'docs/guide.md'], { cwd: dir, stdio: 'ignore' });
+
+    const entries = await listWorkspaceEntries(dir, 200);
+    const byPath = new Map(entries.map(item => [item.path, item]));
+
+    expect(byPath.get('src/')).toEqual({ path: 'src/', kind: 'dir', ignored: false });
+    expect(byPath.get('src/app.ts')).toEqual({ path: 'src/app.ts', kind: 'file', ignored: false });
+    // Shared directory with tracked child stays non-ignored while ignored subdir is flagged.
+    expect(byPath.get('docs/')).toEqual({ path: 'docs/', kind: 'dir', ignored: false });
+    expect(byPath.get('docs/screenshots/')).toEqual({ path: 'docs/screenshots/', kind: 'dir', ignored: true });
+    expect(byPath.get('docs/screenshots/home.png')).toEqual({ path: 'docs/screenshots/home.png', kind: 'file', ignored: true });
+    expect(byPath.get('dist/')).toEqual({ path: 'dist/', kind: 'dir', ignored: true });
+    expect(byPath.get('dist/bundle.js')).toEqual({ path: 'dist/bundle.js', kind: 'file', ignored: true });
+    expect(byPath.get('.env')).toEqual({ path: '.env', kind: 'file', ignored: true });
+
+    expect(filterWorkspaceEntries(entries, '.env', 5).map(e => e.path)).toContain('.env');
+    expect(filterWorkspaceEntries(entries, 'screenshots', 5).map(e => e.path)[0]).toBe('docs/screenshots/');
+
+    const preview = await listDirectoryEntriesPreview(dir, 'docs/');
+    expect(preview.path).toBe('docs/');
+    expect(preview.entries).toEqual([
+      { name: 'screenshots', path: 'docs/screenshots/', kind: 'dir', ignored: true },
+      { name: 'guide.md', path: 'docs/guide.md', kind: 'file', ignored: false },
+    ]);
+
+    const dirResources = await loadDirectorySummaryResources(dir, ['docs/']);
+    expect(dirResources).toHaveLength(1);
+    expect(dirResources[0]?.text).toContain('Directory docs/ (2 items):');
+    expect(dirResources[0]?.text).toContain('- screenshots/ [gitignored]');
+    expect(dirResources[0]?.text).toContain('- guide.md');
+
+    expect(formatPromptWithAttachments('inspect workspace', ['.env'], ['src/', 'docs/screenshots/']))
+      .toBe('@.env @src/ @docs/screenshots/\n\ninspect workspace');
   });
 });
