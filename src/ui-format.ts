@@ -815,3 +815,80 @@ export function extractToolOutputText(rawOutput: unknown): string | undefined {
   }
   return JSON.stringify(rawOutput, null, 2);
 }
+
+export interface ResponsiveLayout {
+  panelSize: 'lg' | 'full';
+  inspectSize: 'lg' | 'full';
+  proseMaxW: `${number}ch`;
+  scrollMaxH: `${number}lines`;
+  inspectBodyMaxH: `${number}lines`;
+  approvalBodyMaxH: `${number}lines`;
+  composerMaxLines: number;
+  dockPopupMaxLines: number;
+  modalListMaxLines: number;
+  dirListMaxLines: number;
+  showKeyLegend: boolean;
+  compactEmpty: boolean;
+}
+
+export interface ResponsiveLayoutInput {
+  userComposerLines: number;
+  userShowKeyLegend: boolean;
+  hasPermission: boolean;
+  hasSuggestionsOrAt: boolean;
+  queuedCount: number;
+  hasAttachments: boolean;
+  hasImageAttachments: boolean;
+  hasHud: boolean;
+}
+
+/** Derive responsive bounds for transcript scrollback, prose measure, dock, and modals from terminal size. */
+export function computeResponsiveLayout(
+  cols: number,
+  rows: number,
+  opts: ResponsiveLayoutInput,
+): ResponsiveLayout {
+  const safeCols = Math.max(30, Math.round(cols));
+  const safeRows = Math.max(12, Math.round(rows));
+  const compactWidth = safeCols < 84;
+  const compactHeight = safeRows < 26;
+  const panelSize: 'lg' | 'full' = compactWidth || compactHeight ? 'full' : 'lg';
+  const inspectSize: 'lg' | 'full' = safeCols >= 104 || compactWidth || compactHeight ? 'full' : 'lg';
+  const proseMaxW = `${Math.max(34, Math.min(116, safeCols - 12))}ch` as const;
+  const showKeyLegend = (opts.userShowKeyLegend && safeRows >= 18) || opts.hasPermission;
+  const composerMaxLines = Math.min(opts.userComposerLines, Math.max(2, Math.floor(safeRows * 0.25)));
+  const dockPopupMaxLines = safeRows < 20 ? 3 : safeRows < 28 ? 4 : 6;
+  const modalListMaxLines = Math.max(4, Math.min(12, Math.floor(safeRows * 0.45)));
+  const dirListMaxLines = Math.max(6, Math.min(24, safeRows - 14));
+  const inspectBodyMaxH = `${Math.max(5, safeRows - 9)}lines` as const;
+  const approvalBodyLines = Math.max(4, Math.min(10, Math.floor(safeRows * 0.3)));
+  const approvalBodyMaxH = `${approvalBodyLines}lines` as const;
+  const compactEmpty = safeRows < 22 || safeCols < 56;
+
+  const baseDock = 5 + (showKeyLegend ? (safeCols < 80 ? 2 : 1) : 0);
+  const popupRows = opts.hasPermission
+    ? approvalBodyLines + 4
+    : opts.hasSuggestionsOrAt
+      ? dockPopupMaxLines + 1
+      : 0;
+  const attachRows = opts.hasAttachments ? (opts.hasImageAttachments ? 4 : 2) : 0;
+  const hudRows = opts.hasHud ? 2 : 0;
+  const queuedRows = opts.queuedCount ? Math.min(opts.queuedCount * 2, 4) : 0;
+  const reserved = Math.min(safeRows - 4, baseDock + popupRows + attachRows + hudRows + queuedRows);
+  const scrollMaxH = `${Math.max(4, safeRows - reserved)}lines` as const;
+
+  return {
+    panelSize,
+    inspectSize,
+    proseMaxW,
+    scrollMaxH,
+    inspectBodyMaxH,
+    approvalBodyMaxH,
+    composerMaxLines,
+    dockPopupMaxLines,
+    modalListMaxLines,
+    dirListMaxLines,
+    showKeyLegend,
+    compactEmpty,
+  };
+}

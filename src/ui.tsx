@@ -64,6 +64,7 @@ import {
 import {
   buildUnifiedDiffHunks,
   collectSessionDiffs,
+  computeResponsiveLayout,
   countSessionDiffs,
   detectGitBranch,
   extractToolImagePaths,
@@ -78,6 +79,7 @@ import {
   summarizeQuotaRows,
   summarizeToolCall,
   thinkingOption,
+  type ResponsiveLayout,
   type SessionDiffItem,
 } from './ui-format';
 import {
@@ -270,6 +272,24 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
 
   function editorWrapWidth(): number {
     return Math.max(24, viewportCols - 14);
+  }
+
+  function currentResponsiveLayout(extra?: {
+    hasPermission?: boolean;
+    hasSuggestionsOrAt?: boolean;
+    hasAttachments?: boolean;
+    hasHud?: boolean;
+  }): ResponsiveLayout {
+    return computeResponsiveLayout(viewportCols, viewportRows, {
+      userComposerLines: userPrefs.composerLines,
+      userShowKeyLegend: userPrefs.showKeyLegend,
+      hasPermission: extra?.hasPermission ?? permissions.length > 0,
+      hasSuggestionsOrAt: extra?.hasSuggestionsOrAt ?? false,
+      queuedCount: queuedPrompts.length,
+      hasAttachments: extra?.hasAttachments ?? (attachedFiles.length > 0 || attachedDirs.length > 0 || attachedImages.length > 0),
+      hasImageAttachments: attachedImages.length > 0,
+      hasHud: extra?.hasHud ?? false,
+    });
   }
 
   function recordUndo(prev: Draft, next: Draft): void {
@@ -1814,7 +1834,8 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       ]
       : undefined;
 
-    return <picker key="picker" size="lg" title={option.name} icon={option.category === 'model' || option.id === 'model' ? 'model' : 'settings'}
+    const modalSize = currentResponsiveLayout().panelSize;
+    return <picker key="picker" size={modalSize} title={option.name} icon={option.category === 'model' || option.id === 'model' ? 'model' : 'settings'}
       subtitle={option.description ?? 'Options supplied by the active agy ACP session'}
       placeholder={`Search ${option.name.toLowerCase()}...`}
       query={panelDraft.text} cursor={panelDraft.cursor}
@@ -1879,7 +1900,8 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       };
     });
     const cannotSwitch = busy || changingConfig || !!sessionOperation || disconnected;
-    return <picker key="picker" size="lg" title="Workspace conversations" icon="history"
+    const modalSize = currentResponsiveLayout().panelSize;
+    return <picker key="picker" size={modalSize} title="Workspace conversations" icon="history"
       subtitle={`Filtered by cwd reported by agy (${options.cwd}); original workspace is not verified.`}
       placeholder="Search conversations by title, local name, or ID..."
       query={panelDraft.text} cursor={panelDraft.cursor}
@@ -1982,7 +2004,8 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         node: 'pv',
       }));
 
-    return <picker key="picker" size="lg" title="Changes" icon="diff"
+    const modalSize = currentResponsiveLayout().panelSize;
+    return <picker key="picker" size={modalSize} title="Changes" icon="diff"
       subtitle="Session edits and git status"
       placeholder="Filter modified paths..."
       query={panelDraft.text} cursor={panelDraft.cursor}
@@ -2127,7 +2150,8 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       ? extractToolImagePaths(highlighted.entry.call, options.cwd).find(p => existsSync(p))
       : undefined;
 
-    return <picker key="picker" size="lg" title="Find" icon="slash"
+    const modalSize = currentResponsiveLayout().panelSize;
+    return <picker key="picker" size={modalSize} title="Find" icon="slash"
       subtitle="Search transcript entries"
       placeholder="Type keywords to filter transcript..."
       query={panelDraft.text} cursor={panelDraft.cursor}
@@ -2184,8 +2208,9 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     const item = p.item;
     const isMedia = item.type === 'image-path' || item.type === 'image-blob';
     const isDir = item.type === 'dir';
-    const isLarge = !isMedia && viewportCols >= 104;
-    const bodyMaxH = `${Math.max(12, viewportRows - 10)}lines` as const;
+    const rLayout = currentResponsiveLayout();
+    const overlaySize = isMedia ? rLayout.panelSize : rLayout.inspectSize;
+    const bodyMaxH = rLayout.inspectBodyMaxH;
     const copyText = item.type === 'file' ? item.content
       : item.type === 'diff' ? item.hunks.flatMap(h => h.lines).join('\n')
       : isDir ? item.preview.entries.map(e => `${e.kind === 'dir' ? `${e.name}/` : e.name}${e.ignored ? ' [gitignored]' : ''}`).join('\n')
@@ -2200,7 +2225,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         ? '.'
         : undefined;
 
-    return <overlay key="panel" anchor="center" modal size={isLarge ? 'full' : 'lg'}
+    return <overlay key="panel" anchor="center" modal size={overlaySize}
       head={p.title}
       icon={isMedia ? 'file-image' : isDir ? 'folder' : item.type === 'diff' ? 'diff' : 'file'}
       meta={p.subtitle}
@@ -2250,7 +2275,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
             { k: 'Directory', v: item.preview.path },
             { k: 'Items', v: String(item.preview.totalCount) },
           ]} />
-          <list max={{ lines: 20 }} empty="Directory is empty.">
+          <list max={{ lines: rLayout.dirListMaxLines }} empty="Directory is empty.">
             {item.preview.entries.map(entry => <item key={entry.path}
               icon={entry.kind === 'dir' ? 'folder' : imageMimeType(entry.name) ? 'file-image' : 'file'}
               label={entry.kind === 'dir' ? `${entry.name}/` : entry.name}
@@ -2297,7 +2322,8 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         node: 'pv',
       };
     });
-    return <picker key="picker" size="lg" title="Commands & skills" icon="slash"
+    const modalSize = currentResponsiveLayout().panelSize;
+    return <picker key="picker" size={modalSize} title="Commands & skills" icon="slash"
       subtitle="Frontend, workflows, and skills"
       placeholder="Filter commands by name or description..."
       query={panelDraft.text} cursor={panelDraft.cursor}
@@ -2349,7 +2375,8 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     }));
     const canToggle = !!highlighted && !extLoading;
     const targetEnabled = highlighted?.status !== 'enabled';
-    return <picker key="picker" size="lg" title="MCP servers" icon="settings"
+    const modalSize = currentResponsiveLayout().panelSize;
+    return <picker key="picker" size={modalSize} title="MCP servers" icon="settings"
       subtitle="Configured via agy mcp CLI"
       placeholder="Filter MCP servers..."
       query={panelDraft.text} cursor={panelDraft.cursor}
@@ -2420,7 +2447,8 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     }));
     const canToggle = !!highlighted && !extLoading;
     const targetEnabled = !(highlighted?.enabled ?? false);
-    return <picker key="picker" size="lg" title="Plugins & skills" icon="compass"
+    const modalSize = currentResponsiveLayout().panelSize;
+    return <picker key="picker" size={modalSize} title="Plugins & skills" icon="compass"
       subtitle="Installed Antigravity plugins via official `agy plugin list --json`"
       placeholder="Filter plugins or skill names..."
       query={panelDraft.text} cursor={panelDraft.cursor}
@@ -2504,7 +2532,8 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       badges: options.agentName === a.name ? [{ text: 'Active', tone: 'success' as const }] : undefined,
       node: 'pv',
     }));
-    return <picker key="picker" size="lg" title="Agents & workspace scope" icon="tern"
+    const modalSize = currentResponsiveLayout().panelSize;
+    return <picker key="picker" size={modalSize} title="Agents & workspace scope" icon="tern"
       subtitle={`Active profile: ${options.agentName ?? 'Default'} · Workspace roots: ${1 + extraDirs.length}`}
       placeholder="Filter agents..."
       query={panelDraft.text} cursor={panelDraft.cursor}
@@ -2549,7 +2578,8 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       render();
       surface?.focus('dock.draft');
     };
-    return <picker key="picker" size="lg" title="Workspace prompt templates" icon="edit"
+    const modalSize = currentResponsiveLayout().panelSize;
+    return <picker key="picker" size={modalSize} title="Workspace prompt templates" icon="edit"
       subtitle={`Saved locally per workspace (${workspaceName})`}
       placeholder="Filter templates..."
       query={panelDraft.text} cursor={panelDraft.cursor}
@@ -2626,7 +2656,8 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     const method = loginMethod();
     const loginProblem = method ? terminalLoginProblem(method) : undefined;
 
-    return <overlay key="panel" head={title} modal size="lg"
+    const rLayout = currentResponsiveLayout();
+    return <overlay key="panel" head={title} modal size={rLayout.panelSize}
       icon={currentPanel.kind === 'report' ? 'context' : currentPanel.kind === 'permissions' ? 'shield' :
         currentPanel.kind === 'account' || currentPanel.kind === 'account-switch' ? 'user' : 'slash'}
       end={<button keys={['esc']} variant="quiet" disabled={authBusy} onClick={closePanel}>Close</button>}>
@@ -2775,7 +2806,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
           onFocus={() => surface?.focus('layer.panel.query')}
           onEdit={event => { panelDraft = editDraft(panelDraft, event); panelSelection = 0; render(); }} />}
         {panelError && <text wrap="word"><span s="error">{panelError}</span></text>}
-        <list key="choices" selected={`layer.panel.choices.row-${selected}`} max={{ lines: 9 }}
+        <list key="choices" selected={`layer.panel.choices.row-${selected}`} max={{ lines: rLayout.modalListMaxLines }}
           empty="No matching choices.">
           {choices.map((choice, index) => <item key={`row-${index}`} label={choice.label} detail={choice.detail}
             value={choice.value} title={`${choice.label}: ${choice.detail}`}
@@ -2800,6 +2831,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       renderTimer = undefined;
     }
     if (!surface || surface.closed || quitting) return;
+    if (process.stdout.rows) viewportRows = process.stdout.rows;
     lastRenderAt = Date.now();
     const permission = permissions[0];
     const approvalCall = permission && (conversation.getTool(permission.request.toolCall.toolCallId)?.call ?? permission.request.toolCall);
@@ -2833,12 +2865,20 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     const loginAvailable = !!loginMethod() && !terminalLoginProblem(loginMethod()!) && !!agent && !disconnected && authentication.logout;
     const agentStatus: Tone = disconnected || phase.includes('failed') ? 'error' : busy ? 'warning' : agent ? 'success' : 'muted';
     const renderNow = lastRenderAt || Date.now();
+    const showHud = !!(planSummary || contextUsage || (busy && turnStartedAt));
+    const layout = currentResponsiveLayout({
+      hasPermission: !!permission,
+      hasSuggestionsOrAt: suggestions.length > 0 || atMatches.length > 0,
+      hasAttachments,
+      hasHud: showHud,
+    });
     const entryCallbacks: EntryCallbacks = {
       cwd: options.cwd,
       working: busy,
       now: renderNow,
       agentStatus,
       prefs: userPrefs,
+      proseMaxW: layout.proseMaxW,
       thoughtFoldOverrides,
       toolFoldOverrides,
       canRetry: !!(lastPrompt || lastImages.length) && !busy && !!agent && !disconnected && !permission,
@@ -2905,13 +2945,8 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       : [{ act: 'send', text: 'Send', icon: 'send', variant: permission ? 'default' as const : 'primary' as const,
         disabled: !canSend }];
 
-    const showHud = !!(planSummary || contextUsage || (busy && turnStartedAt));
-    const dockLines = (permission ? 8 : (suggestions.length > 0 || atMatches.length > 0) ? 8 : 0) +
-      (queuedPrompts.length ? Math.min(queuedPrompts.length * 2, 6) : 0) +
-      (hasAttachments ? (attachedImages.length > 0 ? 5 : 2) : 0) +
-      (showHud ? 2 : 0) +
-      (viewportCols < 80 ? 10 : 8);
-    const scrollMaxH = `${Math.max(10, viewportRows - dockLines)}lines` as const;
+    const dockLines = 0; // Replaced by layout.scrollMaxH
+    void dockLines;
     const allEntries = conversation.entries;
     const totalEntries = allEntries.length;
     const hiddenCount = Math.max(0, totalEntries - historyVisibleCount);
@@ -2937,7 +2972,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         : entry.type === 'tool' ? String(toolFoldOverrides.get(entry.id) ?? '') : '';
       const errorKey = entry.type === 'notice' && entry.error
         ? `${Number(entryCallbacks.canRetry)}${Number(entryCallbacks.canReconnect)}${Number(entryCallbacks.canSwitchAccount)}` : '';
-      const sig = `${conversation.revisionOf(entry)}|${continued ? 1 : 0}|${streaming ? 1 : 0}|${recent ? 1 : 0}|${turnNumber ?? ''}|${isRunning ? Math.floor(renderNow / 1000) : 0}|${foldKey}|${errorKey}|${agentStatus}|${userPrefs.diffMode}|${userPrefs.toolDisplay}|${Number(userPrefs.thoughtExpanded)}|${userPrefs.transcriptDensity}|${Number(userPrefs.showTimestamps)}`;
+      const sig = `${conversation.revisionOf(entry)}|${continued ? 1 : 0}|${streaming ? 1 : 0}|${recent ? 1 : 0}|${turnNumber ?? ''}|${isRunning ? Math.floor(renderNow / 1000) : 0}|${foldKey}|${errorKey}|${agentStatus}|${userPrefs.diffMode}|${userPrefs.toolDisplay}|${Number(userPrefs.thoughtExpanded)}|${userPrefs.transcriptDensity}|${Number(userPrefs.showTimestamps)}|${layout.proseMaxW}`;
       const cached = entryRenderCache.get(entry);
       if (cached && cached.key === sig) return cached.node;
       const node = <Entry key={entry.id} entry={entry} continued={continued} streaming={streaming} recent={recent} turnNumber={turnNumber} callbacks={entryCallbacks} />;
@@ -2946,7 +2981,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     };
     surface.render({
       main: <col>
-        <scroll key="conversation" stick="end" max={{ h: scrollMaxH }} gap="md" aria="Conversation">
+        <scroll key="conversation" stick={visibleEntries.length ? 'end' : undefined} max={{ h: layout.scrollMaxH }} gap="md" aria="Conversation">
           {hiddenCount > 0 && <row key="older-history" justify="between" align="center" gap="sm" wrap>
             <text><span s="muted">{hiddenCount} earlier {hiddenCount === 1 ? 'entry' : 'entries'} hidden for speed</span></text>
             <row gap="xs">
@@ -2955,11 +2990,11 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
             </row>
           </row>}
           {visibleEntries.length ? visibleEntries.map(renderEntryNode) :
-            <col key="empty-wrap" gap="md" align="center">
-              <empty icon="tern" title={agent ? 'Ask Antigravity about this project' : disconnected ? 'Antigravity is unavailable' : 'Opening an ACP session'}
-                text={agent ? 'Type / for commands or @ to attach files, directories, and images (including gitignored entries). Thoughts, diffs, and one-time approvals appear here.' :
-                  disconnected ? 'Open /account to sign in, or Quit to return to your shell.' : 'The official agy process handles authentication and tools.'} />
-              {agent && !disconnected && !permission && <suggestions variant="chips"
+            <col key="empty-wrap" gap={layout.compactEmpty ? 'sm' : 'md'} align="center">
+              <empty icon={layout.compactEmpty ? undefined : 'tern'} title={agent ? 'Ask Antigravity about this project' : disconnected ? 'Antigravity is unavailable' : 'Opening an ACP session'}
+                text={layout.compactEmpty ? (agent ? 'Use / for commands or @ for files & dirs.' : disconnected ? 'Open /account to sign in.' : 'Opening ACP session...') : (agent ? 'Type / for commands or @ to attach files, directories, and images (including gitignored entries). Thoughts, diffs, and one-time approvals appear here.' :
+                  disconnected ? 'Open /account to sign in, or Quit to return to your shell.' : 'The official agy process handles authentication and tools.')} />
+              {agent && !disconnected && !permission && viewportRows >= 20 && <suggestions variant="chips"
                 items={[
                   { id: 'explain', text: 'Summarize this project structure', icon: 'compass' },
                   { id: 'changes', text: 'Review /changes', icon: 'diff' },
@@ -3007,7 +3042,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
           targetKind={approvalSummary.targetKind}
           status="pending" note="Approval required">
           <text>Choose a one-time permission for this tool. Tab selects a choice; Ctrl+Y allows, Ctrl+N denies. Enter never approves.</text>
-          <scroll max={{ h: '8lines' }}><ToolBody call={approvalCall} cwd={options.cwd} showRawInput={approvalSummary.showRawInput} diffMode={userPrefs.diffMode} /></scroll>
+          <scroll max={{ h: layout.approvalBodyMaxH }}><ToolBody call={approvalCall} cwd={options.cwd} showRawInput={approvalSummary.showRawInput} diffMode={userPrefs.diffMode} /></scroll>
           <buttons variant="toolbar" label="One-time permission choices">
             {offered.map(option => <button key={option.optionId} on={option === selectedChoice}
               variant={option === selectedChoice && option.kind === 'allow_once' ? 'primary' : 'default'}
@@ -3018,13 +3053,13 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
           {permissions.length > 1 && <text wrap="char"><span s="muted">Queued: {permissions.slice(1).map(next =>
             next.request.toolCall.title ?? next.request.toolCall.toolCallId).join('; ')}</span></text>}
         </tool>}
-        {suggestions.length > 0 && <list key="commands" selected={`dock.commands.row-${selectedCommand}`} max={{ lines: 6 }}>
+        {suggestions.length > 0 && <list key="commands" selected={`dock.commands.row-${selectedCommand}`} max={{ lines: layout.dockPopupMaxLines }}>
           {suggestions.map((command, index) => <item key={`row-${index}`} label={`/${command.name}`}
             detail={command.description} value={command.hint ? 'Arguments' : command.local ? 'Panel' : 'agy'}
             title={`/${command.name}: ${command.description}${command.hint ? ` · ${command.hint}` : ''}`}
             onClick={() => chooseCommand(command)} />)}
         </list>}
-        {atMatches.length > 0 && <list key="files" selected={`dock.files.row-${selectedFile}`} max={{ lines: 6 }}>
+        {atMatches.length > 0 && <list key="files" selected={`dock.files.row-${selectedFile}`} max={{ lines: layout.dockPopupMaxLines }}>
           {atMatches.map((entry, index) => {
             const isDir = entry.kind === 'dir';
             const cleanPath = isDir ? entry.path.replace(/\/+$/, '') : entry.path;
@@ -3124,7 +3159,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         </row>}
         <editor key="draft" aria="Message to Antigravity" text={draft.text} cursor={draft.cursor} anchor={draft.anchor}
           placeholder={disconnected ? 'Use /account to sign in, or draft a message' : busy ? 'Draft your next message' : 'Message Antigravity, / for commands, @ for files & dirs'}
-          readonly={authBusy} maxLines={userPrefs.composerLines} variant="field"
+          readonly={authBusy} maxLines={layout.composerMaxLines} variant="field"
           buttons={editorButtons}
           onFocus={() => surface?.focus('dock.draft')}
           onEdit={event => { if (!authBusy) { const next = editDraft(draft, event); recordUndo(draft, next); draft = next; autocompleteDismissed = false; commandSelection = 0; fileSelection = 0; render(); } }}
@@ -3227,7 +3262,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
             title="Quit frontend (Ctrl+Q)"
             onClick={quit} />
         </status>
-        {(userPrefs.showKeyLegend || !!permission) && <text key="keys" wrap="word">
+        {layout.showKeyLegend && <text key="keys" wrap="word">
           <span s="key">Enter</span><span s="muted"> send  </span>
           <span s="key">/</span><span s="muted"> commands  </span>
           <span s="key">@</span><span s="muted"> files/dirs  </span>
@@ -3478,9 +3513,10 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       if (!input || surface.closed) break;
       if (input.type === 'event') {
         if (input.event.ev === 'resize') {
-          viewportCols = input.event.cols;
+          viewportCols = input.event.cols || process.stdout.columns || viewportCols;
           viewportRows = process.stdout.rows || viewportRows;
           render();
+          scheduleRender();
         } else if (input.event.ev === 'error') {
           conversation.notice(`Tern: ${input.event.msg}`, true);
           render();

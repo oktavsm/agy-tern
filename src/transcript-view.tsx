@@ -218,6 +218,7 @@ export interface EntryCallbacks {
   now: number;
   agentStatus: Tone;
   prefs: UserPrefs;
+  proseMaxW?: `${number}ch`;
   thoughtFoldOverrides: Map<string, boolean>;
   toolFoldOverrides: Map<string, boolean>;
   canRetry: boolean;
@@ -290,7 +291,7 @@ export function Entry({ entry, continued, streaming, recent, turnNumber, callbac
           : hasCodeBlocks && segments
             ? <col gap="xs">
               {segments.map((seg, idx) => seg.kind === 'prose'
-                ? <md key={`prose-${idx}`} max={{ w: '80ch' }}>{seg.text}</md>
+                ? <md key={`prose-${idx}`} max={{ w: callbacks.proseMaxW ?? '80ch' }}>{seg.text}</md>
                 : <col key={`code-${idx}`} gap="xs">
                   <code lang={seg.lang} wrap>{seg.text}</code>
                   <row gap="xs" align="center" wrap>
@@ -310,7 +311,7 @@ export function Entry({ entry, continued, streaming, recent, turnNumber, callbac
                   </row>
                 </col>)}
             </col>
-            : <md stream={streaming} max={{ w: '80ch' }}>{entry.text}</md>)}
+            : <md stream={streaming} max={{ w: callbacks.proseMaxW ?? '80ch' }}>{entry.text}</md>)}
         {mdImagePaths.map((imgPath, idx) => {
           const label = formatPathLabel(imgPath, callbacks.cwd);
           return <InlineMediaPreview key={`md-img-${idx}`} caption={label} path={imgPath}

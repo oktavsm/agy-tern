@@ -4,6 +4,7 @@ import {
   clipDiffHunks,
   clipInlinePreview,
   collectSessionDiffs,
+  computeResponsiveLayout,
   countSessionDiffs,
   extractMarkdownImagePaths,
   extractToolImagePaths,
@@ -317,5 +318,38 @@ describe('ui formatting helpers', () => {
 
     // Real existing repo path matches via backticked or markdown image only when present on disk.
     expect(extractMarkdownImagePaths('See ![remote](https://example.com/a.png) and `docs/nonexistent.png`', cwd)).toEqual([]);
+
+    const wide = computeResponsiveLayout(180, 50, {
+      userComposerLines: 6,
+      userShowKeyLegend: true,
+      hasPermission: false,
+      hasSuggestionsOrAt: false,
+      queuedCount: 0,
+      hasAttachments: false,
+      hasImageAttachments: false,
+      hasHud: false,
+    });
+    expect(wide.panelSize).toBe('lg');
+    expect(wide.proseMaxW).toBe('116ch');
+    expect(wide.showKeyLegend).toBe(true);
+    expect(wide.scrollMaxH).toBe('44lines');
+
+    const smallSplit = computeResponsiveLayout(58, 16, {
+      userComposerLines: 10,
+      userShowKeyLegend: true,
+      hasPermission: false,
+      hasSuggestionsOrAt: true,
+      queuedCount: 1,
+      hasAttachments: true,
+      hasImageAttachments: false,
+      hasHud: true,
+    });
+    expect(smallSplit.panelSize).toBe('full');
+    expect(smallSplit.proseMaxW).toBe('46ch');
+    expect(smallSplit.composerMaxLines).toBe(4);
+    expect(smallSplit.dockPopupMaxLines).toBe(3);
+    expect(smallSplit.showKeyLegend).toBe(false);
+    expect(smallSplit.compactEmpty).toBe(true);
+    expect(smallSplit.scrollMaxH).toBe('4lines');
   });
 });
