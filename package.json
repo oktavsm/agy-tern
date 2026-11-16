@@ -1,0 +1,33 @@
+{
+  "name": "agy-tern",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "author": "oktavsm",
+  "keywords": [
+    "antigravity",
+    "agy",
+    "acp",
+    "tern",
+    "terminal",
+    "tui"
+  ],
+  "description": "A native Tern frontend for the official Antigravity CLI over ACP",
+  "bin": { "agy-tern": "src/cli.tsx" },
+  "scripts": {
+    "start": "bun src/cli.tsx",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "engines": { "bun": ">=1.2.22", "node": ">=22" },
+  "dependencies": {
+    "@agentclientprotocol/sdk": "2.6.0",
+    "@stencil-hq/tern": "0.2.0"
+  },
+  "devDependencies": {
+    "@types/bun": "1.3.11",
+    "@types/node": "24.10.1",
+    "typescript": "6.0.3"
+  }
+}
