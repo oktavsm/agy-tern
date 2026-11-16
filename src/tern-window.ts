@@ -24,6 +24,39 @@ export function resolveTernTarget(cwd: string, filePath: string, line?: number):
   return abs;
 }
 
+function runTernSubcommand(
+  ternPath: string,
+  args: string[],
+  cwd: string,
+  timeoutMessage: string,
+  target?: string,
+): Promise<TernOpenResult> {
+  return new Promise(resolvePromise => {
+    const child = spawn(ternPath, args, {
+      cwd,
+      stdio: ['ignore', 'ignore', 'pipe'],
+      windowsHide: true,
+    });
+    let stderr = '';
+    const timer = setTimeout(() => {
+      child.kill('SIGTERM');
+      resolvePromise({ ok: false, error: timeoutMessage });
+    }, 3_000);
+    child.stderr.on('data', chunk => {
+      if (stderr.length < 2_048) stderr += String(chunk);
+    });
+    child.once('error', err => {
+      clearTimeout(timer);
+      resolvePromise({ ok: false, error: err.message });
+    });
+    child.once('close', code => {
+      clearTimeout(timer);
+      if (code === 0) resolvePromise({ ok: true, ...(target ? { target } : {}) });
+      else resolvePromise({ ok: false, error: stderr.trim() || `tern exited with code ${code}` });
+    });
+  });
+}
+
 /** Open a workspace file side-by-side inside a Tern split pane without blocking the TUI loop. */
 export async function openInTernSplit(
   cwd: string,
@@ -46,31 +79,27 @@ export async function openInTernSplit(
     : mode === 'preview'
       ? ['open', '--preview', target]
       : ['open', '--split', mode, target];
+  return runTernSubcommand(ternPath, args, cwd, '`tern open` timed out.', target);
+}
 
-  return new Promise(resolvePromise => {
-    const child = spawn(ternPath, args, {
-      cwd,
-      stdio: ['ignore', 'ignore', 'pipe'],
-      windowsHide: true,
-    });
-    let stderr = '';
-    const timer = setTimeout(() => {
-      child.kill('SIGTERM');
-      resolvePromise({ ok: false, error: '`tern open` timed out.' });
-    }, 3_000);
-    child.stderr.on('data', chunk => {
-      if (stderr.length < 2_048) stderr += String(chunk);
-    });
-    child.once('error', err => {
-      clearTimeout(timer);
-      resolvePromise({ ok: false, error: err.message });
-    });
-    child.once('close', code => {
-      clearTimeout(timer);
-      if (code === 0) resolvePromise({ ok: true, target });
-      else resolvePromise({ ok: false, error: stderr.trim() || `tern open exited with code ${code}` });
-    });
-  });
+/** Execute a shell snippet in a kept-open Tern split pane scoped to the active workspace. */
+export async function runCommandInTernSplit(
+  cwd: string,
+  command: string,
+  options: { mode?: 'right' | 'down'; ternBin?: string } = {},
+): Promise<TernOpenResult> {
+  const cleaned = command.trim();
+  if (!cleaned || cleaned.includes('\0') || cleaned.length > 8_000) {
+    return { ok: false, error: 'Command must be non-empty and under 8,000 characters.' };
+  }
+  const ternPath = options.ternBin ?? Bun.which('tern');
+  if (!ternPath) {
+    return { ok: false, error: '`tern` CLI not found on PATH.' };
+  }
+  const mode = options.mode ?? 'right';
+  const workdir = resolve(cwd);
+  const args = ['split', '@focused', mode, '--cwd', workdir, '--keep-open', '--', '/bin/sh', '-lc', cleaned];
+  return runTernSubcommand(ternPath, args, workdir, '`tern split` timed out.', cleaned);
 }
 
 function sanitizeOscText(value: string): string {

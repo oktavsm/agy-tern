@@ -7,7 +7,7 @@ export const CLI_HELP = `agy-tern: native Tern frontend for the official Antigra
 Usage: agy-tern [--cwd DIRECTORY] [--add-dir DIRECTORY]... [--agy EXECUTABLE]
                 [--agent NAME] [--model MODEL] [--mode MODE] [--thinking LEVEL]
                 [-c | --continue | --conversation SESSION_ID] [-i PROMPT | PROMPT]
-       agy-tern --doctor
+       agy-tern --doctor [--json]
 
   --cwd DIRECTORY          Agent workspace (defaults to current directory)
   --add-dir DIRECTORY      Add an extra workspace root (repeatable)
@@ -20,6 +20,7 @@ Usage: agy-tern [--cwd DIRECTORY] [--add-dir DIRECTORY]... [--agy EXECUTABLE]
   --conversation ID        Resume/load a specific conversation ID on startup
   -i, --prompt-interactive Submit an initial prompt automatically once ready (or pass [PROMPT])
   --doctor                 Check local prerequisites without login or model requests
+  --json                   Output --doctor diagnostics as JSON
   --help                   Show usage
 
 In Tern: native chat over ACP. Other terminals: original agy UI.
@@ -30,6 +31,7 @@ Official login outside native chat: agy acp --login
 export interface ParsedCliArgs {
   help: boolean;
   doctor: boolean;
+  doctorJson: boolean;
   cwd: string;
   additionalDirectories: string[];
   agy?: string;
@@ -59,6 +61,7 @@ export function parseCliArgs(argv: readonly string[], baseCwd = process.cwd()): 
       conversation: { type: 'string' },
       'prompt-interactive': { type: 'string', short: 'i' },
       doctor: { type: 'boolean' },
+      json: { type: 'boolean' },
       help: { type: 'boolean', short: 'h' },
     },
     strict: true,
@@ -69,10 +72,14 @@ export function parseCliArgs(argv: readonly string[], baseCwd = process.cwd()): 
     return {
       help: true,
       doctor: false,
+      doctorJson: false,
       cwd: resolve(baseCwd),
       additionalDirectories: [],
       continueLast: false,
     };
+  }
+  if (values.json && !values.doctor) {
+    throw new Error('--json is supported only with --doctor.');
   }
   if (values.continue && values.conversation) {
     throw new Error('Choose either --continue or --conversation, not both.');
@@ -95,6 +102,7 @@ export function parseCliArgs(argv: readonly string[], baseCwd = process.cwd()): 
   return {
     help: false,
     doctor: !!values.doctor,
+    doctorJson: !!values.json,
     cwd,
     additionalDirectories,
     agy: values.agy,

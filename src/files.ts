@@ -305,3 +305,36 @@ export async function loadEmbeddedResourceAttachments(
   }
   return { resources, overflowPaths };
 }
+
+async function runGitCommand(cwd: string, args: string[], maxBytes = 256 * 1024): Promise<string> {
+  return new Promise(resolvePromise => {
+    const child = spawn('git', args, { cwd, stdio: ['ignore', 'pipe', 'ignore'] });
+    let out = '';
+    const timer = setTimeout(() => {
+      child.kill('SIGTERM');
+      resolvePromise('');
+    }, 1_500);
+    child.stdout.on('data', chunk => {
+      if (out.length < maxBytes) out += String(chunk);
+    });
+    child.once('error', () => { clearTimeout(timer); resolvePromise(''); });
+    child.once('close', code => {
+      clearTimeout(timer);
+      resolvePromise(code === 0 ? out : '');
+    });
+  });
+}
+
+/** Read working-tree or staged git diff for a workspace-relative path. */
+export async function readGitFileDiff(cwd: string, filePath: string): Promise<string> {
+  const cleaned = filePath.trim();
+  if (!cleaned || cleaned.startsWith('-') || /[\0-\u001f\u007f]/.test(cleaned)) return '';
+  const root = resolve(cwd);
+  const abs = isAbsolute(cleaned) ? resolve(cleaned) : resolve(root, cleaned);
+  const rel = relative(root, abs);
+  if (!rel || rel.startsWith('..') || isAbsolute(rel)) return '';
+  const unstaged = await runGitCommand(root, ['diff', '--no-color', '--', rel]);
+  if (unstaged.trim()) return unstaged;
+  const staged = await runGitCommand(root, ['diff', '--cached', '--no-color', '--', rel]);
+  return staged;
+}

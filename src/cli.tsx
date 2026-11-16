@@ -1,8 +1,40 @@
 #!/usr/bin/env bun
+import { existsSync, lstatSync, readlinkSync } from 'node:fs';
+import { dirname, isAbsolute, resolve } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { runTerminalLogin } from './auth';
 import { buildFallbackAgyArgs, CLI_HELP, parseCliArgs } from './cli-args';
 import { runNativeChat, type ChatLaunchState } from './ui';
+
+function probeVersionLine(bin: string, args: string[]): string | undefined {
+  const res = spawnSync(bin, args, { encoding: 'utf8', timeout: 3_000 });
+  if (res.error || res.status !== 0) return undefined;
+  const line = `${res.stdout ?? ''}\n${res.stderr ?? ''}`.split(/\r?\n/).map(s => s.trim()).find(Boolean);
+  return line;
+}
+
+function detectClipboardCommand(): string | undefined {
+  const candidates = process.platform === 'darwin' ? ['pbcopy'] : ['wl-copy', 'xclip', 'xsel'];
+  for (const cmd of candidates) {
+    const found = Bun.which(cmd);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+function inspectEntrypointLink(): { path: string; target?: string; valid: boolean } | undefined {
+  const entry = process.argv[1];
+  if (!entry) return undefined;
+  try {
+    const st = lstatSync(entry);
+    if (!st.isSymbolicLink()) return undefined;
+    const rawTarget = readlinkSync(entry);
+    const resolved = isAbsolute(rawTarget) ? rawTarget : resolve(dirname(entry), rawTarget);
+    return { path: entry, target: resolved, valid: existsSync(resolved) };
+  } catch {
+    return undefined;
+  }
+}
 
 async function main(): Promise<void> {
   const parsed = parseCliArgs(process.argv.slice(2));
@@ -21,7 +53,37 @@ async function main(): Promise<void> {
     if (result.status !== 0 || !help.includes('--sandbox') || !help.includes('--stdio')) {
       throw new Error('This agy does not advertise the required ACP stdio and sandbox options. Update the official Antigravity CLI.');
     }
-    console.log(`Bun: ${Bun.version}\nagy: ${executable}\nACP: stdio and sandbox options available\nTern: ${Bun.which('tern') ?? 'not on PATH (official agy fallback available)'}\nWorkspace: ${parsed.cwd}\nAuthentication and OS sandbox enforcement: not checked`);
+    const ternPath = Bun.which('tern');
+    const agyVersion = probeVersionLine(executable, ['--version']);
+    const ternVersion = ternPath ? probeVersionLine(ternPath, ['--version']) : undefined;
+    const clipboard = detectClipboardCommand();
+    const symlink = inspectEntrypointLink();
+    const report = {
+      bun: Bun.version,
+      agy: executable,
+      ...(agyVersion ? { agyVersion } : {}),
+      acpOptions: ['--stdio', '--sandbox'],
+      tern: ternPath ?? null,
+      ...(ternVersion ? { ternVersion } : {}),
+      clipboard: clipboard ?? null,
+      ...(symlink ? { launcherSymlink: symlink } : {}),
+      workspace: parsed.cwd,
+      unverified: ['authentication', 'os_sandbox_enforcement'],
+    };
+    if (parsed.doctorJson) {
+      console.log(JSON.stringify(report, null, 2));
+      return;
+    }
+    console.log([
+      `Bun: ${report.bun}`,
+      `agy: ${report.agy}${agyVersion ? ` (${agyVersion})` : ''}`,
+      'ACP: stdio and sandbox options available',
+      `Tern: ${ternPath ? `${ternPath}${ternVersion ? ` (${ternVersion})` : ''}` : 'not on PATH (official agy fallback available)'}`,
+      `Clipboard: ${clipboard ?? 'not found (install wl-copy, xclip, or xsel)'}`,
+      ...(symlink ? [`Launcher: ${symlink.path} -> ${symlink.target} (${symlink.valid ? 'ok' : 'broken'})`] : []),
+      `Workspace: ${report.workspace}`,
+      'Authentication and OS sandbox enforcement: not checked',
+    ].join('\n'));
     return;
   }
 
