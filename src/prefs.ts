@@ -8,6 +8,9 @@ export type ToolDisplay = 'compact' | 'expanded';
 export type ComposerLines = 4 | 6 | 10;
 export type TranscriptDensity = 'comfortable' | 'compact';
 
+export const DEFAULT_MODEL_ID = 'gemini-4-hydrogen';
+export const DEFAULT_THINKING_ID = 'high';
+
 export interface UserPrefs {
   diffMode: DiffMode;
   toolDisplay: ToolDisplay;
@@ -18,6 +21,9 @@ export interface UserPrefs {
   showTimestamps: boolean;
   autoPreviewMedia: boolean;
   notifyOnTurnComplete: boolean;
+  rememberModel: boolean;
+  lastModel?: string;
+  lastThinking?: string;
 }
 
 export const DEFAULT_PREFS: Readonly<UserPrefs> = Object.freeze({
@@ -28,8 +34,9 @@ export const DEFAULT_PREFS: Readonly<UserPrefs> = Object.freeze({
   composerLines: 6,
   transcriptDensity: 'comfortable',
   showTimestamps: true,
-  autoPreviewMedia: true,
+  autoPreviewMedia: false,
   notifyOnTurnComplete: true,
+  rememberModel: true,
 });
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -48,6 +55,9 @@ export function normalizePrefs(raw: unknown): UserPrefs {
   const showTimestamps = typeof raw.showTimestamps === 'boolean' ? raw.showTimestamps : DEFAULT_PREFS.showTimestamps;
   const autoPreviewMedia = typeof raw.autoPreviewMedia === 'boolean' ? raw.autoPreviewMedia : DEFAULT_PREFS.autoPreviewMedia;
   const notifyOnTurnComplete = typeof raw.notifyOnTurnComplete === 'boolean' ? raw.notifyOnTurnComplete : DEFAULT_PREFS.notifyOnTurnComplete;
+  const rememberModel = typeof raw.rememberModel === 'boolean' ? raw.rememberModel : DEFAULT_PREFS.rememberModel;
+  const lastModel = typeof raw.lastModel === 'string' && raw.lastModel.trim() ? raw.lastModel.trim() : undefined;
+  const lastThinking = typeof raw.lastThinking === 'string' && raw.lastThinking.trim() ? raw.lastThinking.trim() : undefined;
   return {
     diffMode,
     toolDisplay,
@@ -58,6 +68,9 @@ export function normalizePrefs(raw: unknown): UserPrefs {
     showTimestamps,
     autoPreviewMedia,
     notifyOnTurnComplete,
+    rememberModel,
+    ...(lastModel ? { lastModel } : {}),
+    ...(lastThinking ? { lastThinking } : {}),
   };
 }
 

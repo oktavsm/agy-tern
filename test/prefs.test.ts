@@ -34,8 +34,11 @@ describe('local user preferences', () => {
       toolDisplay: 'bad',
       transcriptDensity: 'compact',
       showTimestamps: false,
-      autoPreviewMedia: false,
+      autoPreviewMedia: true,
       notifyOnTurnComplete: false,
+      rememberModel: false,
+      lastModel: '  gemini-4-hydrogen  ',
+      lastThinking: '',
     })).toEqual({
       diffMode: 'split',
       toolDisplay: 'compact',
@@ -44,15 +47,23 @@ describe('local user preferences', () => {
       composerLines: 10,
       transcriptDensity: 'compact',
       showTimestamps: false,
-      autoPreviewMedia: false,
+      autoPreviewMedia: true,
       notifyOnTurnComplete: false,
+      rememberModel: false,
+      lastModel: 'gemini-4-hydrogen',
     });
   });
 
   test('persists updates atomically with owner-only permissions and resets cleanly', async () => {
     const dir = await tempDir();
     const store = new PrefsStore(dir);
-    const updated = await store.update({ diffMode: 'unified', toolDisplay: 'expanded', showKeyLegend: false });
+    const updated = await store.update({
+      diffMode: 'unified',
+      toolDisplay: 'expanded',
+      showKeyLegend: false,
+      lastModel: 'gemini-4-hydrogen',
+      lastThinking: 'high',
+    });
     expect(updated).toEqual({
       diffMode: 'unified',
       toolDisplay: 'expanded',
@@ -61,8 +72,11 @@ describe('local user preferences', () => {
       composerLines: 6,
       transcriptDensity: 'comfortable',
       showTimestamps: true,
-      autoPreviewMedia: true,
+      autoPreviewMedia: false,
       notifyOnTurnComplete: true,
+      rememberModel: true,
+      lastModel: 'gemini-4-hydrogen',
+      lastThinking: 'high',
     });
     expect(await store.load()).toEqual(updated);
 
@@ -75,6 +89,7 @@ describe('local user preferences', () => {
 
     const stored = JSON.parse(await readFile(join(dir, 'prefs.json'), 'utf8'));
     expect(stored.diffMode).toBe('unified');
+    expect(stored.lastModel).toBe('gemini-4-hydrogen');
     expect(await store.reset()).toEqual(DEFAULT_PREFS);
   });
 });
