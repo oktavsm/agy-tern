@@ -746,6 +746,28 @@ const connection = agent({ name: 'local-protocol-fixture' })
         'export const ready = true;',
         '```',
       ].join('\n'));
+    } else if (command === 'elicitation-form') {
+      const reply = await client.request(methods.client.elicitation.create, {
+        sessionId,
+        mode: 'form',
+        message: 'Select rollout target for deployment.',
+        requestedSchema: {
+          type: 'object',
+          title: 'Follow-up decision',
+          required: ['target'],
+          properties: {
+            target: {
+              type: 'string',
+              title: 'Target environment',
+              oneOf: [
+                { const: 'canary', title: 'Canary' },
+                { const: 'prod', title: 'Production' },
+              ],
+            },
+          },
+        },
+      });
+      await text(JSON.stringify(reply));
     } else if (images.length > 0 && resources.length > 0) {
       await text(`Synthetic fixture reply (${images.length} image, ${resources.length} resource): ${command}`);
     } else if (resources.length > 0) {

@@ -923,4 +923,40 @@ describe('official ACP subprocess boundary', () => {
     const listed = await session.listSessions();
     expect(listed.sessions.some(s => s.sessionId === 'fixture-review')).toBe(false);
   });
+
+  test('supports concurrent multi-terminal ACP subprocesses and elicitation follow-up RPCs', async () => {
+    const sharedCwd = await workspace('multisession');
+    const obs1 = observer();
+    const obs2 = observer();
+    const elicited: Array<{ id: string; message: string; reply: () => void }> = [];
+    obs1.events.elicitation = prompt => {
+      elicited.push({
+        id: prompt.id,
+        message: prompt.request.message,
+        reply: () => prompt.answer({ action: 'accept', content: { target: 'prod' } }),
+      });
+    };
+
+    const [s1, s2] = await Promise.all([
+      connectAgent({ cwd: sharedCwd, executable: fixture }, obs1.events),
+      connectAgent({ cwd: sharedCwd, executable: fixture }, obs2.events),
+    ]);
+    sessions.push(s1, s2);
+    expect(s1.sessionId).toBeTruthy();
+    expect(s2.sessionId).toBeTruthy();
+
+    const p1 = s1.prompt('elicitation-form');
+    const p2 = s2.prompt('hello from terminal 2');
+    while (elicited.length === 0) {
+      await new Promise(resolveDelay => setTimeout(resolveDelay, 10));
+    }
+    expect(elicited[0]!.message).toBe('Select rollout target for deployment.');
+    elicited[0]!.reply();
+
+    const [stop1, stop2] = await Promise.all([p1, p2]);
+    expect(stop1).toBe('end_turn');
+    expect(stop2).toBe('end_turn');
+    expect(JSON.parse(await nextText(obs1))).toEqual({ action: 'accept', content: { target: 'prod' } });
+    expect(await nextText(obs2)).toBe('Synthetic fixture reply: hello from terminal 2');
+  });
 });

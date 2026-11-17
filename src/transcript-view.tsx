@@ -8,6 +8,11 @@ import { contentText, type ToolStep, type TranscriptEntry } from './model';
 import type { DirectoryPreview } from './files';
 import type { DiffMode, UserPrefs } from './prefs';
 import {
+  extractMarkdownFollowUpQuestions,
+  extractToolFollowUpQuestions,
+  type QuestionField,
+} from './follow-up';
+import {
   buildTaskDetailText,
   buildUnifiedDiffHunks,
   clipDiffHunks,
@@ -205,12 +210,16 @@ function buildToolHeaderActions(opts: {
   kind?: ToolCallUpdate['kind'];
   hasDiff: boolean;
   hasCopyableOutput: boolean;
+  hasFollowUp: boolean;
   collapsed: boolean;
   targetExists: boolean;
   canInspectFile: boolean;
   canSplit: boolean;
 }): Array<{ id: string; label: string }> {
   const actions: Array<{ id: string; label: string }> = [];
+  if (opts.hasFollowUp) {
+    actions.push({ id: 'answer-followup', label: 'Answer' });
+  }
   if (opts.kind === 'read' && opts.targetExists && opts.canInspectFile) {
     actions.push({ id: 'view-file', label: 'Open file' });
     if (opts.canSplit) actions.push({ id: 'split', label: 'Split' });
@@ -474,6 +483,7 @@ export interface EntryCallbacks {
   onCopy(text: string): void;
   onResend(text: string): void;
   onLoadDeeperHistory?(): void;
+  onOpenFollowUp?(title: string, message: string, fields: readonly QuestionField[]): void;
 }
 
 export function Entry({ entry, continued, streaming, recent, turnNumber, callbacks }: {
@@ -493,6 +503,9 @@ export function Entry({ entry, continued, streaming, recent, turnNumber, callbac
       const hasCodeBlocks = !!segments?.some(seg => seg.kind === 'code');
       const mdImagePaths = entry.role === 'agent' && !streaming && entry.text
         ? extractMarkdownImagePaths(entry.text, callbacks.cwd, checkPathExists)
+        : [];
+      const mdFollowUpQuestions = entry.role === 'agent' && !streaming && entry.text && callbacks.onOpenFollowUp
+        ? extractMarkdownFollowUpQuestions(entry.text)
         : [];
       const msgNode = <message key={withDivider ? 'msg' : entry.id} variant="auto"
         side={entry.role === 'user' ? 'end' : 'start'} author={entry.role === 'user' ? 'You' : 'Antigravity'}
@@ -554,6 +567,16 @@ export function Entry({ entry, continued, streaming, recent, turnNumber, callbac
           return <InlineMediaPreview key={`md-img-${idx}`} caption={label} path={imgPath}
             onOpen={() => callbacks.onInspect(basename(label), { type: 'image-path', path: imgPath }, label)} />;
         })}
+        {mdFollowUpQuestions.length > 0 && callbacks.onOpenFollowUp && <row key="follow-up-bar" gap="xs">
+          <button size="sm" variant="default" icon="chat"
+            onClick={() => callbacks.onOpenFollowUp?.(
+              'Follow-up questions',
+              'Answer the follow-up questions below and send your reply to Antigravity.',
+              mdFollowUpQuestions,
+            )}>
+            Answer follow-up ({mdFollowUpQuestions.length})
+          </button>
+        </row>}
       </message>;
       if (withDivider) {
         const turnLabel = callbacks.prefs.showTimestamps && entry.time ? `Turn ${turnNumber} · ${entry.time}` : `Turn ${turnNumber}`;
@@ -599,12 +622,14 @@ export function Entry({ entry, continued, streaming, recent, turnNumber, callbac
       const targetInfo = summary.targetKind === 'path' ? parseToolTargetPath(summary.target, callbacks.cwd) : undefined;
       const targetExists = !!targetInfo && checkPathExists(targetInfo.absPath);
       const copyableOutput = extractToolOutputText(entry.call.rawOutput);
+      const toolFollowUp = callbacks.onOpenFollowUp ? extractToolFollowUpQuestions(entry.call) : undefined;
       const isPlainFileRead = entry.call.kind === 'read' && !!targetInfo && targetExists && !summary.hasDiff &&
         !hasMedia && !(entry.call.content?.length) && entry.call.rawOutput === undefined && entry.call.status !== 'failed';
       const headerActions = buildToolHeaderActions({
         kind: entry.call.kind,
         hasDiff: summary.hasDiff,
         hasCopyableOutput: !!copyableOutput,
+        hasFollowUp: !!toolFollowUp,
         collapsed,
         targetExists,
         canInspectFile: !!callbacks.onInspectFile,
@@ -626,6 +651,9 @@ export function Entry({ entry, continued, streaming, recent, turnNumber, callbac
         collapsible collapsed={collapsed} preview={{ lines: 4 }}
         tools={headerActions}
         onAction={{
+          ...(toolFollowUp && callbacks.onOpenFollowUp ? {
+            'answer-followup': () => callbacks.onOpenFollowUp?.(summary.title, toolFollowUp.message, toolFollowUp.fields),
+          } : {}),
           ...(targetInfo && callbacks.onInspectFile ? {
             'view-file': () => callbacks.onInspectFile?.(targetInfo.absPath, targetInfo.line),
           } : {}),

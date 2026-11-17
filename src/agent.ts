@@ -13,6 +13,7 @@ import {
   type AnyMessage,
   type ClientConnection,
   type ContentBlock,
+  type CreateElicitationResponse,
   type RequestPermissionResponse,
   type ListSessionsResponse,
   type SendRequestOptions,
@@ -21,7 +22,7 @@ import {
   type SessionNotification,
   type SetSessionConfigOptionRequest,
 } from '@agentclientprotocol/sdk';
-import type { AccountTier, AgentAuthentication, AgentEvents, AgentMetadata, AgentOptions, AgentSession, ImageAttachment, ResourceAttachment } from './contracts';
+import type { AccountTier, AgentAuthentication, AgentEvents, AgentMetadata, AgentOptions, AgentSession, ElicitationPrompt, ImageAttachment, ResourceAttachment } from './contracts';
 
 const STARTUP_TIMEOUT_MS = 30_000;
 const CANCEL_WRITE_TIMEOUT_MS = 1_000;
@@ -152,6 +153,7 @@ export async function connectAgent(options: AgentOptions, events: AgentEvents): 
   });
   const ended = Promise.withResolvers<void>();
   const permissions = new Map<string, (optionId: string | null) => void>();
+  const elicitations = new Map<string, (response: CreateElicitationResponse | null) => void>();
   let connection: ClientConnection | undefined;
   let sessionId = '';
   let exited = false;
@@ -186,6 +188,10 @@ export async function connectAgent(options: AgentOptions, events: AgentEvents): 
     for (const answer of permissions.values()) answer(null);
   }
 
+  function cancelElicitations(): void {
+    for (const answer of elicitations.values()) answer(null);
+  }
+
   function diagnostic(text: string): void {
     try {
       events.diagnostic(text);
@@ -198,6 +204,7 @@ export async function connectAgent(options: AgentOptions, events: AgentEvents): 
     if (failure || closing) return;
     failure = explainError(cause, stderrTail);
     cancelPermissions();
+    cancelElicitations();
     connection?.close(failure);
     try {
       events.disconnected(failure.message);
@@ -366,6 +373,7 @@ export async function connectAgent(options: AgentOptions, events: AgentEvents): 
     closing = true;
     turnCancelled = true;
     cancelPermissions();
+    cancelElicitations();
     closePromise = shutdown();
     return closePromise;
   }
@@ -373,6 +381,7 @@ export async function connectAgent(options: AgentOptions, events: AgentEvents): 
   function onAbort(): void {
     const cause = options.signal?.reason ?? new Error('Antigravity ACP connection was cancelled.');
     cancelPermissions();
+    cancelElicitations();
     if (closing) connection?.close(asError(cause));
     else disconnect(cause);
   }
@@ -386,6 +395,7 @@ export async function connectAgent(options: AgentOptions, events: AgentEvents): 
   child.once('exit', (code, signal) => {
     exited = true;
     cancelPermissions();
+    cancelElicitations();
     const message = signal
       ? `Antigravity ACP exited after signal ${signal}.`
       : `Antigravity ACP exited with code ${code}.`;
@@ -443,6 +453,45 @@ export async function connectAgent(options: AgentOptions, events: AgentEvents): 
         }
         return response.promise;
       })
+      .onRequest(methods.client.elicitation.create, ({ params, signal }) => {
+        const scopedSession = 'sessionId' in params ? params.sessionId : undefined;
+        if (
+          closing ||
+          failure ||
+          loggedOut ||
+          lifecycleMutation ||
+          pendingSession ||
+          turnCancelled ||
+          (scopedSession !== undefined && scopedSession !== sessionId) ||
+          signal.aborted
+        ) {
+          return { action: 'cancel' };
+        }
+        if (!events.elicitation) {
+          return { action: 'decline' };
+        }
+        const id = randomUUID();
+        const response = Promise.withResolvers<CreateElicitationResponse>();
+        const answer = (reply: CreateElicitationResponse | null): void => {
+          if (!elicitations.delete(id)) return;
+          signal.removeEventListener('abort', abort);
+          response.resolve(reply ?? { action: 'cancel' });
+        };
+        const abort = (): void => answer(null);
+        elicitations.set(id, answer);
+        signal.addEventListener('abort', abort, { once: true });
+        try {
+          const promptItem: ElicitationPrompt = { id, request: params, answer };
+          events.elicitation(promptItem);
+        } catch (error) {
+          answer(null);
+          disconnect(error);
+        }
+        return response.promise;
+      })
+      .onNotification(methods.client.elicitation.complete, ({ params }) => {
+        events.elicitationComplete?.(params);
+      })
       .connect(processStream(child.stdout, child.stdin));
     connection.signal.addEventListener('abort', () => {
       disconnect(connection?.signal.reason ?? new Error('Antigravity ACP disconnected.'));
@@ -454,6 +503,7 @@ export async function connectAgent(options: AgentOptions, events: AgentEvents): 
       clientInfo: { name: 'agy-tern', version: '0.1.0' },
       clientCapabilities: {
         auth: { terminal: true },
+        elicitation: { form: {}, url: {} },
         fs: { readTextFile: false, writeTextFile: false },
         terminal: false,
         session: {
@@ -567,6 +617,7 @@ export async function connectAgent(options: AgentOptions, events: AgentEvents): 
       if (configMutation) throw new Error('Antigravity configuration is still being changed.');
       if (lifecycleMutation) throw new Error('An Antigravity session lifecycle operation is already running.');
       if (permissions.size) throw new Error('An Antigravity permission request is still awaiting an answer.');
+      if (elicitations.size) throw new Error('An Antigravity follow-up question is still awaiting an answer.');
     } catch (error) {
       return Promise.reject(error);
     }
@@ -670,6 +721,7 @@ export async function connectAgent(options: AgentOptions, events: AgentEvents): 
     }).finally(() => {
       activePrompt = undefined;
       cancelPermissions();
+      cancelElicitations();
     });
     return activePrompt;
   }
@@ -721,6 +773,7 @@ export async function connectAgent(options: AgentOptions, events: AgentEvents): 
       if (configMutation) throw new Error('Antigravity configuration is still being changed.');
       if (lifecycleMutation) throw new Error('An Antigravity session lifecycle operation is already running.');
       if (permissions.size) throw new Error('An Antigravity permission request is still awaiting an answer.');
+      if (elicitations.size) throw new Error('An Antigravity follow-up question is still awaiting an answer.');
     } catch (error) {
       return Promise.reject(error);
     }
@@ -730,6 +783,7 @@ export async function connectAgent(options: AgentOptions, events: AgentEvents): 
       loggedOut = true;
       turnCancelled = true;
       cancelPermissions();
+      cancelElicitations();
       sessionId = '';
       metadata = { configOptions: [], availableCommands: [] };
       events.metadata?.(metadata);
@@ -751,6 +805,7 @@ export async function connectAgent(options: AgentOptions, events: AgentEvents): 
     }
     turnCancelled = true;
     cancelPermissions();
+    cancelElicitations();
     if (closing || failure) return Promise.resolve();
     if (cancellation) return cancellation;
     cancellation = sendCancel().catch((cause: unknown) => {

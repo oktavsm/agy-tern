@@ -45,6 +45,17 @@ describe('agy-tern native Tern E2E smoke', () => {
     expect(draftNode?.p['variant']).toBe('well');
     const composerBar = harness.findById('dock.shell.composer.composer-bar');
     expect(composerBar).toBeDefined();
+    const usageButton = harness.findByKind('button', 'dock').find(node => node.id.endsWith('.usage'));
+    expect(usageButton).toBeDefined();
+    expect(String(usageButton?.p['text'])).toContain('Usage');
+    harness.sendAction(usageButton!.id, 'click');
+    await harness.waitForText('Usage & Quota', 'layer', 5_000);
+    harness.sendKey('esc');
+    const panelDeadline = Date.now() + 4_000;
+    while (harness.findById('layer.panel') && Date.now() < panelDeadline) {
+      await new Promise(resolveDelay => setTimeout(resolveDelay, 25));
+    }
+    expect(harness.findById('layer.panel')).toBeUndefined();
     expect(harness.findByKind('effort', 'dock').length).toBeGreaterThanOrEqual(1);
 
     // Run a streaming turn and verify starburst working HUD + settle ops on completion.
@@ -81,6 +92,15 @@ describe('agy-tern native Tern E2E smoke', () => {
 
     harness.sendKey('ctrl+y');
     await harness.waitForText('"optionId":"srv-allow-1"', 'main', 6_000);
+    harness.assertWireInvariants();
+
+    // Verify ACP follow-up question (elicitation/create) opens centered modal and submits response cleanly.
+    harness.sendText('ask-followup');
+    harness.sendKey('enter');
+    await harness.waitForText('Release channel', 'layer', 6_000);
+    expect(harness.extractText('layer')).toContain('Choose target release channel before tagging.');
+    harness.sendKey('enter');
+    await harness.waitForText('"channel":"stable"', 'main', 6_000);
     harness.assertWireInvariants();
 
     // Verify /settings exposes maxFps and motion controls cleanly.

@@ -1,9 +1,26 @@
-import type { AuthMethodTerminal, AvailableCommand, ListSessionsResponse, RequestPermissionRequest, SessionConfigOption, SessionNotification, UsageUpdate } from '@agentclientprotocol/sdk';
+import type {
+  AuthMethodTerminal,
+  AvailableCommand,
+  CompleteElicitationNotification,
+  CreateElicitationRequest,
+  CreateElicitationResponse,
+  ListSessionsResponse,
+  RequestPermissionRequest,
+  SessionConfigOption,
+  SessionNotification,
+  UsageUpdate,
+} from '@agentclientprotocol/sdk';
 
 export interface PermissionPrompt {
   id: string;
   request: RequestPermissionRequest;
   answer(optionId: string | null): void;
+}
+
+export interface ElicitationPrompt {
+  id: string;
+  request: CreateElicitationRequest;
+  answer(response: CreateElicitationResponse | null): void;
 }
 
 export interface AccountTier {
@@ -38,6 +55,8 @@ export interface AgentAuthentication {
 export interface AgentEvents {
   update(notification: SessionNotification): void;
   permission(prompt: PermissionPrompt): void;
+  elicitation?(prompt: ElicitationPrompt): void;
+  elicitationComplete?(notification: CompleteElicitationNotification): void;
   diagnostic(text: string): void;
   disconnected(message: string): void;
   metadata?(metadata: AgentMetadata): void;

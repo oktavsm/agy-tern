@@ -1201,6 +1201,28 @@ const connection = agent({ name: 'e2e-protocol-fixture' })
     } else if (command === 'mode-notify') {
       await notify({ sessionUpdate: 'current_mode_update', currentModeId: 'accept-edits' });
       await text('Mode updated via current_mode_update.');
+    } else if (command === 'ask-followup') {
+      const reply = await client.request(methods.client.elicitation.create, {
+        sessionId,
+        mode: 'form',
+        message: 'Choose target release channel before tagging.',
+        requestedSchema: {
+          type: 'object',
+          title: 'Release channel',
+          required: ['channel'],
+          properties: {
+            channel: {
+              type: 'string',
+              title: 'Channel',
+              oneOf: [
+                { const: 'stable', title: 'Stable release' },
+                { const: 'beta', title: 'Beta prerelease' },
+              ],
+            },
+          },
+        },
+      });
+      await text(JSON.stringify(reply));
     } else if (command === 'demo-rich') {
       await notify({
         sessionUpdate: 'agent_thought_chunk',

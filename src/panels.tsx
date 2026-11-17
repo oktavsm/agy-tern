@@ -4,7 +4,7 @@ import type { DiffHunk, EditEvent, JSX, PickerGroup, PickerItem, PrefsRow } from
 import type { AuthMethodTerminal, SessionConfigOption, SessionInfo } from '@agentclientprotocol/sdk';
 import { terminalLoginProblem, type AgentAuthentication, type AgentMetadata, type AgentOptions, type AgentSession } from './contracts';
 import type { ToolStep, TranscriptEntry } from './model';
-import type { Draft } from './draft';
+import { editDraft, type Draft } from './draft';
 import { configLabel, configValues, commandCategory, filterCommands, type Command } from './commands';
 import type { AgentEntry, McpServerEntry, PluginEntry } from './extensions';
 import type { OfficialReport } from './reports';
@@ -51,6 +51,7 @@ import {
   ToolBody,
   type InspectTarget,
 } from './transcript-view';
+import type { FollowUpSessionState, QuestionAnswerValue } from './follow-up';
 
 export type Panel =
   | { kind: 'commands' }
@@ -73,7 +74,8 @@ export type Panel =
   | { kind: 'mcp-add' }
   | { kind: 'plugin-install' }
   | { kind: 'confirm'; title: string; detail: string; actionLabel: string; returnTo?: Panel; onConfirm(): void }
-  | { kind: 'inspect'; title: string; subtitle?: string; item: InspectTarget };
+  | { kind: 'inspect'; title: string; subtitle?: string; item: InspectTarget }
+  | { kind: 'followup'; source: 'elicitation' | 'prompt'; title: string; message: string; urlMode?: { elicitationId: string; url: string } };
 
 export interface Choice {
   label: string;
@@ -174,6 +176,11 @@ export interface PanelRenderContext {
   onCopy(text: string): void;
   onStopTurn(): void;
   onLoadReport(report: OfficialReport): void;
+  followUp?: FollowUpSessionState;
+  onUpdateFollowUp?(updater: (state: FollowUpSessionState) => void): void;
+  onSubmitFollowUp?(): void;
+  onDeclineFollowUp?(): void;
+  onCancelFollowUp?(): void;
 }
 
 function renderPrefsPanel(ctx: PanelRenderContext): JSX.Element {
@@ -1362,10 +1369,160 @@ function renderTasksPicker(ctx: PanelRenderContext): JSX.Element {
   </picker>;
 }
 
+function renderFollowUpOverlay(
+  ctx: PanelRenderContext,
+  p: Extract<Panel, { kind: 'followup' }>,
+): JSX.Element {
+  const closeAction = ctx.onCancelFollowUp ?? ctx.onClosePanel;
+  if (p.urlMode) {
+    return <overlay key="panel" anchor="center" modal size={ctx.rLayout.panelSize}
+      head={p.title}
+      icon="info"
+      end={<button keys={['esc']} variant="quiet" onClick={closeAction}>Cancel</button>}
+      foot={<row gap="xs" justify="between" align="center" wrap>
+        <text><span s="muted">Open the link in your browser, then select Done.</span></text>
+        <row gap="xs">
+          <button size="sm" variant="quiet" icon="copy" onClick={() => ctx.onCopy(p.urlMode!.url)}>Copy URL</button>
+          {ctx.onDeclineFollowUp && <button size="sm" variant="quiet" onClick={ctx.onDeclineFollowUp}>Decline</button>}
+          <button size="sm" variant="primary" onClick={() => ctx.onSubmitFollowUp?.()}>Done</button>
+        </row>
+      </row>}>
+      <scroll key="overlay-scroll" max={{ h: ctx.rLayout.inspectBodyMaxH }}>
+        <col gap="sm">
+          {p.message && <text wrap="word">{p.message}</text>}
+          <kv items={[{ k: 'URL', v: p.urlMode.url }]} />
+        </col>
+      </scroll>
+    </overlay>;
+  }
+
+  const st = ctx.followUp;
+  const fields = st?.fields ?? [];
+  const updateAnswer = (fieldName: string, value: QuestionAnswerValue, fieldIdx: number): void => {
+    ctx.onUpdateFollowUp?.(draft => {
+      draft.activeFieldIdx = fieldIdx;
+      draft.answers[fieldName] = value;
+      draft.error = undefined;
+    });
+  };
+  const toggleMultiOption = (fieldName: string, optionValue: string, fieldIdx: number): void => {
+    ctx.onUpdateFollowUp?.(draft => {
+      draft.activeFieldIdx = fieldIdx;
+      const prev = Array.isArray(draft.answers[fieldName]) ? [...(draft.answers[fieldName] as string[])] : [];
+      const existingIdx = prev.indexOf(optionValue);
+      if (existingIdx >= 0) prev.splice(existingIdx, 1);
+      else prev.push(optionValue);
+      draft.answers[fieldName] = prev;
+      draft.error = undefined;
+    });
+  };
+
+  return <overlay key="panel" anchor="center" modal size={ctx.rLayout.panelSize}
+    head={st?.title || p.title}
+    icon="help"
+    meta={p.source === 'elicitation' ? 'Agent waiting for your response' : 'Reply via next prompt'}
+    end={<button keys={['esc']} variant="quiet" onClick={closeAction}>Cancel</button>}
+    foot={<row gap="xs" justify="between" align="center" wrap>
+      <text><span s="muted">Tab/Up/Down navigate · Enter submit · Esc cancel</span></text>
+      <row gap="xs">
+        {p.source === 'elicitation' && ctx.onDeclineFollowUp && (
+          <button size="sm" variant="quiet" onClick={ctx.onDeclineFollowUp}>Decline</button>
+        )}
+        <button size="sm" variant="quiet" onClick={closeAction}>Cancel</button>
+        <button size="sm" variant="primary" icon="send" onClick={() => ctx.onSubmitFollowUp?.()}>
+          {p.source === 'elicitation' ? 'Submit response' : 'Send answers'}
+        </button>
+      </row>
+    </row>}>
+    <scroll key="overlay-scroll" max={{ h: ctx.rLayout.inspectBodyMaxH }}>
+      <col gap="md">
+        {(st?.message || p.message) && <text wrap="word">{st?.message || p.message}</text>}
+        {fields.map((field, idx) => {
+          const val = st?.answers[field.name];
+          const isActive = st?.activeFieldIdx === idx;
+          return <col key={`field-${field.name}`} gap="xs">
+            <text wrap="word">
+              <span s="strong">{`${fields.length > 1 ? `${idx + 1}. ` : ''}${field.label}`}</span>
+              {field.required ? <span s="warning"> *</span> : ''}
+              {isActive && fields.length > 1 ? <span s="muted"> (active)</span> : ''}
+            </text>
+            {field.description && <text wrap="word"><span s="muted">{field.description}</span></text>}
+            {field.kind === 'single-select' && <col gap="xs">
+              {field.options.map((opt, optIdx) => {
+                const chosen = val === opt.value;
+                return <button key={`opt-${optIdx}`} size="sm" variant={chosen ? 'primary' : 'default'}
+                  icon={chosen ? 'check' : undefined}
+                  title={opt.description ?? opt.label}
+                  onClick={() => updateAnswer(field.name, opt.value, idx)}>
+                  {opt.description ? `${opt.label} - ${opt.description}` : opt.label}
+                </button>;
+              })}
+              {field.allowCustom && <input key={`custom-${field.name}`}
+                aria={`Custom answer for ${field.label}`}
+                text={st?.customDrafts[field.name] ?? ''}
+                placeholder="Or type a custom answer..."
+                onFocus={() => ctx.onUpdateFollowUp?.(draft => { draft.activeFieldIdx = idx; })}
+                onEdit={event => ctx.onUpdateFollowUp?.(draft => {
+                  draft.activeFieldIdx = idx;
+                  const prevText = draft.customDrafts[field.name] ?? '';
+                  draft.customDrafts[field.name] = editDraft({ text: prevText, cursor: prevText.length }, event).text;
+                  draft.error = undefined;
+                })} />}
+            </col>}
+            {field.kind === 'multi-select' && <col gap="xs">
+              {field.options.map((opt, optIdx) => {
+                const checked = Array.isArray(val) && val.includes(opt.value);
+                return <button key={`mopt-${optIdx}`} size="sm" variant={checked ? 'primary' : 'default'}
+                  icon={checked ? 'check' : undefined}
+                  title={opt.description ?? opt.label}
+                  onClick={() => toggleMultiOption(field.name, opt.value, idx)}>
+                  {`${checked ? '[x]' : '[ ]'} ${opt.label}${opt.description ? ` - ${opt.description}` : ''}`}
+                </button>;
+              })}
+            </col>}
+            {field.kind === 'boolean' && <row gap="xs">
+              <button size="sm" variant={val === true ? 'primary' : 'default'} icon={val === true ? 'check' : undefined}
+                onClick={() => updateAnswer(field.name, true, idx)}>Yes</button>
+              <button size="sm" variant={val === false ? 'primary' : 'default'} icon={val === false ? 'check' : undefined}
+                onClick={() => updateAnswer(field.name, false, idx)}>No</button>
+            </row>}
+            {(field.kind === 'text' || field.kind === 'number' || field.kind === 'integer') && (
+              <input key={`input-${field.name}`}
+                aria={field.label}
+                text={typeof val === 'string' ? val : ''}
+                placeholder={field.kind === 'text' ? 'Type your answer...' : `Enter ${field.kind}...`}
+                onFocus={() => ctx.onUpdateFollowUp?.(draft => { draft.activeFieldIdx = idx; })}
+                onEdit={event => ctx.onUpdateFollowUp?.(draft => {
+                  draft.activeFieldIdx = idx;
+                  const prevText = typeof draft.answers[field.name] === 'string' ? (draft.answers[field.name] as string) : '';
+                  draft.answers[field.name] = editDraft({ text: prevText, cursor: prevText.length }, event).text;
+                  draft.error = undefined;
+                })} />
+            )}
+          </col>;
+        })}
+        {p.source === 'prompt' && <col gap="xs">
+          <text><span s="muted">Additional note (optional)</span></text>
+          <input key="free-note"
+            aria="Additional note"
+            text={st?.freeNote ?? ''}
+            placeholder="Add extra clarification if needed..."
+            onEdit={event => ctx.onUpdateFollowUp?.(draft => {
+              const prevText = draft.freeNote;
+              draft.freeNote = editDraft({ text: prevText, cursor: prevText.length }, event).text;
+            })} />
+        </col>}
+        {st?.error && <text wrap="word"><span s="error">{st.error}</span></text>}
+      </col>
+    </scroll>
+  </overlay>;
+}
+
 /** Render the active modal picker, prefs window, report overlay, or inspector dialog. */
 export function renderActivePanel(ctx: PanelRenderContext): JSX.Element {
   const currentPanel = ctx.panel;
   if (currentPanel.kind === 'settings') return renderPrefsPanel(ctx);
+  if (currentPanel.kind === 'followup') return renderFollowUpOverlay(ctx, currentPanel);
   const config = currentPanel.kind === 'config' ? ctx.metadata.configOptions.find(option => option.id === currentPanel.id) : undefined;
   if (currentPanel.kind === 'config' && config?.type === 'select') return renderSelectConfigPicker(ctx, config);
   if (currentPanel.kind === 'commands') return renderCommandsPicker(ctx);

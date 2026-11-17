@@ -4,7 +4,15 @@ import { basename, resolve } from 'node:path';
 import { connect, type DiffHunk, type EditEvent, type JSX, type Renderable, type Session, type Surface, type Tone } from '@stencil-hq/tern';
 import type { AuthMethodTerminal, SessionConfigOption, SessionInfo } from '@agentclientprotocol/sdk';
 import { connectAgent } from './agent';
-import { terminalLoginProblem, type AgentAuthentication, type AgentMetadata, type AgentOptions, type AgentSession, type PermissionPrompt, type ResourceAttachment } from './contracts';
+import { terminalLoginProblem, type AgentAuthentication, type AgentMetadata, type AgentOptions, type AgentSession, type ElicitationPrompt, type PermissionPrompt, type ResourceAttachment } from './contracts';
+import {
+  createFollowUpSessionState,
+  formatFollowUpPromptReply,
+  parseElicitationRequest,
+  validateElicitationAnswers,
+  type FollowUpSessionState,
+  type QuestionField,
+} from './follow-up';
 import { draftKey, editDraft, isCursorOnFirstRow, isCursorOnLastRow, type Draft } from './draft';
 import { Conversation, type ToolStep, type TranscriptEntry } from './model';
 import { commandCatalog, commandQuery, configLabel, configValues, filterCommands, modelOption, resolveCommand, type Command } from './commands';
@@ -222,6 +230,8 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
   let sessionOperation: string | undefined;
   let sessionTask: Promise<void> | undefined;
   const permissions: PermissionPrompt[] = [];
+  const elicitations: ElicitationPrompt[] = [];
+  let followUpState: FollowUpSessionState | undefined;
   let session: Session | null = null;
   let surface: Surface | undefined;
   let renderController: TernRenderController | undefined;
@@ -425,6 +435,139 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     approvalChoice = 0;
   }
 
+  function clearElicitations(): void {
+    for (const req of elicitations.splice(0)) req.answer(null);
+    if (panel?.kind === 'followup' && panel.source === 'elicitation') {
+      panel = undefined;
+      followUpState = undefined;
+    }
+  }
+
+  function openUsageModal(): void {
+    if (permissionOrAuthBlocked()) return;
+    openPanel({ kind: 'report', report: 'usage' });
+  }
+
+  function permissionOrAuthBlocked(): boolean {
+    return quitting || authBusy || permissions.length > 0;
+  }
+
+  function activateNextElicitation(): void {
+    const next = elicitations[0];
+    if (!next) {
+      if (panel?.kind === 'followup' && panel.source === 'elicitation') {
+        followUpState = undefined;
+        closePanel();
+      }
+      return;
+    }
+    const parsed = parseElicitationRequest(next.request);
+    if (parsed.mode === 'url') {
+      followUpState = undefined;
+      openPanel({
+        kind: 'followup',
+        source: 'elicitation',
+        title: parsed.title,
+        message: parsed.message,
+        urlMode: { elicitationId: parsed.elicitationId, url: parsed.url },
+      });
+      return;
+    }
+    if (parsed.mode === 'unsupported') {
+      elicitations.shift();
+      next.answer({ action: 'decline' });
+      activateNextElicitation();
+      return;
+    }
+    followUpState = createFollowUpSessionState(parsed.title, parsed.message, parsed.fields);
+    openPanel({
+      kind: 'followup',
+      source: 'elicitation',
+      title: parsed.title,
+      message: parsed.message,
+    });
+  }
+
+  function openFollowUpModal(title: string, message: string, fields: readonly QuestionField[]): void {
+    if (permissionOrAuthBlocked() || elicitations.length > 0) return;
+    followUpState = createFollowUpSessionState(title, message, fields);
+    openPanel({ kind: 'followup', source: 'prompt', title, message });
+  }
+
+  function submitFollowUp(): void {
+    if (panel?.kind !== 'followup') return;
+    if (panel.source === 'elicitation') {
+      const active = elicitations[0];
+      if (!active) { closePanel(); return; }
+      if (panel.urlMode) {
+        elicitations.shift();
+        active.answer({ action: 'accept' });
+        activateNextElicitation();
+        render();
+        return;
+      }
+      if (!followUpState) return;
+      const checked = validateElicitationAnswers(followUpState.fields, followUpState);
+      if (!checked.ok) {
+        followUpState.error = checked.error;
+        followUpState.activeFieldIdx = checked.fieldIndex;
+        render();
+        return;
+      }
+      elicitations.shift();
+      followUpState = undefined;
+      active.answer({ action: 'accept', content: checked.content });
+      activateNextElicitation();
+      render();
+      return;
+    }
+    if (!followUpState) { closePanel(); return; }
+    const reply = formatFollowUpPromptReply(followUpState);
+    if (!reply) {
+      followUpState.error = 'Select an option or enter an answer before sending.';
+      render();
+      return;
+    }
+    followUpState = undefined;
+    closePanel();
+    if (!busy && agent && !disconnected) {
+      submitPrompt(reply);
+    } else if (busy) {
+      stateManager.enqueuePrompt({ text: reply, files: [], dirs: [], images: [] });
+      showToast('Queued follow-up reply');
+      render();
+    } else {
+      stateManager.getActive().draft = { text: reply, cursor: reply.length };
+      render();
+    }
+  }
+
+  function declineFollowUp(): void {
+    if (panel?.kind !== 'followup' || panel.source !== 'elicitation') {
+      cancelFollowUp();
+      return;
+    }
+    const active = elicitations.shift();
+    followUpState = undefined;
+    active?.answer({ action: 'decline' });
+    activateNextElicitation();
+    render();
+  }
+
+  function cancelFollowUp(): void {
+    if (panel?.kind !== 'followup') return;
+    if (panel.source === 'elicitation') {
+      const active = elicitations.shift();
+      followUpState = undefined;
+      active?.answer({ action: 'cancel' });
+      activateNextElicitation();
+      render();
+      return;
+    }
+    followUpState = undefined;
+    closePanel();
+  }
+
   function quit(): void {
     outcome = { kind: 'quit' };
     if (quitting) return;
@@ -437,6 +580,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     reportAbort?.abort();
     extAbort?.abort();
     clearPermissions();
+    clearElicitations();
     controller.abort();
     stopped.resolve(null);
   }
@@ -649,6 +793,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     cancelling = true;
     phase = 'Cancelling';
     clearPermissions();
+    clearElicitations();
     render();
     void agent.cancel().catch(error => {
       if (quitting) return;
@@ -745,6 +890,10 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
 
   function stepBackPanel(): void {
     if (authBusy || !panel) return;
+    if (panel.kind === 'followup') {
+      cancelFollowUp();
+      return;
+    }
     const back = parentPanel(panel);
     if (back) {
       inspectReturnPanel = undefined;
@@ -1268,15 +1417,21 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     const isPickerPanel = next.kind === 'commands' || next.kind === 'config' || next.kind === 'sessions' ||
       next.kind === 'changes' || next.kind === 'find' || next.kind === 'tasks' || next.kind === 'mcp' || next.kind === 'plugins' ||
       next.kind === 'agents' || next.kind === 'templates';
+    const firstFollowUpField = next.kind === 'followup' ? followUpState?.fields[0] : undefined;
+    const followUpFocus = next.kind === 'followup' && firstFollowUpField &&
+      (firstFollowUpField.kind === 'text' || firstFollowUpField.kind === 'number' || firstFollowUpField.kind === 'integer')
+      ? `layer.panel.overlay-scroll.input-${firstFollowUpField.name}`
+      : null;
     const targetFocus = next.kind === 'settings' ? 'layer.prefs'
       : isPickerPanel && !needsCustomFocus ? 'layer.picker'
-      : needsCustomFocus ? 'layer.panel.query' : null;
+      : needsCustomFocus ? 'layer.panel.query'
+      : followUpFocus;
     surface?.focus(targetFocus);
     if (next.kind === 'report') loadReport(next.report);
     if (next.kind === 'mcp' || next.kind === 'plugins' || next.kind === 'agents') loadExtensions(next.kind);
     if (next.kind === 'templates') loadTemplates();
     if (next.kind === 'sessions' && agent?.capabilities.listSessions) {
-      if (!sessionsPrefetchInFlight && (!listedSessions.length || Date.now() - sessionsLoadedAt >= 30_000)) {
+      if (!sessionsPrefetchInFlight && (!listedSessions.length || Date.now() - sessionsLoadedAt >= 3_000)) {
         loadSessions(false, listedSessions.length > 0);
       }
     }
@@ -1521,7 +1676,11 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     if (trimmedPrompt && promptHistory.at(-1) !== trimmedPrompt) {
       promptHistory.push(trimmedPrompt);
       if (promptHistory.length > 50) promptHistory.splice(0, promptHistory.length - 50);
-      void promptHistoryStore.save(promptHistory).catch(() => {});
+      void promptHistoryStore.append(trimmedPrompt).then(merged => {
+        if (!quitting && merged.length) {
+          promptHistory.splice(0, promptHistory.length, ...merged);
+        }
+      }).catch(() => {});
     }
     const filesToSend = [...st.attachedFiles];
     const dirsToSend = [...st.attachedDirs];
@@ -1973,6 +2132,15 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       },
       onStopTurn: stop,
       onLoadReport: loadReport,
+      followUp: followUpState,
+      onUpdateFollowUp: updater => {
+        if (!followUpState || quitting) return;
+        updater(followUpState);
+        render();
+      },
+      onSubmitFollowUp: submitFollowUp,
+      onDeclineFollowUp: declineFollowUp,
+      onCancelFollowUp: cancelFollowUp,
     });
   }
 
@@ -2021,7 +2189,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     const activeTools = activeToolSteps();
     const rowsNow = viewportRows();
     const colsNow = viewportCols();
-    const showComposerBar = !!(currentModel || currentThinking || currentMode || contextUsage) && rowsNow >= 18;
+    const showComposerBar = rowsNow >= 18;
     const showHud = !!(busy || activeTools.length > 0 || (planSummary && activePlan) || (!showComposerBar && contextUsage));
     const activeToolTop = activeTools.at(-1);
     const activeToolSummary = activeToolTop ? summarizeToolCall(activeToolTop.call, options.cwd) : undefined;
@@ -2107,6 +2275,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       onLoadDeeperHistory() {
         void loadDeeperBrainHistory();
       },
+      onOpenFollowUp: openFollowUpModal,
     };
 
     const allEntries = conv.entries;
@@ -2398,7 +2567,6 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
                 </button>}
               </row>
               <row gap="sm" align="center">
-                {showComposerBar && metadata.usage?.cost && <text><span s="muted">{`${metadata.usage.cost.amount.toFixed(4)} ${metadata.usage.cost.currency}`}</span></text>}
                 {showComposerBar && contextUsage && <meter key="context" style="bar" size="sm"
                   value={contextUsage.percent / 100}
                   thresholds={{ warn: 0.75, bad: 0.9 }}
@@ -2415,7 +2583,23 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
                       { k: 'Action', v: 'Click to open /usage' },
                     ],
                   )}
-                  onClick={() => { if (agent && !disconnected && !permission) openPanel({ kind: 'report', report: 'usage' }); }} />}
+                  onClick={openUsageModal} />}
+                {showComposerBar && <button key="usage" size="sm" variant="quiet" icon={contextUsage ? undefined : 'context'}
+                  disabled={(!!permission || authBusy) && 'Finish current prompt'}
+                  title="Check quota & usage (/usage)"
+                  hovercard={cachedHoverKv(
+                    'bar-usage-btn',
+                    `${metadata.usage?.used ?? ''}|${metadata.usage?.size ?? ''}|${metadata.usage?.cost?.amount ?? ''}|${metadata.usage?.cost?.currency ?? ''}|${metadata.tier?.name ?? ''}`,
+                    () => [
+                      ...(metadata.tier ? [{ k: 'Subscription tier', v: metadata.tier.name }] : []),
+                      ...(contextUsage ? [{ k: 'Context used', v: `${metadata.usage?.used.toLocaleString()} / ${metadata.usage?.size.toLocaleString()} tokens` }] : []),
+                      ...(metadata.usage?.cost ? [{ k: 'Session cost', v: `${metadata.usage.cost.amount} ${metadata.usage.cost.currency}` }] : []),
+                      { k: 'Action', v: 'Click to inspect /usage quota' },
+                    ],
+                  )}
+                  onClick={openUsageModal}>
+                  {metadata.usage?.cost && metadata.usage.cost.amount > 0 ? `${metadata.usage.cost.amount.toFixed(4)} ${metadata.usage.cost.currency}` : 'Usage'}
+                </button>}
                 {busy ? <>
                   {hasDraftContent && <button size="sm" variant="default" icon="plus"
                     disabled={(!canQueue) && 'Wait until ready'}
@@ -2648,6 +2832,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
             renderController?.resetSessionTracking();
           }
           clearPermissions();
+          clearElicitations();
           render();
         },
         update(notification) {
@@ -2712,7 +2897,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         },
         permission(prompt) {
           if (quitting || authBusy || cancelling || disconnected) { prompt.answer(null); return; }
-          closePanel();
+          if (panel?.kind !== 'followup' || panel.source !== 'elicitation') closePanel();
           const conv = stateManager.getConversation();
           conv.tool(prompt.request.toolCall);
           if (!prompt.request.options.some(option => option.kind === 'allow_once')) {
@@ -2728,6 +2913,31 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
           }
           render();
         },
+        elicitation(prompt) {
+          if (quitting || authBusy || cancelling || disconnected || permissions.length > 0) {
+            prompt.answer(null);
+            return;
+          }
+          elicitations.push(prompt);
+          if (elicitations.length === 1) {
+            activateNextElicitation();
+          }
+          if (userPrefs.notifyOnTurnComplete) {
+            sendTerminalAttention('agy-tern', `Follow-up question: ${prompt.request.message}`);
+          }
+          render();
+        },
+        elicitationComplete(notification) {
+          if (quitting) return;
+          const idx = elicitations.findIndex(item => 'elicitationId' in item.request && item.request.elicitationId === notification.elicitationId);
+          if (idx >= 0) {
+            const [done] = elicitations.splice(idx, 1);
+            done?.answer({ action: 'accept' });
+            if (idx === 0) activateNextElicitation();
+            showToast('Browser action completed');
+            render();
+          }
+        },
         diagnostic(text) {
           if (!quitting) { stateManager.getConversation().notice(text); render(); }
         },
@@ -2738,6 +2948,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
           disconnected = true;
           phase = 'Disconnected';
           clearPermissions();
+          clearElicitations();
           stateManager.getConversation().notice(message, true);
           process.exitCode = 1;
           render();
@@ -2894,6 +3105,48 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
               void listDirectoryEntriesPreview(options.cwd, parentDir).then(pv => {
                 if (!quitting) openInspect(pv.path, { type: 'dir', preview: pv }, pv.path);
               }).catch(() => {});
+            }
+          }
+          continue;
+        }
+        if (current.kind === 'followup') {
+          if (key.name === 'page_up' || key.name === 'page_down' || key.name === 'home' || key.name === 'end') {
+            surface.scroll('layer.panel.overlay-scroll',
+              key.name === 'page_up' ? 'page-up'
+                : key.name === 'page_down' ? 'page-down'
+                : key.name === 'home' ? 'start' : 'end');
+            continue;
+          }
+          if (key.name === 'enter' && !key.shift) {
+            submitFollowUp();
+            continue;
+          }
+          if (followUpState && followUpState.fields.length > 0 && (key.name === 'tab' || key.name === 'up' || key.name === 'down')) {
+            const fields = followUpState.fields;
+            const activeField = fields[followUpState.activeFieldIdx];
+            if ((key.name === 'up' || key.name === 'down') && activeField?.kind === 'single-select' && activeField.options.length > 0) {
+              const curVal = followUpState.answers[activeField.name];
+              const curIdx = activeField.options.findIndex(o => o.value === curVal);
+              const nextIdx = key.name === 'down'
+                ? (curIdx + 1) % activeField.options.length
+                : (curIdx <= 0 ? activeField.options.length - 1 : curIdx - 1);
+              followUpState.answers[activeField.name] = activeField.options[nextIdx]!.value;
+              followUpState.error = undefined;
+              render();
+              continue;
+            }
+            if ((key.name === 'up' || key.name === 'down') && activeField?.kind === 'boolean') {
+              const cur = followUpState.answers[activeField.name];
+              followUpState.answers[activeField.name] = cur === undefined ? true : !cur;
+              followUpState.error = undefined;
+              render();
+              continue;
+            }
+            if (fields.length > 1) {
+              const step = key.name === 'up' || (key.name === 'tab' && key.shift) ? -1 : 1;
+              followUpState.activeFieldIdx = (followUpState.activeFieldIdx + fields.length + step) % fields.length;
+              render();
+              continue;
             }
           }
           continue;
