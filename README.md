@@ -134,7 +134,7 @@ Unknown slash commands are rejected locally instead of silently becoming model p
 - **Subprocess isolation boundary**: `agy-tern` passes `--sandbox` to `agy acp --sandbox`, does not implement its own filesystem or terminal RPC servers, and never passes permission-bypass flags. Requesting `--sandbox` does not verify OS-level kernel containment unless enforced by `agy` on your host.
 - **Zero credential storage**: No tokens, OAuth state, or account pools are stored by `agy-tern`. Official login/logout modifies `agy`'s shared authentication across CLI, Desktop App, and IDE extensions.
 - **Explicit approvals**: Tool permission prompts allow only `allow_once` or `reject_once` choices using server-provided option IDs. Pre-existing `agy` allow rules still apply inside the backend subprocess.
-- **Local XDG state (`0700` dir / `0600` file)**: Only UI preferences (`prefs.json`), private session labels (`session-names/`), and workspace prompt templates (`templates/`) are written under `$XDG_STATE_HOME/agy-tern/` (defaulting to `~/.local/state/agy-tern/`). Transcripts are not persisted to `~/.local/state`.
+- **Local XDG state (`0700` dir / `0600` file)**: UI preferences (`prefs.json`), private session labels (`session-names/`), sanitized UI transcript snapshots (`transcripts/`, stripping inline base64 images and capped to recent entries/files), and workspace prompt templates (`templates/`) are written under `$XDG_STATE_HOME/agy-tern/` (defaulting to `~/.local/state/agy-tern/`). If `agy` resumes a session without replaying chat history over ACP, `agy-tern` falls back to its local snapshot or a read-only projection of `~/.gemini/antigravity-cli/brain/<uuid>/.system_generated/logs/transcript.jsonl`.
 
 ---
 
@@ -148,7 +148,7 @@ bun run src/cli.tsx --doctor
 
 Core module map:
 - `src/contracts.ts`, `src/agent.ts`, `src/auth.ts`, `src/reports.ts`: Official ACP stdio boundary, login lifecycle, and CLI reports.
-- `src/model.ts`, `src/draft.ts`, `src/files.ts`, `src/prefs.ts`, `src/session-names.ts`, `src/templates.ts`: Transcript projection, composer input state, workspace files, and XDG local persistence.
+- `src/model.ts`, `src/history.ts`, `src/draft.ts`, `src/files.ts`, `src/prefs.ts`, `src/session-names.ts`, `src/templates.ts`: Transcript projection/snapshot hydration, composer input state, workspace files, and XDG local persistence.
 - `src/cli-args.ts`, `src/cli.tsx`, `src/commands.ts`, `src/extensions.ts`, `src/tern-window.ts`: CLI flag parsing, extension management (`mcp`/`plugin`/`agent`), `tern open` splits, and OSC 9 notifications.
 - `src/ui-format.ts`, `src/picker-nav.ts`, `src/transcript-view.tsx`, `src/ui.tsx`: Tern JSX surface rendering, pickers, centered inspector overlay, and keyboard/event orchestration.
 
