@@ -125,3 +125,18 @@ test('tracks monotonic revision per entry and removes temporary replay notices c
   expect(chat.removeNotice('missing-id')).toBe(false);
   expect(chat.entries.map(e => e.id)).toEqual([firstPrompt.id, reply.id]);
 });
+
+test('settles dangling in-progress tool steps cleanly when a turn finishes or aborts', () => {
+  const chat = new Conversation();
+  chat.tool({ toolCallId: 't-ok', status: 'in_progress', title: 'Run check' }, 100);
+  chat.finishTurn(250, false);
+  const stepOk = chat.getTool('t-ok');
+  expect(stepOk?.call.status).toBe('completed');
+  expect(stepOk?.endedAt).toBe(250);
+
+  chat.tool({ toolCallId: 't-abort', status: 'pending', title: 'Aborted run' }, 300);
+  chat.finishTurn(500, true);
+  const stepAbort = chat.getTool('t-abort');
+  expect(stepAbort?.call.status).toBe('failed');
+  expect(stepAbort?.endedAt).toBe(500);
+});

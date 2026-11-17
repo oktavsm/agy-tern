@@ -105,8 +105,16 @@ export class Conversation {
     return this.plan;
   }
 
-  finishTurn(now = Date.now()): void {
+  finishTurn(now = Date.now(), aborted = false): void {
     this.closeThought(now);
+    for (const entry of this.entries) {
+      if (entry.type !== 'tool') continue;
+      if (entry.call.status === 'in_progress' || entry.call.status === 'pending' || entry.call.status == null) {
+        entry.call.status = aborted ? 'failed' : 'completed';
+        if (entry.startedAt !== undefined && entry.endedAt === undefined) entry.endedAt = now;
+        this.touch(entry);
+      }
+    }
   }
 
   startPrompt(text: string, time?: string): void {
