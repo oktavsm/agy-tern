@@ -86,7 +86,7 @@ export async function openInTernSplit(
 export async function runCommandInTernSplit(
   cwd: string,
   command: string,
-  options: { mode?: 'right' | 'down'; ternBin?: string } = {},
+  options: { mode?: 'right' | 'down'; block?: string; ternBin?: string } = {},
 ): Promise<TernOpenResult> {
   const cleaned = command.trim();
   if (!cleaned || cleaned.includes('\0') || cleaned.length > 8_000) {
@@ -97,8 +97,9 @@ export async function runCommandInTernSplit(
     return { ok: false, error: '`tern` CLI not found on PATH.' };
   }
   const mode = options.mode ?? 'right';
+  const block = options.block?.trim() || process.env.TERN_PANE?.trim() || '@focused';
   const workdir = resolve(cwd);
-  const args = ['split', '@focused', mode, '--cwd', workdir, '--keep-open', '--', '/bin/sh', '-lc', cleaned];
+  const args = ['split', block, mode, '--cwd', workdir, '--keep-open', '--', '/bin/sh', '-lc', cleaned];
   return runTernSubcommand(ternPath, args, workdir, '`tern split` timed out.', cleaned);
 }
 

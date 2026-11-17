@@ -48,8 +48,13 @@ exit 0
     expect(missing.ok).toBe(false);
     expect(missing.error).toContain('File not found on disk');
 
+    const expectedPane = process.env.TERN_PANE?.trim() || '@focused';
     const cmdRes = await runCommandInTernSplit(dir, 'bun test', { ternBin: fakeTern });
     expect(cmdRes).toEqual({ ok: true, target: 'bun test' });
+    expect(await readFile(logFile, 'utf8')).toContain(`split ${expectedPane} right --cwd ${dir} --keep-open -- /bin/sh -lc bun test`);
+
+    const explicitBlockRes = await runCommandInTernSplit(dir, 'bun test', { block: '@focused', ternBin: fakeTern });
+    expect(explicitBlockRes).toEqual({ ok: true, target: 'bun test' });
     expect(await readFile(logFile, 'utf8')).toContain(`split @focused right --cwd ${dir} --keep-open -- /bin/sh -lc bun test`);
 
     const emptyCmd = await runCommandInTernSplit(dir, '   ', { ternBin: fakeTern });

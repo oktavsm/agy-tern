@@ -41,12 +41,19 @@ function defaultPromptHistoryDir(): string {
 export class PromptHistoryStore {
   private readonly directory: string;
   private readonly filePath: string;
+  private writeChain: Promise<unknown> = Promise.resolve();
 
   constructor(cwd: string, stateDirectory?: string) {
     const cleanCwd = resolve(cwd);
     this.directory = resolve(stateDirectory ?? defaultPromptHistoryDir());
     const digest = createHash('sha256').update(cleanCwd).digest('hex').slice(0, 32);
     this.filePath = join(this.directory, `${digest}.json`);
+  }
+
+  private runSerialized<T>(fn: () => Promise<T>): Promise<T> {
+    const next = this.writeChain.then(fn, fn);
+    this.writeChain = next.catch(() => {});
+    return next;
   }
 
   async load(): Promise<string[]> {
@@ -62,15 +69,7 @@ export class PromptHistoryStore {
     }
   }
 
-  async save(prompts: readonly string[]): Promise<void> {
-    const cleaned: string[] = [];
-    for (const rawItem of prompts) {
-      const item = rawItem.trim();
-      if (!item) continue;
-      if (cleaned.at(-1) !== item) cleaned.push(item);
-    }
-    const sliced = cleaned.slice(-MAX_PROMPT_HISTORY);
-    if (!sliced.length) return;
+  private async writePrompts(sliced: string[]): Promise<string[]> {
     await mkdir(this.directory, { recursive: true, mode: 0o700 });
     await chmod(this.directory, 0o700);
     const temporary = join(this.directory, `${randomUUID()}.tmp`);
@@ -86,6 +85,32 @@ export class PromptHistoryStore {
     } finally {
       await rm(temporary, { force: true });
     }
+    return sliced;
+  }
+
+  async save(prompts: readonly string[]): Promise<void> {
+    await this.runSerialized(async () => {
+      const cleaned: string[] = [];
+      for (const rawItem of prompts) {
+        const item = rawItem.trim();
+        if (!item) continue;
+        if (cleaned.at(-1) !== item) cleaned.push(item);
+      }
+      const sliced = cleaned.slice(-MAX_PROMPT_HISTORY);
+      if (!sliced.length) return;
+      await this.writePrompts(sliced);
+    });
+  }
+
+  /** Reload disk history and merge a new prompt atomically so concurrent terminals never clobber each other. */
+  async append(prompt: string): Promise<string[]> {
+    const clean = prompt.trim();
+    if (!clean) return this.load();
+    return this.runSerialized(async () => {
+      const existing = await this.load();
+      const merged = existing.at(-1) === clean ? existing : [...existing, clean].slice(-MAX_PROMPT_HISTORY);
+      return this.writePrompts(merged);
+    });
   }
 }
 
@@ -113,10 +138,17 @@ function defaultStateDir(): string {
 export class TranscriptStore {
   private readonly directory: string;
   private readonly cwd: string;
+  private writeChain: Promise<unknown> = Promise.resolve();
 
   constructor(cwd: string, stateDirectory?: string) {
     this.cwd = resolve(cwd);
     this.directory = resolve(stateDirectory ?? defaultStateDir());
+  }
+
+  private runSerialized<T>(fn: () => Promise<T>): Promise<T> {
+    const next = this.writeChain.then(fn, fn);
+    this.writeChain = next.catch(() => {});
+    return next;
   }
 
   private filePathFor(sessionId: string): string | undefined {
@@ -127,39 +159,41 @@ export class TranscriptStore {
   }
 
   async save(sessionId: string, entries: readonly TranscriptEntry[]): Promise<void> {
-    const target = this.filePathFor(sessionId);
-    if (!target) return;
-    const cleaned: TranscriptEntry[] = [];
-    for (const entry of entries) {
-      const sanitized = sanitizeEntryForDisk(entry);
-      if (sanitized) cleaned.push(sanitized);
-    }
-    if (!cleaned.some(entry => entry.type === 'message')) return;
-    const truncated = cleaned.length > MAX_STORE_ENTRIES;
-    const sliced = truncated ? cleaned.slice(-MAX_STORE_ENTRIES) : cleaned;
-    const payload = JSON.stringify({
-      version: 1,
-      updatedAt: Date.now(),
-      truncated,
-      entries: sliced,
-    });
+    await this.runSerialized(async () => {
+      const target = this.filePathFor(sessionId);
+      if (!target) return;
+      const cleaned: TranscriptEntry[] = [];
+      for (const entry of entries) {
+        const sanitized = sanitizeEntryForDisk(entry);
+        if (sanitized) cleaned.push(sanitized);
+      }
+      if (!cleaned.some(entry => entry.type === 'message')) return;
+      const truncated = cleaned.length > MAX_STORE_ENTRIES;
+      const sliced = truncated ? cleaned.slice(-MAX_STORE_ENTRIES) : cleaned;
+      const payload = JSON.stringify({
+        version: 1,
+        updatedAt: Date.now(),
+        truncated,
+        entries: sliced,
+      });
 
-    await mkdir(this.directory, { recursive: true, mode: 0o700 });
-    await chmod(this.directory, 0o700);
-    const temporary = join(this.directory, `${randomUUID()}.tmp`);
-    const file = await open(temporary, 'wx', 0o600);
-    try {
-      await file.chmod(0o600);
-      await file.writeFile(payload, 'utf8');
-    } finally {
-      await file.close();
-    }
-    try {
-      await rename(temporary, target);
-    } finally {
-      await rm(temporary, { force: true });
-    }
-    void this.pruneOldFiles().catch(() => {});
+      await mkdir(this.directory, { recursive: true, mode: 0o700 });
+      await chmod(this.directory, 0o700);
+      const temporary = join(this.directory, `${randomUUID()}.tmp`);
+      const file = await open(temporary, 'wx', 0o600);
+      try {
+        await file.chmod(0o600);
+        await file.writeFile(payload, 'utf8');
+      } finally {
+        await file.close();
+      }
+      try {
+        await rename(temporary, target);
+      } finally {
+        await rm(temporary, { force: true });
+      }
+      void this.pruneOldFiles().catch(() => {});
+    });
   }
 
   async load(sessionId: string): Promise<LoadedTranscript | undefined> {

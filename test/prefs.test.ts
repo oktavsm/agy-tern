@@ -95,5 +95,15 @@ describe('local user preferences', () => {
     expect(stored.diffMode).toBe('unified');
     expect(stored.lastModel).toBe('gemini-4-hydrogen');
     expect(await store.reset()).toEqual(DEFAULT_PREFS);
+
+    // Concurrent updates serialize cleanly without dropping either patch.
+    await Promise.all([
+      store.update({ lastModel: 'model-a' }),
+      store.update({ lastThinking: 'high', maxFps: 30 }),
+    ]);
+    const finalPrefs = await store.load();
+    expect(finalPrefs.lastModel).toBe('model-a');
+    expect(finalPrefs.lastThinking).toBe('high');
+    expect(finalPrefs.maxFps).toBe(30);
   });
 });

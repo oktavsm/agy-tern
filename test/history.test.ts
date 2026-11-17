@@ -125,5 +125,13 @@ describe('local transcript store & official brain log reader', () => {
     if (process.platform !== 'win32') {
       expect((await stat(stateDir)).mode & 0o777).toBe(0o700);
     }
+
+    // Concurrent appends from two terminals preserve prompts from both without clobbering.
+    const term1 = new PromptHistoryStore(cwd, stateDir);
+    const term2 = new PromptHistoryStore(cwd, stateDir);
+    await term1.append('from-terminal-1');
+    const merged = await term2.append('from-terminal-2');
+    expect(merged.slice(-2)).toEqual(['from-terminal-1', 'from-terminal-2']);
+    expect((await historyStore.load()).slice(-2)).toEqual(['from-terminal-1', 'from-terminal-2']);
   });
 });

@@ -24,6 +24,7 @@ function validateTemplateName(raw: string): string {
 export class PromptTemplatesStore {
   private readonly directory: string;
   private readonly filePath: string;
+  private writeChain: Promise<unknown> = Promise.resolve();
 
   constructor(cwd: string, stateDirectory?: string) {
     const xdgState = process.env.XDG_STATE_HOME;
@@ -34,6 +35,12 @@ export class PromptTemplatesStore {
     ));
     const key = createHash('sha256').update(resolve(cwd)).digest('hex');
     this.filePath = join(this.directory, `${key}.json`);
+  }
+
+  private runSerialized<T>(fn: () => Promise<T>): Promise<T> {
+    const next = this.writeChain.then(fn, fn);
+    this.writeChain = next.catch(() => {});
+    return next;
   }
 
   async list(): Promise<PromptTemplate[]> {
@@ -88,18 +95,22 @@ export class PromptTemplatesStore {
     if (!text.trim() || text.length > MAX_TEXT_CHARS) {
       throw new Error('Template text must be non-empty and at most 16,000 characters.');
     }
-    const existing = await this.list();
-    const updatedAt = new Date().toISOString();
-    const next = [
-      { name: cleanName, text, updatedAt },
-      ...existing.filter(row => row.name !== cleanName),
-    ];
-    return this.writeAll(next);
+    return this.runSerialized(async () => {
+      const existing = await this.list();
+      const updatedAt = new Date().toISOString();
+      const next = [
+        { name: cleanName, text, updatedAt },
+        ...existing.filter(row => row.name !== cleanName),
+      ];
+      return this.writeAll(next);
+    });
   }
 
   async remove(name: string): Promise<PromptTemplate[]> {
-    const existing = await this.list();
-    const next = existing.filter(row => row.name !== name);
-    return this.writeAll(next);
+    return this.runSerialized(async () => {
+      const existing = await this.list();
+      const next = existing.filter(row => row.name !== name);
+      return this.writeAll(next);
+    });
   }
 }

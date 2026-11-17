@@ -103,6 +103,7 @@ function decodePrefsBuffer(contents: Buffer): UserPrefs {
 export class PrefsStore {
   private readonly directory: string;
   private readonly filePath: string;
+  private writeChain: Promise<unknown> = Promise.resolve();
 
   constructor(stateDirectory?: string) {
     const xdgState = process.env.XDG_STATE_HOME;
@@ -111,6 +112,12 @@ export class PrefsStore {
       'agy-tern',
     ));
     this.filePath = join(this.directory, 'prefs.json');
+  }
+
+  private runSerialized<T>(fn: () => Promise<T>): Promise<T> {
+    const next = this.writeChain.then(fn, fn);
+    this.writeChain = next.catch(() => {});
+    return next;
   }
 
   loadSync(): UserPrefs {
@@ -135,7 +142,7 @@ export class PrefsStore {
     return decodePrefsBuffer(contents);
   }
 
-  async save(prefs: UserPrefs): Promise<UserPrefs> {
+  private async writeNormalized(prefs: UserPrefs): Promise<UserPrefs> {
     const normalized = normalizePrefs(prefs);
     await mkdir(this.directory, { recursive: true, mode: 0o700 });
     await chmod(this.directory, 0o700);
@@ -155,9 +162,15 @@ export class PrefsStore {
     return normalized;
   }
 
+  async save(prefs: UserPrefs): Promise<UserPrefs> {
+    return this.runSerialized(() => this.writeNormalized(prefs));
+  }
+
   async update(patch: Partial<UserPrefs>): Promise<UserPrefs> {
-    const current = await this.load();
-    return this.save({ ...current, ...patch });
+    return this.runSerialized(async () => {
+      const current = await this.load();
+      return this.writeNormalized({ ...current, ...patch });
+    });
   }
 
   async reset(): Promise<UserPrefs> {

@@ -16,6 +16,7 @@ function normalizeName(name: string): string {
 export class SessionNames {
   private readonly cwd: string;
   private readonly directory: string;
+  private writeChain: Promise<unknown> = Promise.resolve();
 
   constructor(cwd: string, stateDirectory?: string) {
     this.cwd = resolve(cwd);
@@ -24,6 +25,12 @@ export class SessionNames {
       xdgState && isAbsolute(xdgState) ? xdgState : join(homedir(), '.local', 'state'),
       'agy-tern', 'session-names',
     ));
+  }
+
+  private runSerialized<T>(fn: () => Promise<T>): Promise<T> {
+    const next = this.writeChain.then(fn, fn);
+    this.writeChain = next.catch(() => {});
+    return next;
   }
 
   private filename(sessionId: string): string {
@@ -46,30 +53,32 @@ export class SessionNames {
   }
 
   async set(sessionId: string, name: string): Promise<void> {
-    name = normalizeName(name);
-    const filename = this.filename(sessionId);
-    if (!name) {
-      try {
-        await unlink(filename);
-      } catch (error) {
-        if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) throw error;
+    await this.runSerialized(async () => {
+      name = normalizeName(name);
+      const filename = this.filename(sessionId);
+      if (!name) {
+        try {
+          await unlink(filename);
+        } catch (error) {
+          if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) throw error;
+        }
+        return;
       }
-      return;
-    }
-    await mkdir(this.directory, { recursive: true, mode: 0o700 });
-    await chmod(this.directory, 0o700);
-    const temporary = join(this.directory, `${randomUUID()}.tmp`);
-    const file = await open(temporary, 'wx', 0o600);
-    try {
+      await mkdir(this.directory, { recursive: true, mode: 0o700 });
+      await chmod(this.directory, 0o700);
+      const temporary = join(this.directory, `${randomUUID()}.tmp`);
+      const file = await open(temporary, 'wx', 0o600);
       try {
-        await file.chmod(0o600);
-        await file.writeFile(name, 'utf8');
+        try {
+          await file.chmod(0o600);
+          await file.writeFile(name, 'utf8');
+        } finally {
+          await file.close();
+        }
+        await rename(temporary, filename);
       } finally {
-        await file.close();
+        await rm(temporary, { force: true });
       }
-      await rename(temporary, filename);
-    } finally {
-      await rm(temporary, { force: true });
-    }
+    });
   }
 }
