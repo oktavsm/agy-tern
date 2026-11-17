@@ -17,6 +17,8 @@
   "bin": { "agy-tern": "src/cli.tsx" },
   "scripts": {
     "start": "bun src/cli.tsx",
+    "doctor": "bun run src/cli.tsx --doctor",
+    "setup": "bash ./scripts/install.sh",
     "typecheck": "tsc --noEmit",
     "test": "bun test"
   },

@@ -20,34 +20,45 @@ Native [Tern](https://docs.stencil.so/tern/protocol/index.md) terminal frontend 
 
 ---
 
-## Prerequisites
+## Quick Start (Install & Run)
 
-- [Bun](https://bun.sh/) `>= 1.2.22` (or Node `>= 22` compatible runtime for bundled types)
-- [Tern](https://docs.stencil.so/tern/protocol/index.md) terminal with Surface Protocol support
-- Official Antigravity CLI (`agy`) providing `agy acp`
+Prerequisites:
+- [Bun](https://bun.sh/) `>= 1.2.22` (installer checks for this)
+- Official Antigravity CLI (`agy`) with `agy acp` support
+- [Tern](https://docs.stencil.so/tern/protocol/index.md) terminal with Surface Protocol support (non-Tern terminals automatically fall back to `agy --sandbox`)
 
-Inside non-Tern terminals without TSP, `agy-tern` safely delegates all CLI arguments to `agy --sandbox`.
-
----
-
-## Installation
-
-Clone the repository and link the CLI entrypoint into `~/.local/bin`:
+From a local clone of this repository, install dependencies, link `agy-tern` into `~/.local/bin`, and verify your setup in one step:
 
 ```sh
-bun install --frozen-lockfile
-mkdir -p "$HOME/.local/bin"
-ln -s "$PWD/src/cli.tsx" "$HOME/.local/bin/agy-tern"
-agy-tern --doctor
+./scripts/install.sh
 ```
 
-Ensure `~/.local/bin` is on your `PATH`. Because the symlink targets `src/cli.tsx` directly, updates take effect on the next launch without a separate build step. Calling `ln -s` without `-f` avoids overwriting an existing `agy` or `agy-tern` binary.
-
-Authenticate through the official CLI before or inside a session:
+Sign in once through the official CLI (or inside the `/account` modal on first launch), then run inside any project directory:
 
 ```sh
-agy acp --login
+agy-tern
 ```
+
+<details>
+<summary>Alternative install, uninstall, and troubleshooting</summary>
+
+- **Run directly without global symlink**:
+  ```sh
+  bun install --frozen-lockfile && bun run start
+  ```
+- **Uninstall launcher symlink**:
+  ```sh
+  ./scripts/install.sh --uninstall
+  ```
+- **`agy-tern: command not found`**: Ensure `~/.local/bin` is on your `PATH`:
+  ```sh
+  export PATH="$HOME/.local/bin:$PATH"
+  ```
+- **Updates**: Because `~/.local/bin/agy-tern` links straight to `src/cli.tsx`, pulling changes takes effect immediately on next launch with no separate build step.
+- **Not authenticated**: Run `agy acp --login` in your shell or open `/account` inside `agy-tern`.
+- **Linux clipboard copy/paste**: Install `wl-clipboard` (`wl-copy` / `wl-paste`) on Wayland or `xclip` on X11. If your window manager intercepts `Alt+V`, use `/paste-image` (`/clip`).
+
+</details>
 
 ---
 
@@ -135,7 +146,7 @@ Unknown slash commands are rejected locally instead of silently becoming model p
 - **Subprocess isolation boundary**: `agy-tern` passes `--sandbox` to `agy acp --sandbox`, does not implement its own filesystem or terminal RPC servers, and never passes permission-bypass flags. Requesting `--sandbox` does not verify OS-level kernel containment unless enforced by `agy` on your host.
 - **Zero credential storage**: No tokens, OAuth state, or account pools are stored by `agy-tern`. Official login/logout modifies `agy`'s shared authentication across CLI, Desktop App, and IDE extensions.
 - **Explicit approvals**: Tool permission prompts allow only `allow_once` or `reject_once` choices using server-provided option IDs. Pre-existing `agy` allow rules still apply inside the backend subprocess.
-- **Local XDG state (`0700` dir / `0600` file)**: UI preferences (`prefs.json`), private session labels (`session-names/`), sanitized UI transcript snapshots (`transcripts/`, stripping inline base64 images and capped to recent entries/files), and workspace prompt templates (`templates/`) are written under `$XDG_STATE_HOME/agy-tern/` (defaulting to `~/.local/state/agy-tern/`). If `agy` resumes a session without replaying chat history over ACP, `agy-tern` falls back to its local snapshot or a read-only projection of `~/.gemini/antigravity-cli/brain/<uuid>/.system_generated/logs/transcript.jsonl`.
+- **Local XDG state (`0700` dir / `0600` file)**: UI preferences (`prefs.json`), private session labels (`session-names/`), recent workspace prompt history (`prompt-history/`, capped at 50 prompts), sanitized UI transcript snapshots (`transcripts/`, stripping inline base64 images and capped to recent entries/files), and workspace prompt templates (`templates/`) are written under `$XDG_STATE_HOME/agy-tern/` (defaulting to `~/.local/state/agy-tern/`). If `agy` resumes a session without replaying chat history over ACP, `agy-tern` falls back to whichever local snapshot or read-only projection of `~/.gemini/antigravity-cli/brain/<uuid>/.system_generated/logs/transcript.jsonl` is richer.
 
 ---
 
