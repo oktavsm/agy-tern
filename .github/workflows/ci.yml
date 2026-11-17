@@ -90,6 +90,7 @@ jobs:
             test/draft.test.ts \
             test/extensions.test.ts \
             test/files.test.ts \
+            test/follow-up.test.ts \
             test/history.test.ts \
             test/model.test.ts \
             test/panels.test.ts \
