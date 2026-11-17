@@ -4,7 +4,7 @@ import { extname, isAbsolute, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { SessionConfigOption, ToolCallUpdate, UsageUpdate } from '@agentclientprotocol/sdk';
 import type { Chip, DiffHunk } from '@stencil-hq/tern';
-import { contentText, type AgentPlan, type InlineImage, type TranscriptEntry } from './model';
+import { contentText, type AgentPlan, type InlineImage, type ToolStep, type TranscriptEntry } from './model';
 import type { QuotaRow } from './reports';
 
 export interface DiffResult {
@@ -40,12 +40,56 @@ export interface PlanSummary {
 }
 
 const MAX_LCS_CELLS = 250_000;
-const DIFF_CACHE = new Map<string, DiffResult>();
 const MAX_DIFF_CACHE_ENTRIES = 64;
-const MAX_CACHE_INPUT_CHARS = 16_000;
+
+interface DiffCacheRecord {
+  oldText: string;
+  newText: string;
+  contextLines: number;
+  result: DiffResult;
+}
+
+interface DiffCountRecord {
+  oldText: string;
+  newText: string;
+  counts: { added: number; removed: number };
+}
+
+const DIFF_CACHE = new Map<string, DiffCacheRecord>();
+const DIFF_COUNT_CACHE = new Map<string, DiffCountRecord>();
+
+function fnv1aPair(a: string, b: string, tag: string): string {
+  let h1 = 0x811c9dc5;
+  let h2 = 0x9e3779b9;
+  for (let i = 0; i < a.length; i++) {
+    const c = a.charCodeAt(i);
+    h1 = Math.imul(h1 ^ c, 0x01000193);
+    h2 = Math.imul(h2 ^ ((c << 3) | (c >>> 13)), 0x85ebca6b);
+  }
+  h1 = Math.imul(h1 ^ 0xff, 0x01000193);
+  h2 = Math.imul(h2 ^ 0xff, 0x85ebca6b);
+  for (let i = 0; i < b.length; i++) {
+    const c = b.charCodeAt(i);
+    h1 = Math.imul(h1 ^ c, 0x01000193);
+    h2 = Math.imul(h2 ^ ((c << 5) | (c >>> 11)), 0x85ebca6b);
+  }
+  return `${h1 >>> 0}:${h2 >>> 0}:${a.length}:${b.length}:${tag}`;
+}
+
+function fnv1aSingle(text: string): string {
+  let h1 = 0x811c9dc5;
+  let h2 = 0x9e3779b9;
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    h1 = Math.imul(h1 ^ c, 0x01000193);
+    h2 = Math.imul(h2 ^ ((c << 3) | (c >>> 13)), 0x85ebca6b);
+  }
+  return `${h1 >>> 0}:${h2 >>> 0}:${text.length}`;
+}
 
 function cacheSetBounded<V>(cache: Map<string, V>, key: string, value: V, maxEntries: number): void {
-  if (cache.size >= maxEntries) {
+  if (cache.has(key)) cache.delete(key);
+  else if (cache.size >= maxEntries) {
     const oldest = cache.keys().next().value;
     if (oldest !== undefined) cache.delete(oldest);
   }
@@ -109,13 +153,73 @@ function lcsOps(oldBody: string[], newBody: string[], oldOffset: number, newOffs
   return ops;
 }
 
+/** Compute +/- line counts from before/after text using 1D-DP LCS without allocating full hunks. */
+export function countDiffLines(oldText: string, newText: string): { added: number; removed: number } {
+  if (oldText === newText) return { added: 0, removed: 0 };
+  if (!oldText) return { added: splitLines(newText).length, removed: 0 };
+  if (!newText) return { added: 0, removed: splitLines(oldText).length };
+
+  const pairKey = fnv1aPair(oldText, newText, 'count');
+  const cachedCount = DIFF_COUNT_CACHE.get(pairKey);
+  if (cachedCount && cachedCount.oldText === oldText && cachedCount.newText === newText) {
+    cacheSetBounded(DIFF_COUNT_CACHE, pairKey, cachedCount, MAX_DIFF_CACHE_ENTRIES);
+    return cachedCount.counts;
+  }
+  const hunkKey = fnv1aPair(oldText, newText, '3');
+  const cachedHunk = DIFF_CACHE.get(hunkKey);
+  if (cachedHunk && cachedHunk.oldText === oldText && cachedHunk.newText === newText && cachedHunk.contextLines === 3) {
+    return { added: cachedHunk.result.added, removed: cachedHunk.result.removed };
+  }
+
+  const oldLines = splitLines(oldText);
+  const newLines = splitLines(newText);
+  let prefix = 0;
+  while (prefix < oldLines.length && prefix < newLines.length && oldLines[prefix] === newLines[prefix]) {
+    prefix++;
+  }
+  let suffix = 0;
+  while (
+    suffix < oldLines.length - prefix &&
+    suffix < newLines.length - prefix &&
+    oldLines[oldLines.length - 1 - suffix] === newLines[newLines.length - 1 - suffix]
+  ) {
+    suffix++;
+  }
+  const m = oldLines.length - prefix - suffix;
+  const n = newLines.length - prefix - suffix;
+  let counts: { added: number; removed: number };
+  if (m === 0 || n === 0 || m * n > MAX_LCS_CELLS) {
+    counts = { added: n, removed: m };
+  } else {
+    const oldBody = oldLines.slice(prefix, oldLines.length - suffix);
+    const newBody = newLines.slice(prefix, newLines.length - suffix);
+    const shortBody = m <= n ? oldBody : newBody;
+    const longBody = m <= n ? newBody : oldBody;
+    const dp = new Uint32Array(shortBody.length + 1);
+    for (let i = 1; i <= longBody.length; i++) {
+      let prevDiag = 0;
+      const longLine = longBody[i - 1]!;
+      for (let j = 1; j <= shortBody.length; j++) {
+        const saved = dp[j]!;
+        if (longLine === shortBody[j - 1]!) dp[j] = prevDiag + 1;
+        else if (dp[j - 1]! > dp[j]!) dp[j] = dp[j - 1]!;
+        prevDiag = saved;
+      }
+    }
+    const lcsLen = dp[shortBody.length]!;
+    counts = { added: n - lcsLen, removed: m - lcsLen };
+  }
+  cacheSetBounded(DIFF_COUNT_CACHE, pairKey, { oldText, newText, counts }, MAX_DIFF_CACHE_ENTRIES);
+  return counts;
+}
+
 /** Build unified diff hunks and +/- line counts from before/after text. */
 export function buildUnifiedDiffHunks(oldText: string, newText: string, contextLines = 3): DiffResult {
-  const canCache = contextLines === 3 && oldText.length + newText.length <= MAX_CACHE_INPUT_CHARS;
-  const cacheKey = canCache ? `${oldText}\0${newText}` : '';
-  if (canCache) {
-    const cached = DIFF_CACHE.get(cacheKey);
-    if (cached) return cached;
+  const cacheKey = fnv1aPair(oldText, newText, String(contextLines));
+  const cached = DIFF_CACHE.get(cacheKey);
+  if (cached && cached.oldText === oldText && cached.newText === newText && cached.contextLines === contextLines) {
+    cacheSetBounded(DIFF_CACHE, cacheKey, cached, MAX_DIFF_CACHE_ENTRIES);
+    return cached.result;
   }
   const oldLines = splitLines(oldText);
   const newLines = splitLines(newText);
@@ -159,7 +263,11 @@ export function buildUnifiedDiffHunks(oldText: string, newText: string, contextL
   for (let idx = 0; idx < allOps.length; idx++) {
     if (allOps[idx]!.kind !== 'context') changedIndices.push(idx);
   }
-  if (!changedIndices.length) return { hunks: [], added: 0, removed: 0 };
+  if (!changedIndices.length) {
+    const emptyResult: DiffResult = { hunks: [], added: 0, removed: 0 };
+    cacheSetBounded(DIFF_CACHE, cacheKey, { oldText, newText, contextLines, result: emptyResult }, MAX_DIFF_CACHE_ENTRIES);
+    return emptyResult;
+  }
 
   const ranges: Array<[number, number]> = [];
   for (const idx of changedIndices) {
@@ -181,7 +289,7 @@ export function buildUnifiedDiffHunks(oldText: string, newText: string, contextL
   });
 
   const result: DiffResult = { hunks, added, removed };
-  if (canCache) cacheSetBounded(DIFF_CACHE, cacheKey, result, MAX_DIFF_CACHE_ENTRIES);
+  cacheSetBounded(DIFF_CACHE, cacheKey, { oldText, newText, contextLines, result }, MAX_DIFF_CACHE_ENTRIES);
   return result;
 }
 
@@ -237,7 +345,12 @@ export function compactToolHeaderText(raw: string, maxChars = 88): string {
 }
 
 /** Build native Tern <tool> display props from an ACP ToolCallUpdate. */
-export function summarizeToolCall(call: ToolCallUpdate, cwd: string): ToolSummary {
+export function summarizeToolCall(
+  call: ToolCallUpdate,
+  cwd: string,
+  opts?: { includeDiffStats?: boolean },
+): ToolSummary {
+  const includeDiffStats = opts?.includeDiffStats !== false;
   const input = asRecord(call.rawInput);
   const name = normalizeToolName(call);
   const loc = call.locations?.[0];
@@ -275,9 +388,11 @@ export function summarizeToolCall(call: ToolCallUpdate, cwd: string): ToolSummar
   for (const item of call.content ?? []) {
     if (item.type === 'diff') {
       hasDiff = true;
-      const diff = buildUnifiedDiffHunks(item.oldText ?? '', item.newText);
-      added += diff.added;
-      removed += diff.removed;
+      if (includeDiffStats) {
+        const counts = countDiffLines(item.oldText ?? '', item.newText);
+        added += counts.added;
+        removed += counts.removed;
+      }
     }
   }
 
@@ -575,21 +690,44 @@ export function extractToolImagePaths(call: ToolCallUpdate, cwd: string): string
   return [...seen];
 }
 
-/** Extract existing local image paths referenced via Markdown images or backticked paths inside prose. */
-export function extractMarkdownImagePaths(text: string, cwd: string): string[] {
+/** Build plain text inspection summary for a tool step (shared by /tasks and UI inspect). */
+export function buildTaskDetailText(step: ToolStep, cwd: string): string {
+  const s = summarizeToolCall(step.call, cwd, { includeDiffStats: false });
+  return [
+    `Tool: ${s.title}`,
+    ...(s.target ? [`Target: ${s.target}`] : []),
+    ...(s.fullCommand ? [`Command:\n${s.fullCommand}`] : []),
+    ...(step.call.rawInput !== undefined ? [`Input:\n${JSON.stringify(step.call.rawInput, null, 2)}`] : []),
+    ...(step.call.rawOutput !== undefined
+      ? [`Output:\n${typeof step.call.rawOutput === 'string' ? step.call.rawOutput : JSON.stringify(step.call.rawOutput, null, 2)}`]
+      : []),
+  ].join('\n\n');
+}
+
+/** Extract resolved local image candidates referenced via Markdown images or backticked paths inside prose without FS I/O. */
+export function extractMarkdownImageCandidates(text: string, cwd: string): string[] {
   if (!text) return [];
   const seen = new Set<string>();
-  const addIfExists = (raw: string): void => {
+  const addCandidate = (raw: string): void => {
     const resolved = resolveLocalImageCandidate(raw, cwd);
-    if (resolved && existsSync(resolved)) seen.add(resolved);
+    if (resolved) seen.add(resolved);
   };
   for (const match of text.matchAll(/!\[[^\]]*]\(([^)\s]+)\)/g)) {
-    if (match[1]) addIfExists(match[1]);
+    if (match[1]) addCandidate(match[1]);
   }
   for (const match of text.matchAll(/`([^\n`]+\.(?:png|jpe?g|webp|gif))`/gi)) {
-    if (match[1]) addIfExists(match[1]);
+    if (match[1]) addCandidate(match[1]);
   }
   return [...seen];
+}
+
+/** Extract existing local image paths referenced via Markdown images or backticked paths inside prose. */
+export function extractMarkdownImagePaths(
+  text: string,
+  cwd: string,
+  pathExists: (targetPath: string) => boolean = existsSync,
+): string[] {
+  return extractMarkdownImageCandidates(text, cwd).filter(pathExists);
 }
 
 /** Extract inline base64 image blocks delivered inside a tool call's content array. */
@@ -612,50 +750,119 @@ export interface TranscriptSearchMatch {
   entry: TranscriptEntry;
 }
 
+interface IndexedSearchEntry {
+  match: TranscriptSearchMatch;
+  haystack: string;
+}
+
+interface FindIndexCacheRecord {
+  revision: number;
+  cwd: string;
+  indexed: IndexedSearchEntry[];
+}
+
+interface FindQueryCacheRecord {
+  entries: readonly TranscriptEntry[];
+  revision: number;
+  cwd: string;
+  needle: string;
+  matches: TranscriptSearchMatch[];
+}
+
+const FIND_INDEX_CACHE = new WeakMap<readonly TranscriptEntry[], FindIndexCacheRecord>();
+const FIND_QUERY_CACHE = new Map<string, FindQueryCacheRecord>();
+const MAX_FIND_QUERY_CACHE = 24;
+
+function buildIndexedSearchEntry(entry: TranscriptEntry, cwd: string): IndexedSearchEntry {
+  let label = '';
+  let detail = '';
+  let preview = '';
+  if (entry.type === 'message') {
+    label = entry.role === 'user' ? 'You' : 'Antigravity';
+    detail = entry.text.replace(/\s+/g, ' ').trim().slice(0, 90) || '(image message)';
+    preview = entry.text;
+  } else if (entry.type === 'thought') {
+    label = 'Thought';
+    detail = entry.text.replace(/\s+/g, ' ').trim().slice(0, 90);
+    preview = entry.text;
+  } else if (entry.type === 'tool') {
+    const summary = summarizeToolCall(entry.call, cwd, { includeDiffStats: false });
+    const bodyParts = (entry.call.content ?? []).map(item =>
+      item.type === 'diff'
+        ? `${formatPathLabel(item.path, cwd)}\n${item.newText}`
+        : item.type === 'content' ? contentText(item.content) : item.terminalId);
+    label = `${summary.name ?? 'tool'}: ${summary.title}`;
+    detail = summary.target ?? entry.call.status ?? 'tool call';
+    preview = [detail, ...bodyParts, typeof entry.call.rawOutput === 'string' ? entry.call.rawOutput : ''].filter(Boolean).join('\n\n');
+  } else if (entry.type === 'plan') {
+    label = 'Plan';
+    detail = `${entry.entries.length} steps`;
+    preview = entry.entries.map(item => `[${item.status}] ${item.content}`).join('\n');
+  } else if (entry.type === 'compaction') {
+    label = `Compaction (${entry.status})`;
+    detail = (entry.text || entry.error || 'Context compacted').replace(/\s+/g, ' ').trim().slice(0, 90);
+    preview = entry.error ? `${entry.text}\n${entry.error}`.trim() : entry.text || 'Context compacted';
+  } else {
+    label = entry.error ? 'Error' : 'Notice';
+    detail = entry.text.replace(/\s+/g, ' ').trim().slice(0, 90);
+    preview = entry.text;
+  }
+  const haystack = `${label} ${detail} ${preview}`.toLowerCase();
+  return {
+    match: { id: entry.id, kind: entry.type, label, detail, preview, entry },
+    haystack,
+  };
+}
+
+/** Cached transcript search keyed by `(entries, revision, cwd, query)`. */
+export function searchTranscriptCached(
+  entries: readonly TranscriptEntry[],
+  revision: number,
+  cwd: string,
+  query: string,
+): TranscriptSearchMatch[] {
+  const needle = query.trim().toLowerCase();
+  const queryKey = `${revision}:${cwd}:${needle}`;
+  const cachedQuery = FIND_QUERY_CACHE.get(queryKey);
+  if (
+    cachedQuery &&
+    cachedQuery.entries === entries &&
+    cachedQuery.revision === revision &&
+    cachedQuery.cwd === cwd &&
+    cachedQuery.needle === needle
+  ) {
+    cacheSetBounded(FIND_QUERY_CACHE, queryKey, cachedQuery, MAX_FIND_QUERY_CACHE);
+    return cachedQuery.matches;
+  }
+
+  let idxRecord = FIND_INDEX_CACHE.get(entries);
+  if (!idxRecord || idxRecord.revision !== revision || idxRecord.cwd !== cwd) {
+    idxRecord = {
+      revision,
+      cwd,
+      indexed: entries.map(entry => buildIndexedSearchEntry(entry, cwd)),
+    };
+    FIND_INDEX_CACHE.set(entries, idxRecord);
+  }
+
+  const matches: TranscriptSearchMatch[] = [];
+  for (let i = idxRecord.indexed.length - 1; i >= 0; i--) {
+    const item = idxRecord.indexed[i]!;
+    if (!needle || item.haystack.includes(needle)) matches.push(item.match);
+  }
+  cacheSetBounded(FIND_QUERY_CACHE, queryKey, { entries, revision, cwd, needle, matches }, MAX_FIND_QUERY_CACHE);
+  return matches;
+}
+
 /** Filter transcript entries for /find search modal. */
 export function searchTranscript(entries: readonly TranscriptEntry[], cwd: string, query: string): TranscriptSearchMatch[] {
   const needle = query.trim().toLowerCase();
   const matches: TranscriptSearchMatch[] = [];
-  for (const entry of entries) {
-    let label = '';
-    let detail = '';
-    let preview = '';
-    if (entry.type === 'message') {
-      label = entry.role === 'user' ? 'You' : 'Antigravity';
-      detail = entry.text.replace(/\s+/g, ' ').trim().slice(0, 90) || '(image message)';
-      preview = entry.text;
-    } else if (entry.type === 'thought') {
-      label = 'Thought';
-      detail = entry.text.replace(/\s+/g, ' ').trim().slice(0, 90);
-      preview = entry.text;
-    } else if (entry.type === 'tool') {
-      const summary = summarizeToolCall(entry.call, cwd);
-      const bodyParts = (entry.call.content ?? []).map(item =>
-        item.type === 'diff'
-          ? `${formatPathLabel(item.path, cwd)}\n${item.newText}`
-          : item.type === 'content' ? contentText(item.content) : item.terminalId);
-      label = `${summary.name ?? 'tool'}: ${summary.title}`;
-      detail = summary.target ?? entry.call.status ?? 'tool call';
-      preview = [detail, ...bodyParts, typeof entry.call.rawOutput === 'string' ? entry.call.rawOutput : ''].filter(Boolean).join('\n\n');
-    } else if (entry.type === 'plan') {
-      label = 'Plan';
-      detail = `${entry.entries.length} steps`;
-      preview = entry.entries.map(item => `[${item.status}] ${item.content}`).join('\n');
-    } else if (entry.type === 'compaction') {
-      label = `Compaction (${entry.status})`;
-      detail = (entry.text || entry.error || 'Context compacted').replace(/\s+/g, ' ').trim().slice(0, 90);
-      preview = entry.error ? `${entry.text}\n${entry.error}`.trim() : entry.text || 'Context compacted';
-    } else {
-      label = entry.error ? 'Error' : 'Notice';
-      detail = entry.text.replace(/\s+/g, ' ').trim().slice(0, 90);
-      preview = entry.text;
-    }
-    const haystack = `${label} ${detail} ${preview}`.toLowerCase();
-    if (!needle || haystack.includes(needle)) {
-      matches.push({ id: entry.id, kind: entry.type, label, detail, preview, entry });
-    }
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const item = buildIndexedSearchEntry(entries[i]!, cwd);
+    if (!needle || item.haystack.includes(needle)) matches.push(item.match);
   }
-  return matches.reverse();
+  return matches;
 }
 
 const RUNNABLE_LANGS = new Set(['sh', 'bash', 'zsh', 'shell', 'fish', 'console', 'terminal']);
@@ -673,24 +880,58 @@ export function isRunnableCodeLang(lang?: string): boolean {
   return !!normalized && RUNNABLE_LANGS.has(normalized);
 }
 
-const MD_SEGMENT_CACHE = new Map<string, MarkdownSegment[]>();
+interface MdCacheRecord {
+  markdown: string;
+  segments: MarkdownSegment[];
+}
+
+interface StreamMdPrefixRecord {
+  stablePrefix: string;
+  stableSegments: MarkdownSegment[];
+  resumeOffset: number;
+}
+
+const MD_SEGMENT_CACHE = new Map<string, MdCacheRecord>();
 const MAX_MD_CACHE_ENTRIES = 64;
+const STREAM_MD_PREFIX_CACHE: StreamMdPrefixRecord[] = [];
+const MAX_STREAM_PREFIX_CACHE = 8;
 
 /** Split Markdown into prose chunks and fenced code blocks for per-block copy and run controls. */
 export function splitMarkdownSegments(markdown: string): MarkdownSegment[] {
   if (!markdown) return [];
-  const canCache = markdown.length <= MAX_CACHE_INPUT_CHARS;
-  if (canCache) {
-    const cached = MD_SEGMENT_CACHE.get(markdown);
-    if (cached) return cached;
+  if (!markdown.includes('```') && !markdown.includes('~~~')) {
+    const text = markdown.replace(/\r\n?/g, '\n').trim();
+    return text ? [{ kind: 'prose', text }] : [];
   }
-  const lines = markdown.replace(/\r\n?/g, '\n').split('\n');
-  const segments: MarkdownSegment[] = [];
+
+  const mdKey = fnv1aSingle(markdown);
+  const cached = MD_SEGMENT_CACHE.get(mdKey);
+  if (cached && cached.markdown === markdown) {
+    cacheSetBounded(MD_SEGMENT_CACHE, mdKey, cached, MAX_MD_CACHE_ENTRIES);
+    return cached.segments;
+  }
+
+  const normalized = markdown.includes('\r') ? markdown.replace(/\r\n?/g, '\n') : markdown;
+  let segments: MarkdownSegment[] = [];
+  let startOffset = 0;
+
+  for (let idx = STREAM_MD_PREFIX_CACHE.length - 1; idx >= 0; idx--) {
+    const rec = STREAM_MD_PREFIX_CACHE[idx]!;
+    if (rec.resumeOffset <= normalized.length && normalized.startsWith(rec.stablePrefix)) {
+      segments = rec.stableSegments.slice();
+      startOffset = rec.resumeOffset;
+      break;
+    }
+  }
+
+  const tail = startOffset > 0 ? normalized.slice(startOffset) : normalized;
   let proseLines: string[] = [];
   let fenceChar: '`' | '~' | undefined;
   let fenceLen = 0;
   let fenceLang = '';
   let codeLines: string[] = [];
+  let latestStableOffset = 0;
+  let latestStableSegments: MarkdownSegment[] | undefined;
 
   const flushProse = (): void => {
     const text = proseLines.join('\n').trim();
@@ -698,7 +939,13 @@ export function splitMarkdownSegments(markdown: string): MarkdownSegment[] {
     proseLines = [];
   };
 
-  for (const line of lines) {
+  let lineStart = 0;
+  while (lineStart <= tail.length) {
+    const nlIdx = tail.indexOf('\n', lineStart);
+    const hasNewline = nlIdx !== -1;
+    const lineEnd = hasNewline ? nlIdx : tail.length;
+    const line = tail.slice(lineStart, lineEnd);
+
     if (!fenceChar) {
       const openMatch = /^\s{0,3}(`{3,}|~{3,})([^\n]*)$/.exec(line);
       if (openMatch) {
@@ -706,37 +953,43 @@ export function splitMarkdownSegments(markdown: string): MarkdownSegment[] {
         const info = openMatch[2]!.trim();
         if (marker[0] === '`' && info.includes('`')) {
           proseLines.push(line);
-          continue;
+        } else {
+          flushProse();
+          fenceChar = marker[0] as '`' | '~';
+          fenceLen = marker.length;
+          fenceLang = info.split(/\s+/)[0] ?? '';
+          codeLines = [];
         }
-        flushProse();
-        fenceChar = marker[0] as '`' | '~';
-        fenceLen = marker.length;
-        fenceLang = info.split(/\s+/)[0] ?? '';
-        codeLines = [];
       } else {
         proseLines.push(line);
       }
-      continue;
+    } else {
+      const closeMatch = /^\s{0,3}(`{3,}|~{3,})\s*$/.exec(line);
+      if (closeMatch && closeMatch[1]![0] === fenceChar && closeMatch[1]!.length >= fenceLen) {
+        const code = codeLines.join('\n');
+        const lang = fenceLang || undefined;
+        segments.push({
+          kind: 'code',
+          text: code,
+          ...(lang ? { lang } : {}),
+          runnable: isRunnableCodeLang(lang) && code.trim().length > 0,
+          closed: true,
+        });
+        fenceChar = undefined;
+        fenceLen = 0;
+        fenceLang = '';
+        codeLines = [];
+        if (hasNewline) {
+          latestStableOffset = startOffset + nlIdx + 1;
+          latestStableSegments = segments.slice();
+        }
+      } else {
+        codeLines.push(line);
+      }
     }
 
-    const closeMatch = /^\s{0,3}(`{3,}|~{3,})\s*$/.exec(line);
-    if (closeMatch && closeMatch[1]![0] === fenceChar && closeMatch[1]!.length >= fenceLen) {
-      const code = codeLines.join('\n');
-      const lang = fenceLang || undefined;
-      segments.push({
-        kind: 'code',
-        text: code,
-        ...(lang ? { lang } : {}),
-        runnable: isRunnableCodeLang(lang) && code.trim().length > 0,
-        closed: true,
-      });
-      fenceChar = undefined;
-      fenceLen = 0;
-      fenceLang = '';
-      codeLines = [];
-    } else {
-      codeLines.push(line);
-    }
+    if (!hasNewline) break;
+    lineStart = nlIdx + 1;
   }
 
   if (fenceChar) {
@@ -752,7 +1005,19 @@ export function splitMarkdownSegments(markdown: string): MarkdownSegment[] {
   } else {
     flushProse();
   }
-  if (canCache) cacheSetBounded(MD_SEGMENT_CACHE, markdown, segments, MAX_MD_CACHE_ENTRIES);
+
+  if (latestStableSegments && latestStableOffset > startOffset) {
+    STREAM_MD_PREFIX_CACHE.push({
+      stablePrefix: normalized.slice(0, latestStableOffset),
+      stableSegments: latestStableSegments,
+      resumeOffset: latestStableOffset,
+    });
+    if (STREAM_MD_PREFIX_CACHE.length > MAX_STREAM_PREFIX_CACHE) {
+      STREAM_MD_PREFIX_CACHE.shift();
+    }
+  }
+
+  cacheSetBounded(MD_SEGMENT_CACHE, mdKey, { markdown, segments }, MAX_MD_CACHE_ENTRIES);
   return segments;
 }
 

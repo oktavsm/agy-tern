@@ -2,8 +2,15 @@ import type { SessionConfigOption, SessionInfo } from '@agentclientprotocol/sdk'
 import { commandCategory, filterCommands, type Command } from './commands';
 import { draftKey, type Draft } from './draft';
 import type { AgentEntry, McpServerEntry, PluginEntry } from './extensions';
+import type { GitStatusEntry } from './files';
+import type { ToolStep, TranscriptEntry } from './model';
 import type { PromptTemplate } from './templates';
-import type { TranscriptSearchMatch } from './ui-format';
+import {
+  searchTranscriptCached,
+  summarizeToolCall,
+  type SessionDiffItem,
+  type TranscriptSearchMatch,
+} from './ui-format';
 
 export interface PickerKeyInput {
   name: string;
@@ -119,4 +126,373 @@ export function filterTemplatesList(templates: readonly PromptTemplate[], query:
   const needle = query.trim().toLowerCase();
   if (!needle) return [...templates];
   return templates.filter(tpl => `${tpl.name} ${tpl.text}`.toLowerCase().includes(needle));
+}
+
+export interface PickerTabSpec {
+  id: string;
+  label: string;
+  count: number;
+}
+
+export type PickerModel =
+  | {
+    kind: 'commands';
+    tabIds: readonly string[];
+    tabs: readonly PickerTabSpec[];
+    visibleIds: readonly string[];
+    selectedId: string;
+    filtered: readonly Command[];
+  }
+  | {
+    kind: 'mcp';
+    tabIds: readonly string[];
+    tabs: readonly PickerTabSpec[];
+    visibleIds: readonly string[];
+    selectedId: string;
+    filtered: readonly McpServerEntry[];
+  }
+  | {
+    kind: 'plugins';
+    tabIds: readonly string[];
+    tabs: readonly PickerTabSpec[];
+    visibleIds: readonly string[];
+    selectedId: string;
+    filtered: readonly PluginEntry[];
+  }
+  | {
+    kind: 'agents';
+    tabIds: readonly string[];
+    tabs: readonly PickerTabSpec[];
+    visibleIds: readonly string[];
+    selectedId: string;
+    filtered: readonly AgentEntry[];
+  }
+  | {
+    kind: 'templates';
+    tabIds: readonly string[];
+    tabs: readonly PickerTabSpec[];
+    visibleIds: readonly string[];
+    selectedId: string;
+    filtered: readonly PromptTemplate[];
+  }
+  | {
+    kind: 'find';
+    tabIds: readonly string[];
+    tabs: readonly PickerTabSpec[];
+    visibleIds: readonly string[];
+    selectedId: string;
+    filtered: readonly TranscriptSearchMatch[];
+  }
+  | {
+    kind: 'tasks';
+    tabIds: readonly string[];
+    tabs: readonly PickerTabSpec[];
+    visibleIds: readonly string[];
+    selectedId: string;
+    allToolsCount: number;
+    runningCount: number;
+    filtered: readonly ToolStep[];
+  }
+  | {
+    kind: 'changes';
+    tabIds: readonly string[];
+    tabs: readonly PickerTabSpec[];
+    visibleIds: readonly string[];
+    selectedId: string;
+    usingGit: boolean;
+    filteredEdits: readonly SessionDiffItem[];
+    filteredGit: readonly GitStatusEntry[];
+  }
+  | {
+    kind: 'sessions';
+    tabIds: readonly string[];
+    tabs: readonly PickerTabSpec[];
+    visibleIds: readonly string[];
+    selectedId: string;
+    allRowsCount: number;
+    namedRowsCount: number;
+    filtered: readonly SessionInfo[];
+  }
+  | {
+    kind: 'config';
+    tabIds: readonly string[];
+    tabs: readonly PickerTabSpec[] | undefined;
+    visibleIds: readonly string[];
+    selectedId: string;
+    groups: ReturnType<typeof groupSelectConfigOptions>;
+    visibleGroups: ReturnType<typeof groupSelectConfigOptions>;
+    flat: ReadonlyArray<{
+      group: ReturnType<typeof groupSelectConfigOptions>[number];
+      val: ReturnType<typeof groupSelectConfigOptions>[number]['options'][number];
+    }>;
+  };
+
+export type PickerPanelInput =
+  | { kind: 'commands' }
+  | { kind: 'mcp' }
+  | { kind: 'plugins' }
+  | { kind: 'agents' }
+  | { kind: 'templates' }
+  | { kind: 'find' }
+  | { kind: 'tasks' }
+  | { kind: 'changes' }
+  | { kind: 'sessions' }
+  | { kind: 'config'; option: Extract<SessionConfigOption, { type: 'select' }> };
+
+export interface PickerModelInput {
+  panel: PickerPanelInput;
+  cwd: string;
+  query: string;
+  pickerTab: string;
+  pickerSelected: string;
+  commands: readonly Command[];
+  mcpServers: readonly McpServerEntry[];
+  pluginsList: readonly PluginEntry[];
+  agentsList: readonly AgentEntry[];
+  templatesList: readonly PromptTemplate[];
+  entries: readonly TranscriptEntry[];
+  entriesRevision: number;
+  sessionDiffs: readonly SessionDiffItem[];
+  gitChanges: readonly GitStatusEntry[];
+  listedSessions: readonly SessionInfo[];
+  activeSessionId: string;
+  sessionInfo: ReadonlyMap<string, SessionInfo>;
+  localNames: ReadonlyMap<string, string | undefined>;
+  sessionTitle: (id: string) => string;
+}
+
+function pickSelectedId(visibleIds: readonly string[], requested: string): string {
+  return visibleIds.includes(requested) ? requested : (visibleIds[0] ?? '');
+}
+
+/** Build a unified PickerModel shared by keyboard stepping (`stepPickerKey`) and modal rendering (`panels.tsx`). */
+export function buildPickerModel(input: PickerModelInput): PickerModel {
+  const { panel, cwd, query, pickerTab, pickerSelected } = input;
+  switch (panel.kind) {
+    case 'commands': {
+      const all = filterCommands(input.commands, query);
+      const tabIds = ['all', 'frontend', 'workflow', 'skill'] as const;
+      const tabs: PickerTabSpec[] = [
+        { id: 'all', label: 'All', count: all.length },
+        { id: 'frontend', label: 'Frontend', count: all.filter(c => commandCategory(c) === 'frontend').length },
+        { id: 'workflow', label: 'Workflows', count: all.filter(c => commandCategory(c) === 'workflow').length },
+        { id: 'skill', label: 'Skills', count: all.filter(c => commandCategory(c) === 'skill').length },
+      ];
+      const filtered = pickerTab === 'all' ? all : all.filter(c => commandCategory(c) === pickerTab);
+      const visibleIds = filtered.map(c => c.name);
+      return {
+        kind: 'commands',
+        tabIds,
+        tabs,
+        visibleIds,
+        selectedId: pickSelectedId(visibleIds, pickerSelected),
+        filtered,
+      };
+    }
+    case 'mcp': {
+      const visible = filterMcpServers(input.mcpServers, 'all', query);
+      const filtered = pickerTab === 'all'
+        ? visible
+        : visible.filter(s => (pickerTab === 'enabled' ? s.status === 'enabled' : s.status !== 'enabled'));
+      const tabIds = ['all', 'enabled', 'disabled'] as const;
+      const tabs: PickerTabSpec[] = [
+        { id: 'all', label: 'All', count: visible.length },
+        { id: 'enabled', label: 'Enabled', count: visible.filter(s => s.status === 'enabled').length },
+        { id: 'disabled', label: 'Disabled', count: visible.filter(s => s.status !== 'enabled').length },
+      ];
+      const visibleIds = filtered.map(s => s.name);
+      return {
+        kind: 'mcp',
+        tabIds,
+        tabs,
+        visibleIds,
+        selectedId: pickSelectedId(visibleIds, pickerSelected),
+        filtered,
+      };
+    }
+    case 'plugins': {
+      const visible = filterPluginsList(input.pluginsList, 'all', query);
+      const filtered = pickerTab === 'all'
+        ? visible
+        : visible.filter(p => (pickerTab === 'enabled' ? p.enabled : !p.enabled));
+      const tabIds = ['all', 'enabled', 'disabled'] as const;
+      const tabs: PickerTabSpec[] = [
+        { id: 'all', label: 'All', count: visible.length },
+        { id: 'enabled', label: 'Enabled', count: visible.filter(p => p.enabled).length },
+        { id: 'disabled', label: 'Disabled', count: visible.filter(p => !p.enabled).length },
+      ];
+      const visibleIds = filtered.map(p => p.name);
+      return {
+        kind: 'plugins',
+        tabIds,
+        tabs,
+        visibleIds,
+        selectedId: pickSelectedId(visibleIds, pickerSelected),
+        filtered,
+      };
+    }
+    case 'agents': {
+      const filtered = filterAgentsList(input.agentsList, query);
+      const visibleIds = filtered.map(a => a.name);
+      return {
+        kind: 'agents',
+        tabIds: ['all'],
+        tabs: [{ id: 'all', label: 'Configured agents', count: filtered.length }],
+        visibleIds,
+        selectedId: pickSelectedId(visibleIds, pickerSelected),
+        filtered,
+      };
+    }
+    case 'templates': {
+      const filtered = filterTemplatesList(input.templatesList, query);
+      const visibleIds = filtered.map(t => t.name);
+      return {
+        kind: 'templates',
+        tabIds: ['all'],
+        tabs: [{ id: 'all', label: 'Templates', count: filtered.length }],
+        visibleIds,
+        selectedId: pickSelectedId(visibleIds, pickerSelected),
+        filtered,
+      };
+    }
+    case 'find': {
+      const matches = searchTranscriptCached(input.entries, input.entriesRevision, cwd, query);
+      const tabIds = ['all', 'message', 'tool', 'thought'] as const;
+      const tabs: PickerTabSpec[] = [
+        { id: 'all', label: 'All', count: matches.length },
+        { id: 'message', label: 'Messages', count: matches.filter(m => m.kind === 'message').length },
+        { id: 'tool', label: 'Tools & Diffs', count: matches.filter(m => m.kind === 'tool').length },
+        { id: 'thought', label: 'Thoughts', count: matches.filter(m => m.kind === 'thought').length },
+      ];
+      const filtered = filterFindMatches(matches, pickerTab);
+      const visibleIds = filtered.map(m => m.id);
+      return {
+        kind: 'find',
+        tabIds,
+        tabs,
+        visibleIds,
+        selectedId: pickSelectedId(visibleIds, pickerSelected),
+        filtered,
+      };
+    }
+    case 'tasks': {
+      const needle = query.trim().toLowerCase();
+      const allTools: ToolStep[] = [];
+      let runningCount = 0;
+      for (let i = input.entries.length - 1; i >= 0; i--) {
+        const entry = input.entries[i]!;
+        if (entry.type !== 'tool') continue;
+        allTools.push(entry);
+        if (entry.call.status === 'in_progress' || entry.call.status === 'pending') runningCount++;
+      }
+      const filtered = allTools.filter(step => {
+        const isRunning = step.call.status === 'in_progress' || step.call.status === 'pending';
+        if (pickerTab === 'running' && !isRunning) return false;
+        if (pickerTab === 'done' && isRunning) return false;
+        if (!needle) return true;
+        const summary = summarizeToolCall(step.call, cwd, { includeDiffStats: false });
+        return `${summary.title} ${summary.target ?? ''} ${step.call.toolCallId}`.toLowerCase().includes(needle);
+      });
+      const visibleIds = filtered.map(s => s.id);
+      return {
+        kind: 'tasks',
+        tabIds: ['all', 'running', 'done'],
+        tabs: [
+          { id: 'all', label: 'All', count: allTools.length },
+          { id: 'running', label: 'Running', count: runningCount },
+          { id: 'done', label: 'Finished', count: allTools.length - runningCount },
+        ],
+        visibleIds,
+        selectedId: pickSelectedId(visibleIds, pickerSelected),
+        allToolsCount: allTools.length,
+        runningCount,
+        filtered,
+      };
+    }
+    case 'changes': {
+      const needle = query.trim().toLowerCase();
+      const filteredEdits = input.sessionDiffs.filter(item => item.path.toLowerCase().includes(needle));
+      const filteredGit = input.gitChanges.filter(item => `${item.status} ${item.path}`.toLowerCase().includes(needle));
+      const usingGit = pickerTab === 'git';
+      const visibleIds = usingGit ? filteredGit.map(item => `git:${item.path}`) : filteredEdits.map(item => item.id);
+      return {
+        kind: 'changes',
+        tabIds: ['edits', 'git'],
+        tabs: [
+          { id: 'edits', label: 'Session edits', count: input.sessionDiffs.length },
+          { id: 'git', label: 'Git status', count: input.gitChanges.length },
+        ],
+        visibleIds,
+        selectedId: pickSelectedId(visibleIds, pickerSelected),
+        usingGit,
+        filteredEdits,
+        filteredGit,
+      };
+    }
+    case 'sessions': {
+      const rows = new Map(input.listedSessions.map(row => [row.sessionId, row]));
+      if (input.activeSessionId) {
+        rows.set(
+          input.activeSessionId,
+          input.sessionInfo.get(input.activeSessionId) ?? { sessionId: input.activeSessionId, cwd },
+        );
+      }
+      const allRows = [...rows.values()];
+      const namedRowsCount = allRows.filter(row => !!input.localNames.get(row.sessionId)).length;
+      const filtered = filterSessionRows(
+        allRows,
+        input.localNames,
+        input.activeSessionId,
+        input.sessionTitle,
+        pickerTab,
+        query,
+      );
+      const visibleIds = filtered.map(row => row.sessionId);
+      return {
+        kind: 'sessions',
+        tabIds: ['all', 'named'],
+        tabs: [
+          { id: 'all', label: 'All', count: allRows.length },
+          { id: 'named', label: 'Local named', count: namedRowsCount },
+        ],
+        visibleIds,
+        selectedId: pickSelectedId(visibleIds, pickerSelected),
+        allRowsCount: allRows.length,
+        namedRowsCount,
+        filtered,
+      };
+    }
+    case 'config': {
+      const needle = query.trim().toLowerCase();
+      const groups = groupSelectConfigOptions(panel.option);
+      const visibleGroups = groups
+        .filter(group => pickerTab === 'all' || group.id === pickerTab)
+        .map(group => ({
+          ...group,
+          options: group.options.filter(val =>
+            `${val.name} ${val.value} ${val.description ?? ''}`.toLowerCase().includes(needle)),
+        }))
+        .filter(group => group.options.length > 0);
+      const flat = visibleGroups.flatMap(group => group.options.map(val => ({ group, val })));
+      const visibleIds = flat.map(entry => entry.val.value);
+      const totalCount = groups.reduce((sum, group) => sum + group.options.length, 0);
+      const tabs: PickerTabSpec[] | undefined = groups.length > 1
+        ? [
+          { id: 'all', label: 'All', count: totalCount },
+          ...groups.map(group => ({ id: group.id, label: group.label, count: group.options.length })),
+        ]
+        : undefined;
+      const tabIds = groups.length > 1 ? ['all', ...groups.map(g => g.id)] : [];
+      return {
+        kind: 'config',
+        tabIds,
+        tabs,
+        visibleIds,
+        selectedId: pickSelectedId(visibleIds, pickerSelected),
+        groups,
+        visibleGroups,
+        flat,
+      };
+    }
+  }
 }

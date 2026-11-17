@@ -172,6 +172,7 @@ export async function connectAgent(options: AgentOptions, events: AgentEvents): 
     resumeSession: false,
     closeSession: false,
     additionalDirectories: false,
+    appendSystemPrompt: false,
   };
   let promptCapabilities: NonNullable<AgentSession['promptCapabilities']> = Object.freeze({
     image: false,
@@ -253,6 +254,17 @@ export async function connectAgent(options: AgentOptions, events: AgentEvents): 
     events.update(notification);
     const changes = metadataChanges(notification);
     if (changes) publishMetadata(changes);
+  }
+
+  function supportsSystemPromptAppend(agentCapabilities: unknown): boolean {
+    if (typeof agentCapabilities !== 'object' || agentCapabilities === null) return false;
+    const meta = (agentCapabilities as Record<string, unknown>)._meta;
+    if (typeof meta !== 'object' || meta === null) return false;
+    const antigravity = (meta as Record<string, unknown>).antigravity;
+    if (typeof antigravity !== 'object' || antigravity === null) return false;
+    const systemPrompt = (antigravity as Record<string, unknown>).systemPrompt;
+    if (typeof systemPrompt !== 'object' || systemPrompt === null) return false;
+    return (systemPrompt as Record<string, unknown>).append === true;
   }
 
   function parseTier(meta: unknown): AccountTier | undefined {
@@ -460,6 +472,7 @@ export async function connectAgent(options: AgentOptions, events: AgentEvents): 
       resumeSession: initialized.agentCapabilities?.sessionCapabilities?.resume != null,
       closeSession: initialized.agentCapabilities?.sessionCapabilities?.close != null,
       additionalDirectories: initialized.agentCapabilities?.sessionCapabilities?.additionalDirectories != null,
+      appendSystemPrompt: supportsSystemPromptAppend(initialized.agentCapabilities),
     });
     promptCapabilities = Object.freeze({
       image: initialized.agentCapabilities?.promptCapabilities?.image === true,
@@ -471,7 +484,15 @@ export async function connectAgent(options: AgentOptions, events: AgentEvents): 
     };
     events.authentication?.(authentication);
     const addDirParam = capabilities.additionalDirectories && extraDirs.length ? { additionalDirectories: extraDirs } : {};
-    const session = await connection.agent.request(methods.agent.session.new, { cwd, mcpServers: [], ...addDirParam });
+    const systemPromptMetaParam = capabilities.appendSystemPrompt && options.appendSystemPrompt
+      ? { _meta: { antigravity: { systemPrompt: { append: options.appendSystemPrompt } } } }
+      : {};
+    const session = await connection.agent.request(methods.agent.session.new, {
+      cwd,
+      mcpServers: [],
+      ...addDirParam,
+      ...systemPromptMetaParam,
+    });
     if (typeof session?.sessionId !== 'string' || !session.sessionId) {
       throw new Error('Invalid Antigravity ACP session/new response: missing sessionId.');
     }
@@ -552,19 +573,24 @@ export async function connectAgent(options: AgentOptions, events: AgentEvents): 
     const staged: PendingSession = { targetId, updates: [] };
     pendingSession = staged;
     const addDirParam = capabilities.additionalDirectories && extraDirs.length ? { additionalDirectories: extraDirs } : {};
+    const systemPromptMetaParam = capabilities.appendSystemPrompt && options.appendSystemPrompt
+      ? { _meta: { antigravity: { systemPrompt: { append: options.appendSystemPrompt } } } }
+      : {};
     lifecycleMutation = sessionRequest(async (requestOptions) => {
       if (mode === 'load' && targetId !== undefined) {
         const response = await agentConnection.agent.request(methods.agent.session.load, {
-          sessionId: targetId, cwd, mcpServers: [], ...addDirParam,
+          sessionId: targetId, cwd, mcpServers: [], ...addDirParam, ...systemPromptMetaParam,
         }, requestOptions);
         commitSession(targetId, response?.configOptions ?? [], staged, parseTier(response?._meta));
       } else if (mode === 'resume' && targetId !== undefined) {
         const response = await agentConnection.agent.request(methods.agent.session.resume, {
-          sessionId: targetId, cwd, mcpServers: [], ...addDirParam,
+          sessionId: targetId, cwd, mcpServers: [], ...addDirParam, ...systemPromptMetaParam,
         }, requestOptions);
         commitSession(targetId, response?.configOptions ?? [], staged, parseTier(response?._meta));
       } else {
-        const response = await agentConnection.agent.request(methods.agent.session.new, { cwd, mcpServers: [], ...addDirParam }, requestOptions);
+        const response = await agentConnection.agent.request(methods.agent.session.new, {
+          cwd, mcpServers: [], ...addDirParam, ...systemPromptMetaParam,
+        }, requestOptions);
         if (typeof response?.sessionId !== 'string' || !response.sessionId) {
           throw new Error('Invalid Antigravity ACP session/new response: missing sessionId.');
         }

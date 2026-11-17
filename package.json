@@ -14,10 +14,12 @@
     "tui"
   ],
   "description": "A native Tern frontend for the official Antigravity CLI over ACP",
-  "bin": { "agy-tern": "src/cli.tsx" },
+  "bin": { "agy-tern": "dist/cli.js" },
   "scripts": {
     "start": "bun src/cli.tsx",
     "doctor": "bun run src/cli.tsx --doctor",
+    "build": "rm -rf dist && bun build src/cli.tsx --target=bun --outdir dist --splitting",
+    "bench": "bun run scripts/bench.ts",
     "setup": "bash ./scripts/install.sh",
     "typecheck": "tsc --noEmit",
     "test": "bun test"

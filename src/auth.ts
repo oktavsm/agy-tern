@@ -1,6 +1,8 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import type { AuthMethodTerminal } from '@agentclientprotocol/sdk';
-import type { AgentOptions } from './contracts';
+import { terminalLoginProblem, type AgentOptions } from './contracts';
+
+export { terminalLoginProblem };
 
 export type TerminalLoginResult =
   | { status: 'success' }
@@ -10,16 +12,6 @@ export type TerminalLoginResult =
 
 const INTERRUPT_GRACE_MS = 500;
 const TERMINATE_GRACE_MS = 1_000;
-
-export function terminalLoginProblem(method: AuthMethodTerminal): string | undefined {
-  if (method.args?.length !== 1 || method.args[0] !== '--login') {
-    return 'Unsupported terminal login arguments. Only the official agy --login flow is supported.';
-  }
-  if (method.env && Object.keys(method.env).length !== 0) {
-    return 'Terminal login environment overrides are not supported. Use the official agy login without overrides.';
-  }
-  return undefined;
-}
 
 export async function runTerminalLogin(
   options: AgentOptions,

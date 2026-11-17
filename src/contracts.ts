@@ -55,6 +55,7 @@ export interface AgentSession {
     readonly resumeSession?: boolean;
     readonly closeSession?: boolean;
     readonly additionalDirectories?: boolean;
+    readonly appendSystemPrompt?: boolean;
   };
   readonly promptCapabilities?: {
     readonly image: boolean;
@@ -85,4 +86,15 @@ export interface AgentOptions {
   initialConfig?: InitialConfigRequest;
   additionalDirectories?: readonly string[];
   agentName?: string;
+  appendSystemPrompt?: string;
+}
+
+export function terminalLoginProblem(method: AuthMethodTerminal): string | undefined {
+  if (method.args?.length !== 1 || method.args[0] !== '--login') {
+    return 'Unsupported terminal login arguments. Only the official agy --login flow is supported.';
+  }
+  if (method.env && Object.keys(method.env).length !== 0) {
+    return 'Terminal login environment overrides are not supported. Use the official agy login without overrides.';
+  }
+  return undefined;
 }

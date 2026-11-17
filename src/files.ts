@@ -218,9 +218,24 @@ function trimTrailingSlash(pathValue: string): string {
   return pathValue.replace(/\/+$/, '');
 }
 
+const VENDOR_DIR_NAMES = new Set([
+  'node_modules',
+  '.venv',
+  'venv',
+  'target',
+  '__pycache__',
+  '.next',
+  '.nuxt',
+  '.turbo',
+  '.gradle',
+  'Pods',
+]);
+
 function isVendorPath(pathValue: string): boolean {
   const clean = trimTrailingSlash(pathValue);
-  return clean === 'node_modules' || clean.startsWith('node_modules/');
+  if (!clean) return false;
+  const first = clean.split('/')[0]!;
+  return VENDOR_DIR_NAMES.has(first);
 }
 
 function addAncestorDirs(
@@ -313,9 +328,8 @@ function splitNullSeparated(raw: string): string[] {
 }
 
 async function listViaGitEntries(cwd: string, limit: number, prefix = ''): Promise<WorkspaceEntry[] | undefined> {
-  const [nonIgnoredRaw, ignoredRaw, ignoredDirRaw] = await Promise.all([
+  const [nonIgnoredRaw, ignoredDirRaw] = await Promise.all([
     runGitCommand(cwd, ['ls-files', '-z', '--cached', '--others', '--exclude-standard'], 1_024 * 1024),
-    runGitCommand(cwd, ['ls-files', '-z', '--others', '--ignored', '--exclude-standard'], 1_024 * 1024),
     runGitCommand(cwd, ['ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--directory'], 256 * 1024),
   ]);
   if (nonIgnoredRaw === undefined) return undefined;
@@ -330,40 +344,37 @@ async function listViaGitEntries(cwd: string, limit: number, prefix = ''): Promi
     addAncestorDirs(map, full, false, prefix);
   }
 
-  for (const dirRel of splitNullSeparated(ignoredDirRaw ?? '')) {
-    const cleanRel = trimTrailingSlash(dirRel);
-    if (!cleanRel || cleanRel === '.git') continue;
-    const full = ensureTrailingSlash(prefix ? join(prefix, cleanRel) : cleanRel);
-    const existing = map.get(full);
-    if (!existing) map.set(full, { path: full, kind: 'dir', ignored: true });
-    addAncestorDirs(map, trimTrailingSlash(full), true, prefix);
-  }
-
-  const ignoredNonVendor: string[] = [];
-  const ignoredVendor: string[] = [];
-  for (const rel of splitNullSeparated(ignoredRaw ?? '')) {
-    if (rel === '.git' || rel.startsWith('.git/')) continue;
-    if (isVendorPath(rel)) {
-      ignoredVendor.push(rel);
-      const rootVendor = ensureTrailingSlash(prefix ? join(prefix, 'node_modules') : 'node_modules');
-      if (!map.has(rootVendor)) map.set(rootVendor, { path: rootVendor, kind: 'dir', ignored: true });
-    } else {
-      ignoredNonVendor.push(rel);
+  const nonVendorIgnoredDirs: string[] = [];
+  for (const entryRel of splitNullSeparated(ignoredDirRaw ?? '')) {
+    const cleanRel = trimTrailingSlash(entryRel);
+    if (!cleanRel || cleanRel === '.git' || cleanRel.startsWith('.git/')) continue;
+    if (entryRel.endsWith('/')) {
+      const full = ensureTrailingSlash(prefix ? join(prefix, cleanRel) : cleanRel);
+      if (!map.has(full)) map.set(full, { path: full, kind: 'dir', ignored: true });
+      addAncestorDirs(map, trimTrailingSlash(full), true, prefix);
+      if (!isVendorPath(cleanRel)) nonVendorIgnoredDirs.push(cleanRel);
+    } else if (!isVendorPath(cleanRel)) {
+      const full = prefix ? join(prefix, cleanRel) : cleanRel;
+      if (!map.has(full)) map.set(full, { path: full, kind: 'file', ignored: true });
+      addAncestorDirs(map, full, true, prefix);
     }
   }
 
-  for (const rel of ignoredNonVendor) {
-    if (map.size >= limit) break;
-    const full = prefix ? join(prefix, rel) : rel;
-    if (!map.has(full)) map.set(full, { path: full, kind: 'file', ignored: true });
-    addAncestorDirs(map, full, true, prefix);
-  }
-
-  for (const rel of ignoredVendor) {
-    if (map.size >= limit) break;
-    const full = prefix ? join(prefix, rel) : rel;
-    if (!map.has(full)) map.set(full, { path: full, kind: 'file', ignored: true });
-    addAncestorDirs(map, full, true, prefix);
+  for (let i = 0; i < nonVendorIgnoredDirs.length && map.size < limit; i += 64) {
+    const batch = nonVendorIgnoredDirs.slice(i, i + 64);
+    const expandedRaw = await runGitCommand(
+      cwd,
+      ['ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--', ...batch],
+      512 * 1024,
+    );
+    if (!expandedRaw) continue;
+    for (const rel of splitNullSeparated(expandedRaw)) {
+      if (map.size >= limit) break;
+      if (rel === '.git' || rel.startsWith('.git/')) continue;
+      const full = prefix ? join(prefix, rel) : rel;
+      if (!map.has(full)) map.set(full, { path: full, kind: 'file', ignored: true });
+      addAncestorDirs(map, full, true, prefix);
+    }
   }
 
   return [...map.values()].slice(0, limit);
@@ -465,11 +476,35 @@ export async function searchWorkspacePrefix(
   if (!parsed) return [];
   const map = new Map<string, WorkspaceEntry>();
 
+  const needle = query.trim().replace(/^@+/, '').replace(/\\/g, '/').replace(/^\/+/, '').toLowerCase();
+
   const collectGit = async (root: string, pathPrefix = ''): Promise<boolean> => {
     const spec = parsed.dirPrefix ? [parsed.dirPrefix] : [parsed.pattern];
-    const [nonIgnoredRaw, ignoredRaw] = await Promise.all([
+    if (parsed.dirPrefix) {
+      const [nonIgnoredRaw, ignoredRaw] = await Promise.all([
+        runGitCommand(root, ['ls-files', '-z', '--cached', '--others', '--exclude-standard', '--', ...spec], 512 * 1024),
+        runGitCommand(root, ['ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--', ...spec], 512 * 1024),
+      ]);
+      if (nonIgnoredRaw === undefined) return false;
+      for (const rel of splitNullSeparated(nonIgnoredRaw)) {
+        if (map.size >= limit) break;
+        const full = pathPrefix ? join(pathPrefix, rel) : rel;
+        map.set(full, { path: full, kind: 'file', ignored: false });
+        addAncestorDirs(map, full, false, pathPrefix);
+      }
+      for (const rel of splitNullSeparated(ignoredRaw ?? '')) {
+        if (map.size >= limit) break;
+        if (rel === '.git' || rel.startsWith('.git/')) continue;
+        const full = pathPrefix ? join(pathPrefix, rel) : rel;
+        if (!map.has(full)) map.set(full, { path: full, kind: 'file', ignored: true });
+        addAncestorDirs(map, full, true, pathPrefix);
+      }
+      return true;
+    }
+
+    const [nonIgnoredRaw, ignoredDirRaw] = await Promise.all([
       runGitCommand(root, ['ls-files', '-z', '--cached', '--others', '--exclude-standard', '--', ...spec], 512 * 1024),
-      runGitCommand(root, ['ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--', ...spec], 512 * 1024),
+      runGitCommand(root, ['ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--directory'], 256 * 1024),
     ]);
     if (nonIgnoredRaw === undefined) return false;
     for (const rel of splitNullSeparated(nonIgnoredRaw)) {
@@ -478,12 +513,40 @@ export async function searchWorkspacePrefix(
       map.set(full, { path: full, kind: 'file', ignored: false });
       addAncestorDirs(map, full, false, pathPrefix);
     }
-    for (const rel of splitNullSeparated(ignoredRaw ?? '')) {
+    const nonVendorIgnoredDirs: string[] = [];
+    for (const entryRel of splitNullSeparated(ignoredDirRaw ?? '')) {
       if (map.size >= limit) break;
-      if (rel === '.git' || rel.startsWith('.git/')) continue;
-      const full = pathPrefix ? join(pathPrefix, rel) : rel;
-      if (!map.has(full)) map.set(full, { path: full, kind: 'file', ignored: true });
-      addAncestorDirs(map, full, true, pathPrefix);
+      const cleanRel = trimTrailingSlash(entryRel);
+      if (!cleanRel || cleanRel === '.git' || cleanRel.startsWith('.git/')) continue;
+      if (entryRel.endsWith('/')) {
+        if (cleanRel.toLowerCase().includes(needle)) {
+          const full = ensureTrailingSlash(pathPrefix ? join(pathPrefix, cleanRel) : cleanRel);
+          if (!map.has(full)) map.set(full, { path: full, kind: 'dir', ignored: true });
+          addAncestorDirs(map, trimTrailingSlash(full), true, pathPrefix);
+        }
+        if (!isVendorPath(cleanRel)) nonVendorIgnoredDirs.push(cleanRel);
+      } else if (!isVendorPath(cleanRel) && cleanRel.toLowerCase().includes(needle)) {
+        const full = pathPrefix ? join(pathPrefix, cleanRel) : cleanRel;
+        if (!map.has(full)) map.set(full, { path: full, kind: 'file', ignored: true });
+        addAncestorDirs(map, full, true, pathPrefix);
+      }
+    }
+    for (let i = 0; i < nonVendorIgnoredDirs.length && map.size < limit; i += 64) {
+      const batch = nonVendorIgnoredDirs.slice(i, i + 64);
+      const expandedRaw = await runGitCommand(
+        root,
+        ['ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--', ...batch],
+        512 * 1024,
+      );
+      if (!expandedRaw) continue;
+      for (const rel of splitNullSeparated(expandedRaw)) {
+        if (map.size >= limit) break;
+        if (rel === '.git' || rel.startsWith('.git/')) continue;
+        if (!rel.toLowerCase().includes(needle)) continue;
+        const full = pathPrefix ? join(pathPrefix, rel) : rel;
+        if (!map.has(full)) map.set(full, { path: full, kind: 'file', ignored: true });
+        addAncestorDirs(map, full, true, pathPrefix);
+      }
     }
     return true;
   };

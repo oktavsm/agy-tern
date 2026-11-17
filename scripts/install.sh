@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 BIN_DIR="${XDG_BIN_HOME:-$HOME/.local/bin}"
 TARGET_LINK="$BIN_DIR/agy-tern"
-ENTRY_FILE="$ROOT_DIR/src/cli.tsx"
+ENTRY_FILE="$ROOT_DIR/dist/cli.js"
 
 FORCE=0
 UNINSTALL=0
@@ -17,7 +17,7 @@ for arg in "$@"; do
       cat <<EOF
 Usage: ./scripts/install.sh [--force] [--uninstall]
 
-Installs agy-tern dependencies, links ~/.local/bin/agy-tern -> src/cli.tsx,
+Installs agy-tern dependencies, builds dist/cli.js, links ~/.local/bin/agy-tern -> dist/cli.js,
 and runs agy-tern --doctor to verify your environment.
 
 Options:
@@ -60,6 +60,9 @@ fi
 
 printf 'Installing dependencies with Bun...\n'
 (cd "$ROOT_DIR" && bun install --frozen-lockfile)
+
+printf 'Building agy-tern bundle...\n'
+(cd "$ROOT_DIR" && bun run build)
 
 mkdir -p "$BIN_DIR"
 chmod +x "$ENTRY_FILE"

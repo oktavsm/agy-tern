@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { chmod, mkdir, open, readFile, rename, rm } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
@@ -7,6 +8,7 @@ export type DiffMode = 'auto' | 'unified' | 'split';
 export type ToolDisplay = 'compact' | 'expanded';
 export type ComposerLines = 4 | 6 | 10;
 export type TranscriptDensity = 'comfortable' | 'compact';
+export type MotionPref = 'auto' | 'full' | 'reduced';
 
 export const DEFAULT_MODEL_ID = 'gemini-4-hydrogen';
 export const DEFAULT_THINKING_ID = 'high';
@@ -22,6 +24,8 @@ export interface UserPrefs {
   autoPreviewMedia: boolean;
   notifyOnTurnComplete: boolean;
   rememberModel: boolean;
+  maxFps: number;
+  motion: MotionPref;
   lastModel?: string;
   lastThinking?: string;
 }
@@ -37,6 +41,8 @@ export const DEFAULT_PREFS: Readonly<UserPrefs> = Object.freeze({
   autoPreviewMedia: false,
   notifyOnTurnComplete: true,
   rememberModel: true,
+  maxFps: 25,
+  motion: 'auto',
 });
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -56,6 +62,14 @@ export function normalizePrefs(raw: unknown): UserPrefs {
   const autoPreviewMedia = typeof raw.autoPreviewMedia === 'boolean' ? raw.autoPreviewMedia : DEFAULT_PREFS.autoPreviewMedia;
   const notifyOnTurnComplete = typeof raw.notifyOnTurnComplete === 'boolean' ? raw.notifyOnTurnComplete : DEFAULT_PREFS.notifyOnTurnComplete;
   const rememberModel = typeof raw.rememberModel === 'boolean' ? raw.rememberModel : DEFAULT_PREFS.rememberModel;
+  const maxFps = typeof raw.maxFps === 'number' && Number.isFinite(raw.maxFps)
+    ? Math.min(60, Math.max(5, Math.round(raw.maxFps)))
+    : DEFAULT_PREFS.maxFps;
+  const motion: MotionPref = raw.motion === 'full'
+    ? 'full'
+    : (raw.motion === 'reduced' || raw.motion === 'reduce')
+      ? 'reduced'
+      : 'auto';
   const lastModel = typeof raw.lastModel === 'string' && raw.lastModel.trim() ? raw.lastModel.trim() : undefined;
   const lastThinking = typeof raw.lastThinking === 'string' && raw.lastThinking.trim() ? raw.lastThinking.trim() : undefined;
   return {
@@ -69,9 +83,20 @@ export function normalizePrefs(raw: unknown): UserPrefs {
     autoPreviewMedia,
     notifyOnTurnComplete,
     rememberModel,
+    maxFps,
+    motion,
     ...(lastModel ? { lastModel } : {}),
     ...(lastThinking ? { lastThinking } : {}),
   };
+}
+
+function decodePrefsBuffer(contents: Buffer): UserPrefs {
+  try {
+    const text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(contents);
+    return normalizePrefs(JSON.parse(text));
+  } catch {
+    return { ...DEFAULT_PREFS };
+  }
 }
 
 /** Local UI preferences stored in user state (never affects ACP credentials or server config). */
@@ -88,6 +113,17 @@ export class PrefsStore {
     this.filePath = join(this.directory, 'prefs.json');
   }
 
+  loadSync(): UserPrefs {
+    let contents: Buffer;
+    try {
+      contents = readFileSync(this.filePath);
+    } catch (error) {
+      if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return { ...DEFAULT_PREFS };
+      throw error;
+    }
+    return decodePrefsBuffer(contents);
+  }
+
   async load(): Promise<UserPrefs> {
     let contents: Buffer;
     try {
@@ -96,12 +132,7 @@ export class PrefsStore {
       if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return { ...DEFAULT_PREFS };
       throw error;
     }
-    try {
-      const text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(contents);
-      return normalizePrefs(JSON.parse(text));
-    } catch {
-      return { ...DEFAULT_PREFS };
-    }
+    return decodePrefsBuffer(contents);
   }
 
   async save(prefs: UserPrefs): Promise<UserPrefs> {

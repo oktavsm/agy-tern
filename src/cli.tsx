@@ -2,9 +2,8 @@
 import { existsSync, lstatSync, readlinkSync } from 'node:fs';
 import { dirname, isAbsolute, resolve } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
-import { runTerminalLogin } from './auth';
 import { buildFallbackAgyArgs, CLI_HELP, parseCliArgs } from './cli-args';
-import { runNativeChat, type ChatLaunchState } from './ui';
+import type { ChatLaunchState } from './ui';
 
 function probeVersionLine(bin: string, args: string[]): string | undefined {
   const res = spawnSync(bin, args, { encoding: 'utf8', timeout: 3_000 });
@@ -104,21 +103,28 @@ async function main(): Promise<void> {
     ...(parsed.mode ? { mode: parsed.mode } : {}),
     ...(parsed.thinking ? { thinking: parsed.thinking } : {}),
   };
-  let launch: ChatLaunchState | undefined = (parsed.continueLast || parsed.conversationId || parsed.initialPrompt) ? {
+  let launch: ChatLaunchState | undefined = (
+    parsed.continueLast || parsed.conversationId || parsed.initialPrompt || parsed.maxFps !== undefined || parsed.motion !== undefined
+  ) ? {
     ...(parsed.continueLast ? { continueLast: true } : {}),
     ...(parsed.conversationId ? { conversationId: parsed.conversationId } : {}),
     ...(parsed.initialPrompt ? { initialPrompt: parsed.initialPrompt } : {}),
+    ...(parsed.maxFps !== undefined ? { maxFps: parsed.maxFps } : {}),
+    ...(parsed.motion !== undefined ? { motion: parsed.motion } : {}),
   } : undefined;
+  const { runNativeChat } = await import('./ui');
   while (true) {
     const result = await runNativeChat({
       cwd: parsed.cwd,
       executable,
       ...(parsed.additionalDirectories.length ? { additionalDirectories: parsed.additionalDirectories } : {}),
       ...(parsed.agentName ? { agentName: parsed.agentName } : {}),
+      ...(parsed.appendSystemPrompt !== undefined ? { appendSystemPrompt: parsed.appendSystemPrompt } : {}),
       ...(Object.keys(initialConfig).length ? { initialConfig } : {}),
     }, launch);
     if (result.kind === 'unavailable') break;
     if (result.kind === 'quit') return;
+    const { runTerminalLogin } = await import('./auth');
     const login = await runTerminalLogin({ cwd: parsed.cwd, executable }, result.method);
     if (login.status === 'terminated') {
       process.exitCode = login.signal === 'SIGTERM' ? 143 : 129;
@@ -128,6 +134,8 @@ async function main(): Promise<void> {
     launch = {
       draft: result.draft,
       ...(result.previousSessionId ? { previousSessionId: result.previousSessionId } : {}),
+      ...(parsed.maxFps !== undefined ? { maxFps: parsed.maxFps } : {}),
+      ...(parsed.motion !== undefined ? { motion: parsed.motion } : {}),
       notice: {
         text: login.status === 'success'
           ? 'Official terminal login exited successfully. Starting a fresh connection; account identity and access are not verified.'
