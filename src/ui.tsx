@@ -26,6 +26,7 @@ import {
   type PluginValidationReport,
 } from './extensions';
 import { parseQuotaReport, readOfficialReport, type OfficialReport } from './reports';
+import { readOfficialBrainTranscript, TranscriptStore } from './history';
 import { SessionNames } from './session-names';
 import { PromptTemplatesStore, type PromptTemplate } from './templates';
 import { openInTernSplit, runCommandInTernSplit, sendTerminalAttention } from './tern-window';
@@ -155,6 +156,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
   const conversations = new Map<string, Conversation>();
   const drafts = new Map<string, Draft>();
   const names = new SessionNames(options.cwd);
+  const transcriptStore = new TranscriptStore(options.cwd);
   const localNames = new Map<string, string | undefined>();
   const sessionInfo = new Map<string, SessionInfo>();
   let activeSessionId = '';
@@ -415,8 +417,12 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     quitting = true;
     clearTimeout(renderTimer);
     renderTimer = undefined;
+    clearTimeout(toastTimer);
+    toastTimer = undefined;
     clearTimeout(replaySettleTimer);
     replaySettleTimer = undefined;
+    reportAbort?.abort();
+    extAbort?.abort();
     syncLiveTick(false);
     clearPermissions();
     controller.abort();
@@ -431,28 +437,62 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     replayCachedFallback = undefined;
   }
 
+  function hasRichHistory(conv: Conversation | undefined): boolean {
+    return !!conv?.entries.some(entry => entry.type === 'message' && entry.role === 'agent');
+  }
+
+  function persistActiveTranscript(): Promise<void> {
+    if (!activeSessionId || !conversation.entries.some(entry => entry.type === 'message')) {
+      return Promise.resolve();
+    }
+    return transcriptStore.save(activeSessionId, conversation.entries).catch(() => {});
+  }
+
+  async function hydrateSessionHistoryFallback(
+    targetSessionId: string,
+    fallback: Conversation | undefined,
+    mode: 'load' | 'resume',
+  ): Promise<void> {
+    if (quitting || hasRichHistory(conversation)) return;
+    if (fallback && hasRichHistory(fallback)) {
+      conversation = fallback;
+      return;
+    }
+    const disk = (await transcriptStore.load(targetSessionId)) ?? (await readOfficialBrainTranscript(targetSessionId));
+    if (quitting) return;
+    const replayedNonNotice = conversation.entries.filter(entry => entry.type !== 'notice').length;
+    if (disk && disk.entries.length > replayedNonNotice) {
+      conversation.restoreEntries([
+        ...disk.entries,
+        {
+          type: 'notice',
+          id: `history-restored-${Date.now()}`,
+          text: disk.truncated
+            ? `Showing latest ${disk.entries.length} entries from local session history.`
+            : 'Restored conversation history from local session log.',
+          error: false,
+        },
+      ]);
+      return;
+    }
+    if (!replayedNonNotice) {
+      conversation.notice(mode === 'resume'
+        ? 'Resumed active ACP session context without replaying earlier history. Send a message to continue.'
+        : 'Antigravity loaded this session context without replaying earlier history. Send a message to continue.');
+    } else {
+      conversation.notice('Antigravity replayed partial user history; backend session context is active.');
+    }
+  }
+
   function finishHistoryReplay(): void {
     if (quitting) return;
     clearTimeout(replaySettleTimer);
     replaySettleTimer = undefined;
     const placeholderId = replayPlaceholderId;
-    const fallback = replayCachedFallback;
-    const mode = replayNoticeMode;
     replayingHistory = false;
     replayPlaceholderId = undefined;
     replayCachedFallback = undefined;
     if (placeholderId) conversation.removeNotice(placeholderId);
-    const hasAgentReply = conversation.entries.some(entry => entry.type === 'message' && entry.role === 'agent');
-    const replayedNonNotice = conversation.entries.filter(entry => entry.type !== 'notice').length;
-    if (fallback && !hasAgentReply && fallback.entries.length >= replayedNonNotice) {
-      conversation = fallback;
-    } else if (!hasAgentReply && replayedNonNotice === 0) {
-      conversation.notice(mode === 'resume'
-        ? 'Resumed active ACP session context without replaying earlier history. Send a message to continue.'
-        : 'Antigravity loaded this session context without replaying earlier history. Send a message to continue.');
-    } else if (!hasAgentReply && replayedNonNotice > 0) {
-      conversation.notice('Antigravity replayed partial user history; backend session context is active.');
-    }
     if (!busy && !sessionOperation && !disconnected && !agentConnecting) phase = 'Ready';
     render();
     if (!panel) surface?.scroll('main.conversation', 'end');
@@ -1004,8 +1044,9 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
   function openConversation(id: string, requestedMode?: 'load' | 'resume'): void {
     if (id === activeSessionId) { closePanel(); return; }
     const cached = conversations.get(id);
-    const mode: 'load' | 'resume' = requestedMode ?? (cached && agent?.capabilities.resumeSession ? 'resume' : 'load');
+    const mode: 'load' | 'resume' = requestedMode ?? (cached && hasRichHistory(cached) && agent?.capabilities.resumeSession ? 'resume' : 'load');
     runSessionAction(mode === 'resume' ? 'Resuming conversation' : 'Opening conversation', async connected => {
+      await persistActiveTranscript();
       beginHistoryReplay(mode, cached);
       try {
         if (mode === 'resume' && connected.resumeSession) await connected.resumeSession(id);
@@ -1014,16 +1055,9 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         clearReplayState();
         throw err;
       }
-      if (mode === 'load') {
-        finishHistoryReplay();
-      } else {
-        clearReplayState();
-        const hasAgentReply = conversation.entries.some(entry => entry.type === 'message' && entry.role === 'agent');
-        if (!hasAgentReply && cached) conversation = cached;
-        else if (!conversation.entries.some(entry => entry.type !== 'notice')) {
-          conversation.notice('Resumed active ACP session context without replaying earlier history. Send a message to continue.');
-        }
-      }
+      if (mode === 'load') finishHistoryReplay();
+      else clearReplayState();
+      await hydrateSessionHistoryFallback(id, cached, mode);
       await applyPreferredConfigOptions(connected, false, true);
       phase = 'Ready';
       closePanel();
@@ -1259,6 +1293,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     }).finally(() => {
       const elapsed = turnStartedAt ? Date.now() - turnStartedAt : 0;
       conversation.finishTurn(Date.now(), !completedNormally);
+      void persistActiveTranscript();
       busy = false;
       turnStartedAt = undefined;
       cancelling = false;
@@ -3483,6 +3518,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         },
         sessionChanged(id) {
           if (activeSessionId) {
+            void persistActiveTranscript();
             conversations.set(activeSessionId, conversation);
             if (conversations.size > 12) {
               const oldest = conversations.keys().next().value;
@@ -3494,6 +3530,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
             expandedThoughts.clear();
             thoughtFoldOverrides.clear();
             toolFoldOverrides.clear();
+            previewedMedia.clear();
             gitDiffCache.clear();
             historyVisibleCount = DEFAULT_HISTORY_VISIBLE;
             cachedDiffCountConversation = undefined;
@@ -3614,8 +3651,10 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
               beginHistoryReplay('load');
               await connected.loadSession(targetId);
               finishHistoryReplay();
+              await hydrateSessionHistoryFallback(targetId, undefined, 'load');
             } else if (connected.capabilities.resumeSession && connected.resumeSession) {
               await connected.resumeSession(targetId);
+              await hydrateSessionHistoryFallback(targetId, undefined, 'resume');
             } else if (!resumeId) {
               conversation.notice(`Cannot open --conversation ${targetId}: session load/resume not advertised.`, true);
             }
@@ -3634,8 +3673,10 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
                 beginHistoryReplay('load');
                 await connected.loadSession(latest.sessionId);
                 finishHistoryReplay();
+                await hydrateSessionHistoryFallback(latest.sessionId, undefined, 'load');
               } else if (connected.capabilities.resumeSession && connected.resumeSession) {
                 await connected.resumeSession(latest.sessionId);
+                await hydrateSessionHistoryFallback(latest.sessionId, undefined, 'resume');
               }
               await applyPreferredConfigOptions(connected, true, true);
             } else if (!latest) {
@@ -3956,6 +3997,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
   } finally {
     if (!quitting) quit();
     try {
+      await persistActiveTranscript();
       await startup;
       await agent?.close();
       await turn;
