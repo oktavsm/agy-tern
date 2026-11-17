@@ -886,15 +886,78 @@ interface MdCacheRecord {
 }
 
 interface StreamMdPrefixRecord {
-  stablePrefix: string;
-  stableSegments: MarkdownSegment[];
-  resumeOffset: number;
+  prefix: string;
+  segments: MarkdownSegment[];
+  offset: number;
 }
 
 const MD_SEGMENT_CACHE = new Map<string, MdCacheRecord>();
 const MAX_MD_CACHE_ENTRIES = 64;
 const STREAM_MD_PREFIX_CACHE: StreamMdPrefixRecord[] = [];
 const MAX_STREAM_PREFIX_CACHE = 8;
+const STREAM_CACHE_MIN_LEN = 2_048;
+
+function fastMarkdownKey(text: string): string {
+  const len = text.length;
+  if (len <= 64) return `${len}:${text}`;
+  const mid = len >> 1;
+  return `${len}:${text.slice(0, 20)}:${text.slice(mid - 8, mid + 8)}:${text.slice(-20)}`;
+}
+
+function trimSlice(text: string, start: number, end: number): string {
+  let s = start;
+  let e = end;
+  while (s < e && text.charCodeAt(s) <= 32) s++;
+  while (e > s && text.charCodeAt(e - 1) <= 32) e--;
+  return text.slice(s, e);
+}
+
+function parseFenceOpen(text: string, lineStart: number, lineEnd: number): { char: '`' | '~'; len: number; lang: string } | undefined {
+  let i = lineStart;
+  let spaces = 0;
+  while (i < lineEnd && spaces < 3 && text.charCodeAt(i) === 32) {
+    spaces++;
+    i++;
+  }
+  if (i >= lineEnd) return undefined;
+  const ch = text.charCodeAt(i);
+  if (ch !== 96 && ch !== 126) return undefined; // '`' or '~'
+  let len = 0;
+  while (i < lineEnd && text.charCodeAt(i) === ch) {
+    len++;
+    i++;
+  }
+  if (len < 3) return undefined;
+  const info = trimSlice(text, i, lineEnd);
+  if (ch === 96 && info.includes('`')) return undefined;
+  const sp = info.search(/\s/);
+  const lang = sp === -1 ? info : info.slice(0, sp);
+  return { char: ch === 96 ? '`' : '~', len, lang };
+}
+
+function isFenceClose(text: string, lineStart: number, lineEnd: number, fenceChar: '`' | '~', fenceLen: number): boolean {
+  let i = lineStart;
+  let spaces = 0;
+  while (i < lineEnd && spaces < 3 && text.charCodeAt(i) === 32) {
+    spaces++;
+    i++;
+  }
+  if (i >= lineEnd) return false;
+  const expected = fenceChar === '`' ? 96 : 126;
+  if (text.charCodeAt(i) !== expected) return false;
+  let len = 0;
+  while (i < lineEnd && text.charCodeAt(i) === expected) {
+    len++;
+    i++;
+  }
+  if (len < fenceLen) return false;
+  while (i < lineEnd) {
+    const code = text.charCodeAt(i);
+    if (code !== 32 && code !== 9 && code !== 13) return false;
+    i++;
+  }
+  return true;
+}
 
 /** Split Markdown into prose chunks and fenced code blocks for per-block copy and run controls. */
 export function splitMarkdownSegments(markdown: string): MarkdownSegment[] {
@@ -904,7 +967,7 @@ export function splitMarkdownSegments(markdown: string): MarkdownSegment[] {
     return text ? [{ kind: 'prose', text }] : [];
   }
 
-  const mdKey = fnv1aSingle(markdown);
+  const mdKey = fastMarkdownKey(markdown);
   const cached = MD_SEGMENT_CACHE.get(mdKey);
   if (cached && cached.markdown === markdown) {
     cacheSetBounded(MD_SEGMENT_CACHE, mdKey, cached, MAX_MD_CACHE_ENTRIES);
@@ -915,76 +978,67 @@ export function splitMarkdownSegments(markdown: string): MarkdownSegment[] {
   let segments: MarkdownSegment[] = [];
   let startOffset = 0;
 
-  for (let idx = STREAM_MD_PREFIX_CACHE.length - 1; idx >= 0; idx--) {
-    const rec = STREAM_MD_PREFIX_CACHE[idx]!;
-    if (rec.resumeOffset <= normalized.length && normalized.startsWith(rec.stablePrefix)) {
-      segments = rec.stableSegments.slice();
-      startOffset = rec.resumeOffset;
-      break;
+  if (normalized.length >= STREAM_CACHE_MIN_LEN) {
+    for (let idx = STREAM_MD_PREFIX_CACHE.length - 1; idx >= 0; idx--) {
+      const rec = STREAM_MD_PREFIX_CACHE[idx]!;
+      if (rec.offset <= normalized.length && normalized.startsWith(rec.prefix)) {
+        segments = rec.segments.slice();
+        startOffset = rec.offset;
+        break;
+      }
     }
   }
 
-  const tail = startOffset > 0 ? normalized.slice(startOffset) : normalized;
-  let proseLines: string[] = [];
+  let proseStart = -1;
   let fenceChar: '`' | '~' | undefined;
   let fenceLen = 0;
   let fenceLang = '';
-  let codeLines: string[] = [];
+  let codeStart = 0;
   let latestStableOffset = 0;
-  let latestStableSegments: MarkdownSegment[] | undefined;
+  let latestStableCount = 0;
 
-  const flushProse = (): void => {
-    const text = proseLines.join('\n').trim();
+  const flushProse = (proseEnd: number): void => {
+    if (proseStart < 0) return;
+    const text = trimSlice(normalized, proseStart, proseEnd);
     if (text) segments.push({ kind: 'prose', text });
-    proseLines = [];
+    proseStart = -1;
   };
 
-  let lineStart = 0;
-  while (lineStart <= tail.length) {
-    const nlIdx = tail.indexOf('\n', lineStart);
+  let lineStart = startOffset;
+  const nLen = normalized.length;
+  while (lineStart <= nLen) {
+    const nlIdx = normalized.indexOf('\n', lineStart);
     const hasNewline = nlIdx !== -1;
-    const lineEnd = hasNewline ? nlIdx : tail.length;
-    const line = tail.slice(lineStart, lineEnd);
+    const lineEnd = hasNewline ? nlIdx : nLen;
 
     if (!fenceChar) {
-      const openMatch = /^\s{0,3}(`{3,}|~{3,})([^\n]*)$/.exec(line);
-      if (openMatch) {
-        const marker = openMatch[1]!;
-        const info = openMatch[2]!.trim();
-        if (marker[0] === '`' && info.includes('`')) {
-          proseLines.push(line);
-        } else {
-          flushProse();
-          fenceChar = marker[0] as '`' | '~';
-          fenceLen = marker.length;
-          fenceLang = info.split(/\s+/)[0] ?? '';
-          codeLines = [];
-        }
-      } else {
-        proseLines.push(line);
+      const opened = parseFenceOpen(normalized, lineStart, lineEnd);
+      if (opened) {
+        flushProse(lineStart);
+        fenceChar = opened.char;
+        fenceLen = opened.len;
+        fenceLang = opened.lang;
+        codeStart = hasNewline ? nlIdx + 1 : nLen;
+      } else if (proseStart < 0) {
+        proseStart = lineStart;
       }
-    } else {
-      const closeMatch = /^\s{0,3}(`{3,}|~{3,})\s*$/.exec(line);
-      if (closeMatch && closeMatch[1]![0] === fenceChar && closeMatch[1]!.length >= fenceLen) {
-        const code = codeLines.join('\n');
-        const lang = fenceLang || undefined;
-        segments.push({
-          kind: 'code',
-          text: code,
-          ...(lang ? { lang } : {}),
-          runnable: isRunnableCodeLang(lang) && code.trim().length > 0,
-          closed: true,
-        });
-        fenceChar = undefined;
-        fenceLen = 0;
-        fenceLang = '';
-        codeLines = [];
-        if (hasNewline) {
-          latestStableOffset = startOffset + nlIdx + 1;
-          latestStableSegments = segments.slice();
-        }
-      } else {
-        codeLines.push(line);
+    } else if (isFenceClose(normalized, lineStart, lineEnd, fenceChar, fenceLen)) {
+      const rawEnd = lineStart > codeStart && normalized.charCodeAt(lineStart - 1) === 10 ? lineStart - 1 : lineStart;
+      const code = rawEnd > codeStart ? normalized.slice(codeStart, rawEnd) : '';
+      const lang = fenceLang || undefined;
+      segments.push({
+        kind: 'code',
+        text: code,
+        ...(lang ? { lang } : {}),
+        runnable: isRunnableCodeLang(lang) && code.trim().length > 0,
+        closed: true,
+      });
+      fenceChar = undefined;
+      fenceLen = 0;
+      fenceLang = '';
+      if (hasNewline) {
+        latestStableOffset = nlIdx + 1;
+        latestStableCount = segments.length;
       }
     }
 
@@ -993,7 +1047,7 @@ export function splitMarkdownSegments(markdown: string): MarkdownSegment[] {
   }
 
   if (fenceChar) {
-    const code = codeLines.join('\n');
+    const code = nLen >= codeStart ? normalized.slice(codeStart, nLen) : '';
     const lang = fenceLang || undefined;
     segments.push({
       kind: 'code',
@@ -1003,14 +1057,14 @@ export function splitMarkdownSegments(markdown: string): MarkdownSegment[] {
       closed: false,
     });
   } else {
-    flushProse();
+    flushProse(nLen);
   }
 
-  if (latestStableSegments && latestStableOffset > startOffset) {
+  if (normalized.length >= STREAM_CACHE_MIN_LEN && latestStableOffset > startOffset && latestStableCount > 0) {
     STREAM_MD_PREFIX_CACHE.push({
-      stablePrefix: normalized.slice(0, latestStableOffset),
-      stableSegments: latestStableSegments,
-      resumeOffset: latestStableOffset,
+      prefix: normalized.slice(0, latestStableOffset),
+      segments: segments.slice(0, latestStableCount),
+      offset: latestStableOffset,
     });
     if (STREAM_MD_PREFIX_CACHE.length > MAX_STREAM_PREFIX_CACHE) {
       STREAM_MD_PREFIX_CACHE.shift();

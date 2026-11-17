@@ -1,15 +1,65 @@
 #!/usr/bin/env bun
 import { existsSync, lstatSync, readlinkSync } from 'node:fs';
 import { dirname, isAbsolute, resolve } from 'node:path';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { buildFallbackAgyArgs, CLI_HELP, parseCliArgs } from './cli-args';
 import type { ChatLaunchState } from './ui';
 
-function probeVersionLine(bin: string, args: string[]): string | undefined {
-  const res = spawnSync(bin, args, { encoding: 'utf8', timeout: 3_000 });
+interface ProbeOutput {
+  status: number | null;
+  stdout: string;
+  stderr: string;
+  error?: Error;
+}
+
+async function runProbe(bin: string, args: readonly string[], cwd: string, timeoutMs: number): Promise<ProbeOutput> {
+  let proc: ReturnType<typeof Bun.spawn>;
+  try {
+    proc = Bun.spawn([bin, ...args], {
+      cwd,
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+  } catch (error) {
+    return {
+      status: null,
+      stdout: '',
+      stderr: '',
+      error: error instanceof Error ? error : new Error(String(error)),
+    };
+  }
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    try { proc.kill(); } catch {}
+  }, timeoutMs);
+  timer.unref?.();
+  try {
+    const [status, stdout, stderr] = await Promise.all([
+      proc.exited,
+      proc.stdout && typeof proc.stdout !== 'number' ? new Response(proc.stdout).text() : Promise.resolve(''),
+      proc.stderr && typeof proc.stderr !== 'number' ? new Response(proc.stderr).text() : Promise.resolve(''),
+    ]);
+    if (timedOut) {
+      return { status: null, stdout, stderr, error: new Error(`Command timed out after ${timeoutMs}ms: ${bin} ${args.join(' ')}`) };
+    }
+    return { status, stdout, stderr };
+  } catch (error) {
+    return {
+      status: null,
+      stdout: '',
+      stderr: '',
+      error: error instanceof Error ? error : new Error(String(error)),
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function probeVersionLine(bin: string, args: readonly string[], cwd: string): Promise<string | undefined> {
+  const res = await runProbe(bin, args, cwd, 3_000);
   if (res.error || res.status !== 0) return undefined;
-  const line = `${res.stdout ?? ''}\n${res.stderr ?? ''}`.split(/\r?\n/).map(s => s.trim()).find(Boolean);
-  return line;
+  return `${res.stdout}\n${res.stderr}`.split(/\r?\n/).map(s => s.trim()).find(Boolean);
 }
 
 function detectClipboardCommand(): string | undefined {
@@ -55,15 +105,17 @@ async function main(): Promise<void> {
   if (!executable) throw new Error('Official agy executable not found. Install Antigravity CLI or pass --agy /path/to/agy.');
 
   if (parsed.doctor) {
-    const result = spawnSync(executable, ['help', 'acp'], { cwd: parsed.cwd, encoding: 'utf8', timeout: 10_000 });
+    const ternPath = Bun.which('tern');
+    const [result, agyVersion, ternVersion] = await Promise.all([
+      runProbe(executable, ['help', 'acp'], parsed.cwd, 10_000),
+      probeVersionLine(executable, ['--version'], parsed.cwd),
+      ternPath ? probeVersionLine(ternPath, ['--version'], parsed.cwd) : Promise.resolve(undefined),
+    ]);
     if (result.error) throw result.error;
     const help = result.stdout + result.stderr;
     if (result.status !== 0 || !help.includes('--sandbox') || !help.includes('--stdio')) {
       throw new Error('This agy does not advertise the required ACP stdio and sandbox options. Update the official Antigravity CLI.');
     }
-    const ternPath = Bun.which('tern');
-    const agyVersion = probeVersionLine(executable, ['--version']);
-    const ternVersion = ternPath ? probeVersionLine(ternPath, ['--version']) : undefined;
     const clipboard = detectClipboardCommand();
     const clipboardPaste = detectClipboardPasteCommand();
     const symlink = inspectEntrypointLink();

@@ -193,6 +193,7 @@ export class TernRenderController {
   private readonly timers: RenderTimerAdapter;
   private readonly entryCache = new WeakMap<TranscriptEntry, { key: string; node: JSX.Element }>();
   private readonly settledSigs = new Map<string, string>();
+  private readonly currentByIdScratch = new Map<string, RenderedEntryRecord>();
   private readonly activeAgeSnapshots = new Map<string, { startedAt: number; initialAgeMs: number }>();
 
   cols: number;
@@ -367,18 +368,24 @@ export class TernRenderController {
     this.lastRenderAt = this.timers.now();
     this.dirtyWhenHidden = false;
 
-    const currentById = new Map<string, RenderedEntryRecord>();
-    for (const item of renderedEntries) {
-      currentById.set(item.wireId, item);
-    }
-    for (const [wireId, settledSig] of this.settledSigs) {
-      const current = currentById.get(wireId);
-      if (!current || !current.settled || current.sig !== settledSig) {
-        this.settledSigs.delete(wireId);
+    const currentById = this.currentByIdScratch;
+    const trackSettled = this.supportsSettle && !replayingHistory && !this.surface.blocked;
+    if (this.settledSigs.size > 0 || trackSettled) {
+      currentById.clear();
+      for (const item of renderedEntries) {
+        currentById.set(item.wireId, item);
+      }
+      if (this.settledSigs.size > 0) {
+        for (const [wireId, settledSig] of this.settledSigs) {
+          const current = currentById.get(wireId);
+          if (!current || !current.settled || current.sig !== settledSig) {
+            this.settledSigs.delete(wireId);
+          }
+        }
       }
     }
 
-    if (!this.supportsSettle || replayingHistory || this.surface.blocked) {
+    if (!trackSettled) {
       return [];
     }
 
