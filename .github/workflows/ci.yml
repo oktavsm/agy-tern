@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify-linux:
+    name: Verify (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Build bundle
+        run: bun run build
+
+      - name: Run full test suite
+        run: bun test
+
+      - name: Check text hygiene (no emoji or em-dash)
+        run: |
+          python3 - <<'PY'
+          import pathlib, re, sys
+
+          emoji_re = re.compile(r'[\U0001F300-\U0001FAFF\u2600-\u27BF\uFE0F]')
+          roots = [pathlib.Path('src'), pathlib.Path('test'), pathlib.Path('docs'), pathlib.Path('README.md'), pathlib.Path('SECURITY.md'), pathlib.Path('CONTRIBUTING.md')]
+          violations = []
+          for root in roots:
+              paths = [root] if root.is_file() else [p for p in root.rglob('*') if p.is_file()]
+              for p in paths:
+                  if p.suffix in {'.png', '.jpg', '.jpeg', '.webp', '.gif'}:
+                      continue
+                  text = p.read_text(encoding='utf-8', errors='replace')
+                  for i, line in enumerate(text.splitlines(), 1):
+                      if emoji_re.search(line):
+                          violations.append(f'{p}:{i}: emoji character found')
+                      if root.name in {'src', 'docs', 'README.md'} and '\u2014' in line:
+                          violations.append(f'{p}:{i}: em-dash character found')
+          if violations:
+              print('\n'.join(violations), file=sys.stderr)
+              sys.exit(1)
+          print('Hygiene checks passed.')
+          PY
+
+  verify-macos:
+    name: Verify (macOS)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Build bundle
+        run: bun run build
+
+      - name: Run cross-platform unit tests
+        run: |
+          bun test \
+            test/agent.test.ts \
+            test/auth.test.ts \
+            test/cli.test.ts \
+            test/commands.test.ts \
+            test/draft.test.ts \
+            test/extensions.test.ts \
+            test/files.test.ts \
+            test/history.test.ts \
+            test/model.test.ts \
+            test/panels.test.ts \
+            test/picker-nav.test.ts \
+            test/prefs.test.ts \
+            test/reports.test.ts \
+            test/session-names.test.ts \
+            test/session-state.test.ts \
+            test/templates.test.ts \
+            test/tern-render.test.ts \
+            test/tern-window.test.ts \
+            test/ui-format.test.ts

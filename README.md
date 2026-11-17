@@ -12,7 +12,7 @@ Native [Tern](https://docs.stencil.so/tern/protocol/index.md) terminal frontend 
 
 - **Native Tern Surface UI**: Renders conversations, collapsible `Thought` traces, multi-step `Plan` HUD, `starburst` working indicator, composer control bar (model, `<effort>` thinking level, mode, cost, and context `<meter>`), inline/card tool output, unified/split code diffs, and clickable multi-locations using Tern native elements and theme tokens.
 - **Full Keyboard Parity**: Shell-style composer editing (`Ctrl+A`/`E`, word jumps `Ctrl+Left`/`Right` or `Alt+B`/`F`, `Up`/`Down` line movement and prompt history with `History i/N`, `Ctrl+W`/`U`/`K`, `Ctrl+Z` undo), `Esc` cancellation, and explicit one-time approvals (`Tab`, `Ctrl+Y`, `Ctrl+N`; `Enter` never approves a tool).
-- **Rich Inspection & Side-by-Side Splits**: Inline clickable screenshots and images inside tool cards and agent Markdown responses (click any image or **Open modal** for centered `InspectOverlay`; optional `autoPreviewMedia` toggle in `/settings`); centered inspector for files, directories, and diffs; per-block `Copy`, `Fullscreen`, and confirmed `Run in split` (`tern split`) actions on fenced Markdown code/command blocks; `Copy output` / `Copy diff` inside tool cards; and direct `tern open --split right` launch.
+- **Rich Inspection & Side-by-Side Splits**: Click any file-read task in the transcript to open the file contents directly in `InspectOverlay`, inspect tool outputs/diffs/commands from hover pill actions (`Open file`, `Inspect`, `Inspect diff`, `Split`, `Copy`) or expanded tool controls, click inline screenshots/images (`autoPreviewMedia` toggle in `/settings`), preview directories (`Up`, `Copy`, `Attach`), trigger `Copy`, `Fullscreen`, or confirmed `Run in split` (`tern split`) on fenced Markdown code/command blocks, and launch `tern open --split right`.
 - **Model Defaults & Local Memory**: New ACP sessions default to `gemini-4-hydrogen` + `high` thinking when advertised by `agy`, while remembering your last selected model and thinking level in local `prefs.json` (`rememberModel`, configurable in `/settings`).
 - **Full Workspace `@` Attachments & Directory Tagging**: `@` autocomplete indexes tracked, untracked, and gitignored files plus directories (`@dir/`), clearly marking gitignored items with a `[gitignored]` flag, and includes a directory preview inspector modal (`Up`, `Copy`, `Attach`).
 - **Official CLI Extension & Session Management**: Browse/toggle/add/remove MCP servers (`/mcp`), browse/toggle/validate/install/uninstall plugins & skills (`/plugins`), inspect agent profiles and `--add-dir` roots (`/agents`), manage ACP sessions (`/sessions`, `/new`, `/rename`), and read official `/usage`, `/credits`, and `/changelog` reports.
@@ -56,9 +56,19 @@ agy-tern
   ```
 - **Updates**: Because `./scripts/install.sh` builds `dist/cli.js` and links `~/.local/bin/agy-tern -> dist/cli.js`, run `bun run build` (or re-run `./scripts/install.sh`) after pulling updates so the pre-bundled launcher reflects your changes. For live unbundled development, run `bun run start`.
 - **Not authenticated**: Run `agy acp --login` in your shell or open `/account` inside `agy-tern`.
+- **macOS clipboard image paste**: Install `pngpaste` (`brew install pngpaste`) for `Alt+V` / `/paste-image` (`pbcopy` is used for copying text).
 - **Linux clipboard copy/paste**: Install `wl-clipboard` (`wl-copy` / `wl-paste`) on Wayland or `xclip` on X11. If your window manager intercepts `Alt+V`, use `/paste-image` (`/clip`).
 
 </details>
+
+### Platform Support Matrix
+
+| Platform | Status | Notes |
+| --- | --- | --- |
+| Linux (`x86_64` / `arm64`) | Verified | Primary development target; full unit + PTY Tern E2E CI suite (`wl-copy`/`wl-paste` or `xclip`) |
+| macOS (`darwin`) | Experimental | Unit tests & production build verified on `macos-latest` CI; uses `pbcopy` and `pngpaste` for clipboard; interactive Tern binary checks unverified in CI |
+| Windows (via WSL2) | Supported | Run inside WSL2 Linux with Bun, `agy`, and Tern |
+| Windows (native) | Unsupported | Relies on POSIX PTYs, POSIX `/bin/sh -lc` splits, and Unix terminal utilities |
 
 ---
 
@@ -187,6 +197,6 @@ Additional documentation:
 
 ## Contributing & License
 
-Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md) before opening a pull request.
+Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md), [AGENTS.md](AGENTS.md), and [SECURITY.md](SECURITY.md) before opening a pull request or reporting security issues.
 
 Licensed under the [MIT License](LICENSE).
