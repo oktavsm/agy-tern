@@ -114,10 +114,11 @@ export function ToolOutput({ rawOutput }: { rawOutput: unknown }): JSX.Element {
   </col>;
 }
 
-export function ToolBody({ call, cwd, showRawInput, diffMode, getBlob, onInspect, onOpenSplit, onCopy }: {
+export function ToolBody({ call, cwd, showRawInput, fullCommand, diffMode, getBlob, onInspect, onOpenSplit, onCopy }: {
   call: ToolCallUpdate;
   cwd: string;
   showRawInput: boolean;
+  fullCommand?: string;
   diffMode: DiffMode;
   getBlob?(key: string, data: string, mimeType: string): string | undefined;
   onInspect?(title: string, target: InspectTarget, subtitle?: string): void;
@@ -126,10 +127,27 @@ export function ToolBody({ call, cwd, showRawInput, diffMode, getBlob, onInspect
 }): JSX.Element {
   const imagePaths = extractToolImagePaths(call, cwd).filter(path => existsSync(path));
   const copyableOutput = extractToolOutputText(call.rawOutput);
+  const commandClip = !showRawInput && fullCommand ? clipInlinePreview(fullCommand, 6, 450) : undefined;
+  const rawInputClip = showRawInput && call.rawInput !== undefined
+    ? clipInlinePreview(typeof call.rawInput === 'string' ? call.rawInput : JSON.stringify(call.rawInput, null, 2), 8, 600)
+    : undefined;
   return <col gap="sm">
-    {showRawInput && call.rawInput !== undefined && <col key="input" gap="xs">
+    {rawInputClip && <col key="input" gap="xs">
       <text><span s="muted">Input</span></text>
-      <code wrap>{typeof call.rawInput === 'string' ? call.rawInput : JSON.stringify(call.rawInput, null, 2)}</code>
+      <code wrap>{rawInputClip.text}</code>
+      {rawInputClip.truncated && <text><span s="muted">Input preview truncated</span></text>}
+    </col>}
+    {commandClip && <col key="command" gap="xs">
+      <code lang="sh" wrap>{commandClip.text}</code>
+      {(commandClip.truncated || onCopy || onInspect) && <row gap="xs" align="center" wrap>
+        {onCopy && fullCommand && <button size="sm" variant="quiet" icon="copy" onClick={() => onCopy(fullCommand)}>
+          Copy command
+        </button>}
+        {onInspect && fullCommand && <button size="sm" variant="quiet" icon="expand"
+          onClick={() => onInspect('Command', { type: 'file', path: 'command.sh', content: fullCommand })}>
+          Fullscreen command
+        </button>}
+      </row>}
     </col>}
     {call.content?.map((content, index) => {
       if (content.type === 'content') {
@@ -256,7 +274,7 @@ export function Entry({ entry, continued, streaming, recent, turnNumber, callbac
       const withDivider = entry.role === 'user' && !!turnNumber && turnNumber > 1 && showAvatar;
       const segments = entry.role === 'agent' && entry.text ? splitMarkdownSegments(entry.text) : undefined;
       const hasCodeBlocks = !!segments?.some(seg => seg.kind === 'code');
-      const mdImagePaths = entry.role === 'agent' && entry.text ? extractMarkdownImagePaths(entry.text, callbacks.cwd) : [];
+      const mdImagePaths = entry.role === 'agent' && !streaming && entry.text ? extractMarkdownImagePaths(entry.text, callbacks.cwd) : [];
       const msgNode = <message key={withDivider ? 'msg' : entry.id} variant="auto"
         side={entry.role === 'user' ? 'end' : 'start'} author={entry.role === 'user' ? 'You' : 'Antigravity'}
         continued={continued}
@@ -382,7 +400,7 @@ export function Entry({ entry, continued, streaming, recent, turnNumber, callbac
           ...(summary.hasDiff ? { 'Review in /changes': callbacks.onOpenChanges } : {}),
         }}
         onToggle={event => callbacks.onToggleTool(entry.id, event.collapsed ?? !collapsed)}>
-        {!collapsed ? <ToolBody call={entry.call} cwd={callbacks.cwd} showRawInput={summary.showRawInput} diffMode={callbacks.prefs.diffMode}
+        {!collapsed ? <ToolBody call={entry.call} cwd={callbacks.cwd} showRawInput={summary.showRawInput} fullCommand={summary.fullCommand} diffMode={callbacks.prefs.diffMode}
           getBlob={callbacks.getBlob} onInspect={callbacks.onInspect} onOpenSplit={callbacks.onOpenSplit} onCopy={callbacks.onCopy} />
           : <spacer key="lazy" size="none" />}
       </tool>;

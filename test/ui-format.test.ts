@@ -351,5 +351,18 @@ describe('ui formatting helpers', () => {
     expect(smallSplit.showKeyLegend).toBe(false);
     expect(smallSplit.compactEmpty).toBe(true);
     expect(smallSplit.scrollMaxH).toBe('4lines');
+
+    const longCmd = "bun -e 'import { x } from \"./src/x\";\n" + Array.from({ length: 20 }, (_, i) => `console.log(${i});`).join('\n') + "'";
+    const longTool = summarizeToolCall({
+      toolCallId: 'long-cmd',
+      kind: 'execute',
+      title: longCmd,
+      status: 'in_progress',
+      rawInput: { command: longCmd },
+    }, cwd);
+    expect(longTool.title).toBe('Run command');
+    expect(longTool.target?.includes('\n')).toBe(false);
+    expect((longTool.target?.length ?? 0) <= 88).toBe(true);
+    expect(longTool.fullCommand).toBe(longCmd);
   });
 });

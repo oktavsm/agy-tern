@@ -6,7 +6,7 @@ import type { AuthMethodTerminal, SessionConfigOption, SessionInfo } from '@agen
 import { connectAgent } from './agent';
 import type { AgentAuthentication, AgentMetadata, AgentOptions, AgentSession, PermissionPrompt, ResourceAttachment } from './contracts';
 import { draftKey, editDraft, isCursorOnFirstRow, isCursorOnLastRow, type Draft } from './draft';
-import { Conversation, type TranscriptEntry } from './model';
+import { Conversation, type ToolStep, type TranscriptEntry } from './model';
 import { commandCatalog, commandCategory, commandQuery, configLabel, configValues, filterCommands, modelOption, resolveCommand, type Command } from './commands';
 import {
   addMcpServer,
@@ -63,7 +63,9 @@ import {
 } from './files';
 import {
   buildUnifiedDiffHunks,
+  clipInlinePreview,
   collectSessionDiffs,
+  compactToolHeaderText,
   computeResponsiveLayout,
   countSessionDiffs,
   detectGitBranch,
@@ -119,7 +121,7 @@ export type NativeChatResult = { kind: 'unavailable' } | { kind: 'quit' } |
 type Panel = { kind: 'commands' } | { kind: 'settings' } | { kind: 'config'; id: string } |
   { kind: 'report'; report: OfficialReport } | { kind: 'permissions' } | { kind: 'sessions' } |
   { kind: 'rename'; sessionId: string } | { kind: 'account' } | { kind: 'account-switch' } |
-  { kind: 'changes' } | { kind: 'find' } | { kind: 'mcp' } | { kind: 'plugins' } | { kind: 'agents' } |
+  { kind: 'changes' } | { kind: 'find' } | { kind: 'tasks' } | { kind: 'mcp' } | { kind: 'plugins' } | { kind: 'agents' } |
   { kind: 'templates' } | { kind: 'template-save' } | { kind: 'mcp-add' } | { kind: 'plugin-install' } |
   { kind: 'confirm'; title: string; detail: string; actionLabel: string; returnTo?: Panel; onConfirm(): void } |
   { kind: 'inspect'; title: string; subtitle?: string; item: InspectTarget };
@@ -158,6 +160,10 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
   let activeSessionId = '';
   let listedSessions: SessionInfo[] = [];
   let nextSessionsCursor: string | undefined;
+  let sessionsLoading = false;
+  let sessionsLoadedAt = 0;
+  let sessionsPrefetchInFlight: Promise<void> | undefined;
+  let lastWorkspaceIndexAt = 0;
   let sessionOperation: string | undefined;
   let sessionTask: Promise<void> | undefined;
   const permissions: PermissionPrompt[] = [];
@@ -435,12 +441,17 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     replayingHistory = false;
     replayPlaceholderId = undefined;
     replayCachedFallback = undefined;
-    if (!conversation.entries.some(entry => entry.type !== 'notice')) {
-      if (placeholderId) conversation.removeNotice(placeholderId);
-      if (fallback) conversation = fallback;
-      else conversation.notice(mode === 'resume'
-        ? 'Resumed the active ACP context without replaying earlier history. Only new messages appear here.'
-        : 'agy restored the session context but did not replay earlier messages. Only new messages will appear here.');
+    if (placeholderId) conversation.removeNotice(placeholderId);
+    const hasAgentReply = conversation.entries.some(entry => entry.type === 'message' && entry.role === 'agent');
+    const replayedNonNotice = conversation.entries.filter(entry => entry.type !== 'notice').length;
+    if (fallback && !hasAgentReply && fallback.entries.length >= replayedNonNotice) {
+      conversation = fallback;
+    } else if (!hasAgentReply && replayedNonNotice === 0) {
+      conversation.notice(mode === 'resume'
+        ? 'Resumed active ACP session context without replaying earlier history. Send a message to continue.'
+        : 'Antigravity loaded this session context without replaying earlier history. Send a message to continue.');
+    } else if (!hasAgentReply && replayedNonNotice > 0) {
+      conversation.notice('Antigravity replayed partial user history; backend session context is active.');
     }
     if (!busy && !sessionOperation && !disconnected && !agentConnecting) phase = 'Ready';
     render();
@@ -449,7 +460,6 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
 
   function beginHistoryReplay(mode: 'load' | 'resume', fallback?: Conversation): void {
     clearReplayState();
-    if (mode !== 'load') return;
     replayingHistory = true;
     replayNoticeMode = mode;
     replayCachedFallback = fallback;
@@ -458,18 +468,19 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
   function markReplayActivity(): void {
     if (!replayingHistory || quitting) return;
     clearTimeout(replaySettleTimer);
-    replaySettleTimer = setTimeout(finishHistoryReplay, 350);
+    replaySettleTimer = setTimeout(finishHistoryReplay, 40);
   }
 
   function scheduleRender(): void {
     if (quitting || !surface || surface.closed) return;
+    const intervalMs = busy ? 40 : 20;
     const now = Date.now();
-    if (!surface.blocked && now - lastRenderAt >= 20 && !renderTimer) {
+    if (!surface.blocked && now - lastRenderAt >= intervalMs && !renderTimer) {
       render();
       return;
     }
     if (!renderTimer) {
-      const waitMs = Math.max(8, 20 - (now - lastRenderAt));
+      const waitMs = Math.max(8, intervalMs - (now - lastRenderAt));
       renderTimer = setTimeout(() => {
         renderTimer = undefined;
         if (!quitting) render();
@@ -671,9 +682,15 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     });
   }
 
-  function loadSessions(append = false): void {
-    runSessionAction('Reading conversations', async connected => {
-      const response = await connected.listSessions(append ? nextSessionsCursor : undefined);
+  function loadSessions(append = false, silent = false): void {
+    const active = agent;
+    if (!active?.capabilities.listSessions || disconnected || quitting) return;
+    if (sessionsPrefetchInFlight && !append) return;
+    sessionsLoading = true;
+    if (!silent) { panelError = ''; render(); }
+    const task = (async () => {
+      const response = await active.listSessions(append ? nextSessionsCursor : undefined);
+      if (quitting) return;
       const rows = new Map((append ? listedSessions : []).map(row => [row.sessionId, row]));
       for (const row of response.sessions) {
         rows.set(row.sessionId, row);
@@ -681,11 +698,21 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       }
       listedSessions = [...rows.values()];
       nextSessionsCursor = response.nextCursor ?? undefined;
+      sessionsLoadedAt = Date.now();
       await Promise.all(response.sessions.map(async row => {
         localNames.set(row.sessionId, await names.get(row.sessionId));
       }));
-      panelSelection = 0;
+      if (!append) panelSelection = 0;
+    })().catch(error => {
+      if (!quitting && !silent) {
+        panelError = error instanceof Error ? error.message : String(error);
+      }
+    }).finally(() => {
+      if (sessionsPrefetchInFlight === task) sessionsPrefetchInFlight = undefined;
+      sessionsLoading = false;
+      if (!quitting) render();
     });
+    if (!append) sessionsPrefetchInFlight = task;
   }
 
   function loadExtensions(kind: 'mcp' | 'plugins' | 'agents'): void {
@@ -879,6 +906,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
   }
 
   function refreshWorkspaceFiles(): void {
+    lastWorkspaceIndexAt = Date.now();
     void listWorkspaceEntries(options.cwd, 2_400, options.additionalDirectories).then(entries => {
       if (!quitting) { setWorkspaceEntries(entries); render(); }
     }).catch(() => {});
@@ -973,10 +1001,11 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     });
   }
 
-  function openConversation(id: string, mode: 'load' | 'resume' = 'load'): void {
+  function openConversation(id: string, requestedMode?: 'load' | 'resume'): void {
     if (id === activeSessionId) { closePanel(); return; }
+    const cached = conversations.get(id);
+    const mode: 'load' | 'resume' = requestedMode ?? (cached && agent?.capabilities.resumeSession ? 'resume' : 'load');
     runSessionAction(mode === 'resume' ? 'Resuming conversation' : 'Opening conversation', async connected => {
-      const cached = conversations.get(id);
       beginHistoryReplay(mode, cached);
       try {
         if (mode === 'resume' && connected.resumeSession) await connected.resumeSession(id);
@@ -985,20 +1014,18 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         clearReplayState();
         throw err;
       }
-      const hasHistory = conversation.entries.some(entry => entry.type !== 'notice');
       if (mode === 'load') {
-        if (!hasHistory && !cached) {
-          replayPlaceholderId = conversation.notice('Loading session history...').id;
-        }
-        phase = hasHistory ? 'Syncing history' : 'Loading history';
-        markReplayActivity();
-      } else if (!hasHistory) {
-        if (cached) conversation = cached;
-        else conversation.notice('Resumed the active ACP context without replaying earlier history. Only new messages appear here.');
-        phase = 'Ready';
+        finishHistoryReplay();
       } else {
-        phase = 'Ready';
+        clearReplayState();
+        const hasAgentReply = conversation.entries.some(entry => entry.type === 'message' && entry.role === 'agent');
+        if (!hasAgentReply && cached) conversation = cached;
+        else if (!conversation.entries.some(entry => entry.type !== 'notice')) {
+          conversation.notice('Resumed active ACP session context without replaying earlier history. Send a message to continue.');
+        }
       }
+      await applyPreferredConfigOptions(connected, false, true);
+      phase = 'Ready';
       closePanel();
       surface?.scroll('main.conversation', 'end');
     });
@@ -1059,7 +1086,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       next.kind === 'mcp-add' || next.kind === 'plugin-install' ||
       (next.kind === 'config' && metadata.configOptions.find(candidate => candidate.id === next.id)?.type === 'boolean');
     const isPickerPanel = next.kind === 'commands' || next.kind === 'config' || next.kind === 'sessions' ||
-      next.kind === 'changes' || next.kind === 'find' || next.kind === 'mcp' || next.kind === 'plugins' ||
+      next.kind === 'changes' || next.kind === 'find' || next.kind === 'tasks' || next.kind === 'mcp' || next.kind === 'plugins' ||
       next.kind === 'agents' || next.kind === 'templates';
     const targetFocus = next.kind === 'settings' ? 'layer.prefs'
       : isPickerPanel && !needsCustomFocus ? 'layer.picker'
@@ -1068,7 +1095,11 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     if (next.kind === 'report') loadReport(next.report);
     if (next.kind === 'mcp' || next.kind === 'plugins' || next.kind === 'agents') loadExtensions(next.kind);
     if (next.kind === 'templates') loadTemplates();
-    if (next.kind === 'sessions' && agent?.capabilities.listSessions) loadSessions();
+    if (next.kind === 'sessions' && agent?.capabilities.listSessions) {
+      if (!sessionsPrefetchInFlight && (!listedSessions.length || Date.now() - sessionsLoadedAt >= 30_000)) {
+        loadSessions(false, listedSessions.length > 0);
+      }
+    }
     if (next.kind === 'changes') {
       gitDiffCache.clear();
       void detectGitStatus(options.cwd).then(rows => {
@@ -1122,6 +1153,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         case 'settings': openPanel({ kind: 'settings' }); return;
         case 'permissions': openPanel({ kind: 'permissions' }); return;
         case 'changes': openPanel({ kind: 'changes' }); return;
+        case 'tasks': openPanel({ kind: 'tasks' }); return;
         case 'find':
           openPanel({ kind: 'find' });
           if (args) { panelDraft = { text: args, cursor: args.length }; render(); }
@@ -1206,17 +1238,15 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     const activeAgent = agent;
     const promptBody = text || 'Inspect the attached image.';
     let completedNormally = false;
+    const entryCountBeforePrompt = conversation.entries.length;
     turn = (async () => {
       const resources: ResourceAttachment[] = [];
-      if (activeAgent.promptCapabilities?.embeddedContext) {
-        if (attachedFilePaths.length) {
-          const loaded = await loadEmbeddedResourceAttachments(options.cwd, attachedFilePaths);
-          resources.push(...loaded.resources);
-        }
-        if (attachedDirPaths.length) {
-          const dirResources = await loadDirectorySummaryResources(options.cwd, attachedDirPaths);
-          resources.push(...dirResources);
-        }
+      if (activeAgent.promptCapabilities?.embeddedContext && (attachedFilePaths.length || attachedDirPaths.length)) {
+        const [fileLoaded, dirLoaded] = await Promise.all([
+          attachedFilePaths.length ? loadEmbeddedResourceAttachments(options.cwd, attachedFilePaths) : Promise.resolve({ resources: [], overflowPaths: [] }),
+          attachedDirPaths.length ? loadDirectorySummaryResources(options.cwd, attachedDirPaths) : Promise.resolve([]),
+        ]);
+        resources.push(...fileLoaded.resources, ...dirLoaded);
       }
       const reason = await activeAgent.prompt(promptBody, images, resources);
       if (quitting || disconnected) return;
@@ -1228,7 +1258,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       conversation.notice(error instanceof Error ? error.message : String(error), true, true);
     }).finally(() => {
       const elapsed = turnStartedAt ? Date.now() - turnStartedAt : 0;
-      conversation.finishTurn();
+      conversation.finishTurn(Date.now(), !completedNormally);
       busy = false;
       turnStartedAt = undefined;
       cancelling = false;
@@ -1237,7 +1267,10 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       if (!quitting && userPrefs.notifyOnTurnComplete && elapsed >= 8_000) {
         sendTerminalAttention('agy-tern', completedNormally ? 'Turn complete' : phase);
       }
-      if (!quitting && !disconnected) {
+      const touchedWorkspace = conversation.entries.slice(entryCountBeforePrompt).some(entry =>
+        entry.type === 'tool' && (entry.call.kind === 'edit' || entry.call.kind === 'execute' ||
+          entry.call.content?.some(item => item.type === 'diff')));
+      if (!quitting && !disconnected && (touchedWorkspace || Date.now() - lastWorkspaceIndexAt > 30_000)) {
         refreshWorkspaceFiles();
       }
       if (completedNormally && !quitting && !disconnected && !permissions.length && queuedPrompts.length > 0) {
@@ -1489,7 +1522,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         label: option.name, detail: option.description ?? option.id, value: configLabel(option),
         choose: () => openPanel({ kind: 'config', id: option.id }),
       }));
-    } else {
+    } else if (panel.kind === 'config') {
       const id = panel.id;
       const option = metadata.configOptions.find(option => option.id === id);
       choices = option?.type === 'boolean' ? [true, false].map(value => ({
@@ -1499,6 +1532,8 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         label: value.name, detail: value.description ?? value.value,
         value: option.currentValue === value.value ? 'Current' : undefined, choose: () => changeConfig(option, value.value),
       })) : [];
+    } else {
+      choices = [];
     }
     const query = panelDraft.text.toLowerCase();
     return choices.filter(choice => `${choice.label} ${choice.detail}`.toLowerCase().includes(query));
@@ -1913,8 +1948,8 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       order={filtered.map(row => row.sessionId)}
       items={items} selected={selectedId}
       current={activeSessionId ? [activeSessionId] : undefined}
-      state={sessionOperation ? 'loading' : panelError ? 'error' : 'ready'}
-      message={sessionOperation ?? (panelError || (!agent?.capabilities.listSessions ? 'agy does not advertise session listing.' : undefined))}
+      state={sessionOperation || (sessionsLoading && !listedSessions.length) ? 'loading' : panelError ? 'error' : 'ready'}
+      message={sessionOperation ?? (sessionsLoading ? 'Syncing conversations from agy...' : panelError || (!agent?.capabilities.listSessions ? 'agy does not advertise session listing.' : undefined))}
       empty="No saved conversations matched your filter."
       preview={highlighted ? 'below' : 'none'}
       actions={[
@@ -2621,6 +2656,110 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     </picker>;
   }
 
+  function activeToolSteps(): ToolStep[] {
+    return conversation.entries.filter((entry): entry is ToolStep =>
+      entry.type === 'tool' && (entry.call.status === 'in_progress' || entry.call.status === 'pending'));
+  }
+
+  function inspectTaskStep(step: ToolStep): void {
+    const s = summarizeToolCall(step.call, options.cwd);
+    const detailText = [
+      `Tool: ${s.title}`,
+      ...(s.target ? [`Target: ${s.target}`] : []),
+      ...(s.fullCommand ? [`Command:\n${s.fullCommand}`] : []),
+      ...(step.call.rawInput !== undefined ? [`Input:\n${JSON.stringify(step.call.rawInput, null, 2)}`] : []),
+      ...(step.call.rawOutput !== undefined ? [`Output:\n${typeof step.call.rawOutput === 'string' ? step.call.rawOutput : JSON.stringify(step.call.rawOutput, null, 2)}`] : []),
+    ].join('\n\n');
+    openInspect(s.title, { type: 'file', path: 'task.log', content: detailText }, s.target);
+  }
+
+  function renderTasksPicker(): JSX.Element {
+    const query = panelDraft.text.trim().toLowerCase();
+    const allTools = conversation.entries
+      .filter((entry): entry is ToolStep => entry.type === 'tool')
+      .slice()
+      .reverse();
+    const filtered = allTools.filter(step => {
+      const summary = summarizeToolCall(step.call, options.cwd);
+      const isRunning = step.call.status === 'in_progress' || step.call.status === 'pending';
+      if (pickerTab === 'running' && !isRunning) return false;
+      if (pickerTab === 'done' && isRunning) return false;
+      if (!query) return true;
+      return `${summary.title} ${summary.target ?? ''} ${step.call.toolCallId}`.toLowerCase().includes(query);
+    });
+    const order = filtered.map(step => step.id);
+    const selectedId = order.includes(pickerSelected) ? pickerSelected : (order[0] ?? '');
+    const highlighted = filtered.find(step => step.id === selectedId);
+    const highlightedSummary = highlighted ? summarizeToolCall(highlighted.call, options.cwd) : undefined;
+    const now = Date.now();
+    const runningCount = allTools.filter(step => step.call.status === 'in_progress' || step.call.status === 'pending').length;
+
+    const items: PickerItem[] = filtered.map(step => {
+      const summary = summarizeToolCall(step.call, options.cwd);
+      const isRunning = step.call.status === 'in_progress' || step.call.status === 'pending';
+      const elapsedMs = isRunning && step.startedAt !== undefined
+        ? Math.max(0, now - step.startedAt)
+        : step.startedAt !== undefined && step.endedAt !== undefined
+          ? Math.max(0, step.endedAt - step.startedAt)
+          : undefined;
+      const elapsedLabel = elapsedMs !== undefined ? `${(elapsedMs / 1000).toFixed(1)}s` : '';
+      return {
+        id: step.id,
+        label: summary.title,
+        detail: [summary.target, elapsedLabel].filter(Boolean).join(' · ') || step.call.toolCallId,
+        badges: [
+          {
+            text: isRunning ? 'Running' : step.call.status === 'failed' ? 'Failed' : 'Done',
+            tone: isRunning ? 'accent' : step.call.status === 'failed' ? 'error' : 'success',
+          },
+          ...(summary.exit !== undefined ? [{ text: `exit ${summary.exit}`, tone: summary.exit === 0 ? ('neutral' as const) : ('error' as const) }] : []),
+        ],
+        node: 'pv',
+      };
+    });
+
+    const modalSize = currentResponsiveLayout().panelSize;
+    return <picker key="picker" size={modalSize} title="Tasks & tool activity" icon="timer"
+      subtitle={busy || runningCount ? `${runningCount} active tool(s) in current turn · Stop cancels the active ACP turn` : `${allTools.length} tool call(s) recorded in this session`}
+      placeholder="Filter tasks by tool, command, or path..."
+      query={panelDraft.text} cursor={panelDraft.cursor}
+      tabs={[
+        { id: 'all', label: 'All', count: allTools.length },
+        { id: 'running', label: 'Running', count: runningCount },
+        { id: 'done', label: 'Finished', count: allTools.length - runningCount },
+      ]}
+      tab={pickerTab}
+      order={order}
+      items={items} selected={selectedId}
+      state="ready"
+      empty={pickerTab === 'running' ? 'No tool tasks are currently running.' : 'No tool activity recorded in this conversation yet.'}
+      preview={highlighted ? 'below' : 'none'}
+      actions={[
+        ...(busy ? [{ id: 'stopTurn', label: cancelling ? 'Stopping...' : 'Stop active turn', keys: ['esc'], disabled: cancelling ? (true as const) : undefined }] : []),
+        { id: 'close', label: 'Close', keys: ['esc'] },
+        { id: 'inspect', label: 'Inspect details', primary: true, keys: ['enter'], disabled: !highlighted ? (true as const) : undefined },
+      ]}
+      onSelect={event => { pickerSelected = event.item; render(); }}
+      onActivate={() => {
+        if (highlighted) inspectTaskStep(highlighted);
+      }}
+      onAction={{
+        close: closePanel,
+        tab: event => {
+          if (typeof event.value === 'string') { pickerTab = event.value; render(); }
+        },
+        stopTurn: () => stop(),
+        inspect: () => {
+          if (highlighted) inspectTaskStep(highlighted);
+        },
+      }}>
+      {highlighted && highlightedSummary && <ToolBody call={highlighted.call} cwd={options.cwd} showRawInput={highlightedSummary.showRawInput}
+        fullCommand={highlightedSummary.fullCommand} diffMode={userPrefs.diffMode}
+        getBlob={blobForImage} onInspect={openInspect} onOpenSplit={openSplit}
+        onCopy={text => { void copyToClipboard(text).then(ok => { if (!quitting) showToast(ok ? 'Copied to clipboard' : 'Clipboard unavailable'); }); }} />}
+    </picker>;
+  }
+
   function renderPanel(): JSX.Element | null {
     if (!panel) return null;
     const currentPanel = panel;
@@ -2635,6 +2774,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     if (currentPanel.kind === 'sessions') return renderSessionsPicker();
     if (currentPanel.kind === 'changes') return renderChangesPicker();
     if (currentPanel.kind === 'find') return renderFindPicker();
+    if (currentPanel.kind === 'tasks') return renderTasksPicker();
     if (currentPanel.kind === 'inspect') return renderInspectOverlay(currentPanel);
 
     const mode = modeOption();
@@ -2865,7 +3005,16 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     const loginAvailable = !!loginMethod() && !terminalLoginProblem(loginMethod()!) && !!agent && !disconnected && authentication.logout;
     const agentStatus: Tone = disconnected || phase.includes('failed') ? 'error' : busy ? 'warning' : agent ? 'success' : 'muted';
     const renderNow = lastRenderAt || Date.now();
-    const showHud = !!(planSummary || contextUsage || (busy && turnStartedAt));
+    const activeTools = activeToolSteps();
+    const showHud = !!(planSummary || contextUsage || busy || activeTools.length > 0);
+    const activeToolTop = activeTools.at(-1);
+    const activeToolSummary = activeToolTop ? summarizeToolCall(activeToolTop.call, options.cwd) : undefined;
+    const liveTaskLabel = activeToolSummary
+      ? `Running${activeTools.length > 1 ? ` (${activeTools.length})` : ''}: ${activeToolSummary.title}${activeToolSummary.target ? ` · ${compactToolHeaderText(activeToolSummary.target, 36)}` : ''}`
+      : phase;
+    const activeAgeMs = activeToolTop?.startedAt !== undefined
+      ? Math.max(0, Date.now() - activeToolTop.startedAt)
+      : turnStartedAt ? Math.max(0, Date.now() - turnStartedAt) : 0;
     const layout = currentResponsiveLayout({
       hasPermission: !!permission,
       hasSuggestionsOrAt: suggestions.length > 0 || atMatches.length > 0,
@@ -3011,17 +3160,24 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         </scroll>
       </col>,
       dock: <col gap="xs">
-        {showHud && <row key="hud" justify="between" align="center" gap="md" wrap>
-          {activePlan && planSummary ? <checklist key="plan-hud" mode="hud"
-            note={`${planSummary.done}/${planSummary.total}`}
-            phases={[{ title: 'Tasks', items: activePlan.entries.map((item, index) => ({
-              id: String(index), text: item.content,
-              status: item.status === 'in_progress' ? 'active' : item.status === 'completed' ? 'done' : 'pending',
-            })) }]} /> : (busy && turnStartedAt) ? <row key="live-turn" gap="xs" align="center">
+        {showHud && <row key="hud" justify="between" align="center" gap="sm" wrap>
+          <row gap="sm" align="center" wrap>
+            {(busy || activeTools.length > 0) && <row key="live-turn" gap="sm" align="center">
               <spinner style="braille" />
-              <shimmer text={phase} />
-              <elapsed age={Math.max(0, Date.now() - turnStartedAt)} />
-            </row> : <spacer size="none" />}
+              <shimmer text={liveTaskLabel} />
+              <elapsed age={activeAgeMs} />
+              <button size="sm" variant="quiet" onClick={() => openPanel({ kind: 'tasks' })}>Tasks</button>
+              <button size="sm" variant="danger" disabled={cancelling && 'Cancellation requested'} onClick={stop}>
+                {cancelling ? 'Stopping...' : 'Stop'}
+              </button>
+            </row>}
+            {activePlan && planSummary && <checklist key="plan-hud" mode="hud"
+              note={`${planSummary.done}/${planSummary.total}`}
+              phases={[{ title: 'Tasks', items: activePlan.entries.map((item, index) => ({
+                id: String(index), text: item.content,
+                status: item.status === 'in_progress' ? 'active' : item.status === 'completed' ? 'done' : 'pending',
+              })) }]} />}
+          </row>
           {contextUsage && <meter key="context" style="bar" size="sm"
             value={contextUsage.percent / 100}
             thresholds={{ warn: 0.75, bad: 0.9 }}
@@ -3169,8 +3325,11 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
           <seg key="state" priority={10}
             tone={busy || authBusy || agentConnecting || !!sessionOperation ? 'accent' : disconnected || phase.includes('failed') ? 'error' : agent ? 'success' : 'muted'}
             text={authBusy ? 'Signing in' : sessionOperation ?? phase}
-            title={disconnected && !agentConnecting ? 'Click to reconnect agy ACP' : undefined}
-            onClick={() => { if (disconnected && !agentConnecting && !authBusy) reconnectAgent(); }} />
+            title={disconnected && !agentConnecting ? 'Click to reconnect agy ACP' : busy ? 'Click to inspect running task (/tasks)' : undefined}
+            onClick={() => {
+              if (disconnected && !agentConnecting && !authBusy) reconnectAgent();
+              else if (busy && !permission && !authBusy) openPanel({ kind: 'tasks' });
+            }} />
           {historyIndex !== undefined && <seg key="history" priority={6} icon="history" tone="accent"
             text={`History ${historyIndex + 1}/${promptHistory.length}`}
             title="Up/Down cycles sent prompts; type to keep editing" />}
@@ -3325,7 +3484,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         sessionChanged(id) {
           if (activeSessionId) {
             conversations.set(activeSessionId, conversation);
-            if (conversations.size > 3) {
+            if (conversations.size > 12) {
               const oldest = conversations.keys().next().value;
               if (oldest !== undefined && oldest !== id) conversations.delete(oldest);
             }
@@ -3447,8 +3606,6 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         const loadingExisting = Boolean((targetId && targetId !== connected.sessionId) || (!resumeId && launch?.continueLast));
         if (!resumeId && !loadingExisting) {
           await applyPreferredConfigOptions(connected, true, true);
-        } else if (!resumeId && options.initialConfig) {
-          await applyPreferredConfigOptions(connected, true, false);
         }
         if (quitting) return;
         if (targetId && targetId !== connected.sessionId) {
@@ -3456,7 +3613,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
             if (connected.capabilities.loadSession) {
               beginHistoryReplay('load');
               await connected.loadSession(targetId);
-              markReplayActivity();
+              finishHistoryReplay();
             } else if (connected.capabilities.resumeSession && connected.resumeSession) {
               await connected.resumeSession(targetId);
             } else if (!resumeId) {
@@ -3466,6 +3623,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
             clearReplayState();
             conversation.notice(`Failed to open conversation ${targetId}: ${err instanceof Error ? err.message : String(err)}`, true);
           }
+          await applyPreferredConfigOptions(connected, !resumeId, true);
         } else if (!resumeId && launch?.continueLast && connected.capabilities.listSessions) {
           try {
             const list = await connected.listSessions();
@@ -3475,10 +3633,11 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
               if (connected.capabilities.loadSession) {
                 beginHistoryReplay('load');
                 await connected.loadSession(latest.sessionId);
-                markReplayActivity();
+                finishHistoryReplay();
               } else if (connected.capabilities.resumeSession && connected.resumeSession) {
                 await connected.resumeSession(latest.sessionId);
               }
+              await applyPreferredConfigOptions(connected, true, true);
             } else if (!latest) {
               conversation.notice('No previous conversation found in this workspace for --continue; started a new session.');
             }
@@ -3491,6 +3650,9 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         phase = replayingHistory ? 'Syncing history' : 'Ready';
         render();
         if (!replayingHistory) surface?.scroll('main.conversation', 'end');
+        if (!resumeId && connected.capabilities.listSessions && !listedSessions.length) {
+          loadSessions(false, true);
+        }
         if (resumeId) showToast('Reconnected to Antigravity');
         else if (launch?.initialPrompt && !disconnected) submitPrompt(launch.initialPrompt);
       }).catch(error => {
@@ -3549,8 +3711,8 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         }
         const configOpt = current.kind === 'config' ? metadata.configOptions.find(candidate => candidate.id === current.id) : undefined;
         if (current.kind === 'commands' || current.kind === 'mcp' || current.kind === 'plugins' || current.kind === 'agents' ||
-          current.kind === 'templates' || current.kind === 'find' || current.kind === 'changes' || current.kind === 'sessions' ||
-          (current.kind === 'config' && configOpt?.type === 'select')) {
+          current.kind === 'templates' || current.kind === 'find' || current.kind === 'tasks' || current.kind === 'changes' ||
+          current.kind === 'sessions' || (current.kind === 'config' && configOpt?.type === 'select')) {
           let tabIds: string[] = [];
           let visibleIds: string[] = [];
           let activate: (chosenId: string) => void = () => {};
@@ -3603,6 +3765,26 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
             activate = chosenId => {
               const match = matches.find(m => m.id === chosenId);
               if (match) inspectFindMatch(match);
+            };
+          } else if (current.kind === 'tasks') {
+            const needle = panelDraft.text.trim().toLowerCase();
+            const allTools = conversation.entries
+              .filter((entry): entry is ToolStep => entry.type === 'tool')
+              .slice()
+              .reverse()
+              .filter(step => {
+                const isRunning = step.call.status === 'in_progress' || step.call.status === 'pending';
+                if (pickerTab === 'running' && !isRunning) return false;
+                if (pickerTab === 'done' && isRunning) return false;
+                if (!needle) return true;
+                const summary = summarizeToolCall(step.call, options.cwd);
+                return `${summary.title} ${summary.target ?? ''} ${step.call.toolCallId}`.toLowerCase().includes(needle);
+              });
+            tabIds = ['all', 'running', 'done'];
+            visibleIds = allTools.map(s => s.id);
+            activate = chosenId => {
+              const step = allTools.find(s => s.id === chosenId);
+              if (step) inspectTaskStep(step);
             };
           } else if (current.kind === 'changes') {
             const needle = panelDraft.text.trim().toLowerCase();

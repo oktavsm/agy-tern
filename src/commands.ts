@@ -1,6 +1,6 @@
 import type { AvailableCommand, SessionConfigOption, SessionConfigSelectOption } from '@agentclientprotocol/sdk';
 
-export type LocalCommand = 'help' | 'model' | 'settings' | 'usage' | 'credits' | 'changelog' | 'permissions' | 'sessions' | 'new' | 'rename' | 'account' | 'switch-account' | 'login' | 'changes' | 'find' | 'export' | 'expand' | 'collapse' | 'mcp' | 'plugins' | 'agents' | 'templates' | 'exit';
+export type LocalCommand = 'help' | 'model' | 'settings' | 'usage' | 'credits' | 'changelog' | 'permissions' | 'sessions' | 'new' | 'rename' | 'account' | 'switch-account' | 'login' | 'changes' | 'find' | 'tasks' | 'export' | 'expand' | 'collapse' | 'mcp' | 'plugins' | 'agents' | 'templates' | 'exit';
 export type CommandCategory = 'frontend' | 'workflow' | 'skill';
 
 const CORE_WORKFLOWS = new Set([
@@ -20,6 +20,7 @@ const LOCAL: readonly Command[] = [
   { name: 'switch-account', local: 'switch-account', description: 'Confirm logout and switch account via official login' },
   { name: 'login', local: 'login', description: 'Open official sign-in options, including while disconnected' },
   { name: 'changes', local: 'changes', description: 'Review session file edits and git working tree status' },
+  { name: 'tasks', local: 'tasks', description: 'Inspect running tools and cancel active turn tasks' },
   { name: 'find', local: 'find', description: 'Search messages, tools, thoughts, and diffs in this conversation', hint: 'query' },
   { name: 'export', local: 'export', description: 'Save current conversation transcript to Markdown or JSON in workspace', hint: 'file.md|json' },
   { name: 'templates', local: 'templates', description: 'Save, browse, and insert reusable prompt templates for this workspace' },
@@ -39,8 +40,9 @@ const LOCAL: readonly Command[] = [
   { name: 'exit', local: 'exit', description: 'Close this frontend and its agy session' },
 ];
 const ALIASES: Readonly<Record<string, string>> = {
-  quota: 'usage', config: 'settings', preferences: 'settings', prefs: 'settings', quit: 'exit', commands: 'help', resume: 'sessions', conversation: 'sessions', switch: 'sessions', reauth: 'switch-account', diff: 'changes', search: 'find', skills: 'plugins', agent: 'agents', snippets: 'templates',
+  quota: 'usage', config: 'settings', preferences: 'settings', prefs: 'settings', quit: 'exit', commands: 'help', resume: 'sessions', conversation: 'sessions', switch: 'sessions', reauth: 'switch-account', diff: 'changes', search: 'find', skills: 'plugins', agent: 'agents', snippets: 'templates', running: 'tasks', ps: 'tasks',
 };
+const ALIAS_PATTERN = new RegExp(`^\\/(${Object.keys(ALIASES).join('|')})(?=\\s|$)`);
 
 export function commandCategory(command: Command): CommandCategory {
   if (command.local) return 'frontend';
@@ -77,7 +79,7 @@ export function filterCommands(commands: readonly Command[], query: string): Com
 }
 
 export function resolveCommand(text: string, commands: readonly Command[]): { command: Command; args: string } | undefined {
-  const input = text.trim().replace(/^\/(quota|config|preferences|prefs|quit|commands|resume|conversation|switch|reauth|diff|search|skills|agent|snippets)(?=\s|$)/, (_match, name: string) =>
+  const input = text.trim().replace(ALIAS_PATTERN, (_match, name: string) =>
     `/${ALIASES[name]}`);
   let matched: Command | undefined;
   for (const command of commands) {

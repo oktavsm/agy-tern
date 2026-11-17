@@ -18,6 +18,7 @@ export interface ToolSummary {
   title: string;
   target?: string;
   targetKind?: 'command' | 'path' | 'pattern' | 'query' | 'text';
+  fullCommand?: string;
   frame: 'card' | 'inline';
   badges: Chip[];
   exit?: number;
@@ -228,6 +229,13 @@ function normalizeToolName(call: ToolCallUpdate): string | undefined {
   return raw;
 }
 
+/** Collapse newlines/whitespace into one compact single-line summary for tool headers. */
+export function compactToolHeaderText(raw: string, maxChars = 88): string {
+  const single = raw.replace(/\s+/g, ' ').trim();
+  if (single.length <= maxChars) return single;
+  return `${single.slice(0, Math.max(8, maxChars - 3)).trimEnd()}...`;
+}
+
 /** Build native Tern <tool> display props from an ACP ToolCallUpdate. */
 export function summarizeToolCall(call: ToolCallUpdate, cwd: string): ToolSummary {
   const input = asRecord(call.rawInput);
@@ -235,6 +243,7 @@ export function summarizeToolCall(call: ToolCallUpdate, cwd: string): ToolSummar
   const loc = call.locations?.[0];
   let target: string | undefined;
   let targetKind: ToolSummary['targetKind'];
+  let fullCommand: string | undefined;
 
   const command = firstString(input, ['command', 'CommandLine', 'cmd']);
   const pattern = firstString(input, ['pattern', 'Query', 'query', 'regex']);
@@ -242,8 +251,9 @@ export function summarizeToolCall(call: ToolCallUpdate, cwd: string): ToolSummar
   const url = firstString(input, ['url', 'uri']);
 
   if (command && (name === 'bash' || call.kind === 'execute')) {
-    target = command;
+    target = compactToolHeaderText(command, 88);
     targetKind = 'command';
+    if (command.includes('\n') || command.trim().length > 88) fullCommand = command;
   } else if (loc?.path) {
     const formatted = formatPathLabel(loc.path, cwd);
     target = loc.line == null ? formatted : `${formatted}:${loc.line}`;
@@ -252,10 +262,10 @@ export function summarizeToolCall(call: ToolCallUpdate, cwd: string): ToolSummar
     target = formatPathLabel(inputPath, cwd);
     targetKind = 'path';
   } else if (pattern) {
-    target = pattern;
+    target = compactToolHeaderText(pattern, 80);
     targetKind = name === 'search' ? 'pattern' : 'query';
   } else if (url) {
-    target = url;
+    target = compactToolHeaderText(url, 88);
     targetKind = 'text';
   }
 
@@ -284,11 +294,24 @@ export function summarizeToolCall(call: ToolCallUpdate, cwd: string): ToolSummar
   const lightweight = (name === 'read' || name === 'search' || name === 'think' || call.kind === 'read' || call.kind === 'search') &&
     !hasDiff && !failed && !hasContent && !hasOutput;
 
+  const rawTitle = (call.title ?? call.toolCallId).trim();
+  const isExecute = name === 'bash' || call.kind === 'execute';
+  let title = compactToolHeaderText(rawTitle, 72);
+  if (isExecute && (rawTitle.includes('\n') || rawTitle.length > 88 || (target && compactToolHeaderText(rawTitle, 88) === target))) {
+    title = 'Run command';
+    if (!target) {
+      target = compactToolHeaderText(rawTitle, 88);
+      targetKind = 'command';
+      if (rawTitle.includes('\n') || rawTitle.length > 88) fullCommand = rawTitle;
+    }
+  }
+
   return {
     name,
-    title: call.title ?? call.toolCallId,
+    title,
     target,
     targetKind,
+    ...(fullCommand ? { fullCommand } : {}),
     frame: lightweight ? 'inline' : 'card',
     badges,
     exit,

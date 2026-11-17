@@ -672,6 +672,31 @@ const connection = agent({ name: 'local-protocol-fixture' })
     } else if (command === 'demo-slow') {
       await new Promise(done => setTimeout(done, 1_500));
       await text('Slow synthetic turn finished cleanly.');
+    } else if (command === 'demo-long-task') {
+      const longCmd = "bun -e 'import { connectAgent } from \"./src/agent\";\n" +
+        Array.from({ length: 20 }, (_, i) => `console.log(${i});`).join('\n') + "'";
+      await client.notify(methods.client.session.update, {
+        sessionId,
+        update: {
+          sessionUpdate: 'tool_call',
+          toolCallId: 'demo-long-task-1',
+          kind: 'execute',
+          title: longCmd,
+          status: 'in_progress',
+          rawInput: { CommandLine: longCmd },
+        },
+      });
+      await new Promise(done => setTimeout(done, 1_800));
+      await client.notify(methods.client.session.update, {
+        sessionId,
+        update: {
+          sessionUpdate: 'tool_call_update',
+          toolCallId: 'demo-long-task-1',
+          status: 'completed',
+          rawOutput: { exitCode: 0, stdout: '0\n1\n2\nCompleted cleanly.\n' },
+        },
+      });
+      await text('Multiline command completed cleanly.');
     } else if (command === 'mode-notify') {
       await client.notify(methods.client.session.update, {
         sessionId,
