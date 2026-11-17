@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import { mkdir, mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { readOfficialBrainTranscript, TranscriptStore } from '../src/history';
+import { readOfficialBrainTranscript, readSessionPreview, TranscriptStore } from '../src/history';
 import { Conversation } from '../src/model';
 
 const dirs: string[] = [];
@@ -86,5 +86,14 @@ describe('local transcript store & official brain log reader', () => {
 
     // Rejects invalid/non-UUID IDs against path traversal.
     expect(await readOfficialBrainTranscript('../etc/passwd', { appDataDir: appData })).toBeUndefined();
+
+    const preview = await readSessionPreview(sessionId, undefined, { appDataDir: appData });
+    expect(preview).toMatchObject({
+      source: 'brain',
+      messageCount: 2,
+      toolCount: 1,
+      lastUser: 'audit project',
+      lastAgent: 'Audit complete.',
+    });
   });
 });

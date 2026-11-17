@@ -82,6 +82,8 @@ test('authentication commands stay local even when the agent advertises the same
   expect(resolveCommand('/skills', commands)?.command.local).toBe('plugins');
   expect(resolveCommand('/agents', commands)?.command.local).toBe('agents');
   expect(resolveCommand('/agent', commands)?.command.local).toBe('agents');
+  expect(resolveCommand('/paste-image', commands)?.command.local).toBe('paste-image');
+  expect(resolveCommand('/clip', commands)?.command.local).toBe('paste-image');
   expect(resolveCommand('/switch', commands)?.command.local).toBe('sessions');
   expect(filterCommands(commands, 'account')[0]?.name).toBe('account');
 

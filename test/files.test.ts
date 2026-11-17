@@ -14,10 +14,12 @@ import {
   listWorkspaceFiles,
   loadDirectorySummaryResources,
   loadEmbeddedResourceAttachments,
+  readClipboardImage,
   readGitFileDiff,
   readImageAttachment,
   readWorkspaceTextPreview,
   resolvePastedImagePath,
+  searchWorkspacePrefix,
   stripAtMention,
   writeTranscriptExport,
 } from '../src/files';
@@ -193,5 +195,31 @@ describe('workspace @file mention helpers', () => {
 
     expect(formatPromptWithAttachments('inspect workspace', ['.env'], ['src/', 'docs/screenshots/']))
       .toBe('@.env @src/ @docs/screenshots/\n\ninspect workspace');
+
+    const targeted = await searchWorkspacePrefix(dir, 'docs/screenshots/', 50);
+    expect(targeted.map(e => e.path)).toContain('docs/screenshots/home.png');
+    expect(targeted.find(e => e.path === 'docs/screenshots/home.png')?.ignored).toBe(true);
+    expect(await searchWorkspacePrefix(dir, '../etc/passwd', 50)).toEqual([]);
+  });
+
+  test('reads clipboard PNG image safely and enforces size and missing-type errors', async () => {
+    const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 1, 2, 3]);
+    const loaded = await readClipboardImage({
+      hasCommand: cmd => cmd === 'wl-paste',
+      exec: async (_cmd, args) => {
+        if (args.includes('--list-types')) return Buffer.from('text/plain\nimage/png\n');
+        if (args.includes('image/png')) return pngBytes;
+        return undefined;
+      },
+    });
+    expect(loaded.mimeType).toBe('image/png');
+    expect(loaded.size).toBe(pngBytes.byteLength);
+    expect(loaded.data).toBe(pngBytes.toString('base64'));
+    expect(loaded.path).toMatch(/^clipboard-.*\.png$/);
+
+    await expect(readClipboardImage({
+      hasCommand: cmd => cmd === 'xclip',
+      exec: async () => Buffer.from('UTF8_STRING\ntext/plain\n'),
+    })).rejects.toThrow('Clipboard does not contain a PNG, JPEG, or WebP image.');
   });
 });

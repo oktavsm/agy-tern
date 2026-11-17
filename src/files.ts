@@ -24,6 +24,107 @@ export interface LoadedImageAttachment extends ImageAttachment {
   size: number;
 }
 
+const CLIPBOARD_IMAGE_MIMES: ReadonlyArray<{ mime: string; ext: string }> = [
+  { mime: 'image/png', ext: 'png' },
+  { mime: 'image/jpeg', ext: 'jpg' },
+  { mime: 'image/webp', ext: 'webp' },
+];
+
+export type ClipboardExec = (cmd: string, args: string[], maxBytes: number) => Promise<Buffer | undefined>;
+
+async function runBinaryCommand(cmd: string, args: string[], maxBytes: number): Promise<Buffer | undefined> {
+  const bin = Bun.which(cmd);
+  if (!bin) return undefined;
+  return new Promise(resolvePromise => {
+    const child = spawn(bin, args, { stdio: ['ignore', 'pipe', 'ignore'] });
+    const chunks: Buffer[] = [];
+    let total = 0;
+    let settled = false;
+    const finish = (value: Buffer | undefined): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolvePromise(value);
+    };
+    const timer = setTimeout(() => {
+      child.kill('SIGTERM');
+      finish(undefined);
+    }, 2_000);
+    child.stdout?.on('data', (chunk: Buffer) => {
+      total += chunk.byteLength;
+      if (total <= maxBytes) chunks.push(chunk);
+      else {
+        child.kill('SIGTERM');
+        finish(Buffer.concat(chunks, Math.min(total, maxBytes)));
+      }
+    });
+    child.once('error', () => finish(undefined));
+    child.once('close', code => finish(code === 0 ? Buffer.concat(chunks) : undefined));
+  });
+}
+
+/**
+ * Read a PNG/JPEG/WebP screenshot directly from system clipboard (`wl-paste` or `xclip`).
+ * Enforces the 10 MB ACP attachment limit cleanly without shell interpolation.
+ */
+export async function readClipboardImage(
+  options?: { exec?: ClipboardExec; hasCommand?: (cmd: string) => boolean },
+): Promise<LoadedImageAttachment> {
+  const exec = options?.exec ?? runBinaryCommand;
+  const hasCmd = options?.hasCommand ?? ((cmd: string) => !!Bun.which(cmd));
+
+  const tryTool = async (
+    cmd: string,
+    targetsArgs: string[],
+    readArgsForMime: (mime: string) => string[],
+  ): Promise<{ tried: boolean; loaded?: LoadedImageAttachment; error?: string }> => {
+    if (!hasCmd(cmd)) return { tried: false };
+    const typesBuf = await exec(cmd, targetsArgs, 32 * 1024);
+    const typesText = typesBuf?.toString('utf8') ?? '';
+    const offered = new Set(typesText.split(/\r?\n/).map(line => line.trim().toLowerCase()).filter(Boolean));
+    const matched = CLIPBOARD_IMAGE_MIMES.find(entry => offered.has(entry.mime));
+    if (!matched) return { tried: true };
+    const payload = await exec(cmd, readArgsForMime(matched.mime), MAX_IMAGE_BYTES + 1);
+    if (!payload || payload.byteLength === 0) {
+      return { tried: true, error: 'Clipboard image payload was empty.' };
+    }
+    if (payload.byteLength > MAX_IMAGE_BYTES) {
+      return { tried: true, error: `Clipboard image exceeds 10 MB limit (${(payload.byteLength / (1024 * 1024)).toFixed(1)} MB).` };
+    }
+    return {
+      tried: true,
+      loaded: {
+        path: `clipboard-${Date.now().toString(36)}.${matched.ext}`,
+        mimeType: matched.mime,
+        size: payload.byteLength,
+        data: payload.toString('base64'),
+      },
+    };
+  };
+
+  const candidates = process.env.WAYLAND_DISPLAY
+    ? [
+      () => tryTool('wl-paste', ['--list-types'], mime => ['--no-newline', '--type', mime]),
+      () => tryTool('xclip', ['-selection', 'clipboard', '-t', 'TARGETS', '-o'], mime => ['-selection', 'clipboard', '-t', mime, '-o']),
+    ]
+    : [
+      () => tryTool('xclip', ['-selection', 'clipboard', '-t', 'TARGETS', '-o'], mime => ['-selection', 'clipboard', '-t', mime, '-o']),
+      () => tryTool('wl-paste', ['--list-types'], mime => ['--no-newline', '--type', mime]),
+    ];
+
+  let anyToolAvailable = false;
+  for (const probe of candidates) {
+    const res = await probe();
+    if (res.tried) anyToolAvailable = true;
+    if (res.error) throw new Error(res.error);
+    if (res.loaded) return res.loaded;
+  }
+  if (!anyToolAvailable) {
+    throw new Error('No clipboard image utility available (install wl-paste or xclip).');
+  }
+  throw new Error('Clipboard does not contain a PNG, JPEG, or WebP image.');
+}
+
 export interface GitStatusEntry {
   status: string;
   path: string;
@@ -336,6 +437,78 @@ export async function listWorkspaceEntries(
     }
   }
   return [...map.values()];
+}
+
+function sanitizePrefixPattern(query: string): { dirPrefix: string; pattern: string } | undefined {
+  const clean = query.trim().replace(/^@+/, '').replace(/\\/g, '/').replace(/^\/+/, '');
+  if (!clean || clean.includes('\0') || clean.startsWith('-') || clean.split('/').some(seg => seg === '..')) {
+    return undefined;
+  }
+  const slashIdx = clean.lastIndexOf('/');
+  const dirPrefix = slashIdx >= 0 ? clean.slice(0, slashIdx + 1) : '';
+  const tail = clean.slice(slashIdx + 1);
+  if (dirPrefix) return { dirPrefix, pattern: tail ? `${dirPrefix}*${tail}*` : `${dirPrefix}**` };
+  return { dirPrefix: '', pattern: `*${clean}*` };
+}
+
+/**
+ * Targeted workspace lookup for `@` queries beyond the initial 2,400-entry index.
+ * Searches nested directories and gitignored files safely within `cwd` and `--add-dir` roots.
+ */
+export async function searchWorkspacePrefix(
+  cwd: string,
+  query: string,
+  limit = 120,
+  extraDirs: readonly string[] = [],
+): Promise<WorkspaceEntry[]> {
+  const parsed = sanitizePrefixPattern(query);
+  if (!parsed) return [];
+  const map = new Map<string, WorkspaceEntry>();
+
+  const collectGit = async (root: string, pathPrefix = ''): Promise<boolean> => {
+    const spec = parsed.dirPrefix ? [parsed.dirPrefix] : [parsed.pattern];
+    const [nonIgnoredRaw, ignoredRaw] = await Promise.all([
+      runGitCommand(root, ['ls-files', '-z', '--cached', '--others', '--exclude-standard', '--', ...spec], 512 * 1024),
+      runGitCommand(root, ['ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--', ...spec], 512 * 1024),
+    ]);
+    if (nonIgnoredRaw === undefined) return false;
+    for (const rel of splitNullSeparated(nonIgnoredRaw)) {
+      if (map.size >= limit) break;
+      const full = pathPrefix ? join(pathPrefix, rel) : rel;
+      map.set(full, { path: full, kind: 'file', ignored: false });
+      addAncestorDirs(map, full, false, pathPrefix);
+    }
+    for (const rel of splitNullSeparated(ignoredRaw ?? '')) {
+      if (map.size >= limit) break;
+      if (rel === '.git' || rel.startsWith('.git/')) continue;
+      const full = pathPrefix ? join(pathPrefix, rel) : rel;
+      if (!map.has(full)) map.set(full, { path: full, kind: 'file', ignored: true });
+      addAncestorDirs(map, full, true, pathPrefix);
+    }
+    return true;
+  };
+
+  const gitOk = await collectGit(cwd);
+  if (!gitOk && parsed.dirPrefix) {
+    const targetDir = resolve(cwd, trimTrailingSlash(parsed.dirPrefix));
+    const relTarget = relative(resolve(cwd), targetDir);
+    if (!relTarget.startsWith('..') && !isAbsolute(relTarget)) {
+      const walked = await walkDirectoryEntries(targetDir, limit, trimTrailingSlash(parsed.dirPrefix));
+      for (const item of walked) {
+        if (map.size >= limit) break;
+        map.set(item.path, item);
+      }
+    }
+  }
+  if (map.size < limit) {
+    for (const extra of extraDirs) {
+      if (map.size >= limit) break;
+      const root = isAbsolute(extra) ? resolve(extra) : resolve(cwd, extra);
+      if (root === resolve(cwd)) continue;
+      await collectGit(root, root);
+    }
+  }
+  return [...map.values()].slice(0, limit);
 }
 
 /** List workspace file paths (including gitignored files when git is present, plus any `--add-dir` roots). */

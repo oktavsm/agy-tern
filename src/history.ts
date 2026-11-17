@@ -311,3 +311,56 @@ export async function readOfficialBrainTranscript(
     source: 'brain',
   };
 }
+
+export interface SessionPreview {
+  source: 'cache' | 'brain';
+  entryCount: number;
+  messageCount: number;
+  toolCount: number;
+  lastUser?: string;
+  lastAgent?: string;
+  truncated: boolean;
+}
+
+function compactPreviewLine(raw: string, maxLen = 140): string {
+  const single = raw.replace(/\s+/g, ' ').trim();
+  return single.length > maxLen ? `${single.slice(0, maxLen - 3)}...` : single;
+}
+
+/** Read a lightweight last-turn preview for `/sessions` without invoking ACP `session/load`. */
+export async function readSessionPreview(
+  sessionId: string,
+  store?: TranscriptStore,
+  options?: { appDataDir?: string; maxReadBytes?: number },
+): Promise<SessionPreview | undefined> {
+  const loaded = (await store?.load(sessionId)) ??
+    (await readOfficialBrainTranscript(sessionId, {
+      appDataDir: options?.appDataDir,
+      maxReadBytes: options?.maxReadBytes ?? 280_000,
+      maxEntries: 30,
+    }));
+  if (!loaded) return undefined;
+  let lastUser: string | undefined;
+  let lastAgent: string | undefined;
+  let messageCount = 0;
+  let toolCount = 0;
+  for (const entry of loaded.entries) {
+    if (entry.type === 'tool') toolCount++;
+    else if (entry.type === 'message') {
+      messageCount++;
+      const text = compactPreviewLine(entry.text);
+      if (!text) continue;
+      if (entry.role === 'user') lastUser = text;
+      else if (entry.role === 'agent') lastAgent = text;
+    }
+  }
+  return {
+    source: loaded.source,
+    entryCount: loaded.entries.length,
+    messageCount,
+    toolCount,
+    ...(lastUser ? { lastUser } : {}),
+    ...(lastAgent ? { lastAgent } : {}),
+    truncated: loaded.truncated,
+  };
+}

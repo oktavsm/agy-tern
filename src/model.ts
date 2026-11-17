@@ -44,6 +44,7 @@ export interface NoticeEntry {
   text: string;
   error: boolean;
   retryable?: boolean;
+  action?: 'load_deeper_history';
 }
 
 export interface CompactionEntry {
