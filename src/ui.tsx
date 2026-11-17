@@ -1,13 +1,13 @@
 /** @jsxImportSource @stencil-hq/tern */
-import { existsSync, statSync } from 'node:fs';
+import { statSync } from 'node:fs';
 import { basename, resolve } from 'node:path';
-import { connect, type DiffHunk, type JSX, type PickerGroup, type PickerItem, type PrefsRow, type Session, type Surface, type Tone } from '@stencil-hq/tern';
+import { connect, type DiffHunk, type EditEvent, type JSX, type Session, type Surface, type Tone } from '@stencil-hq/tern';
 import type { AuthMethodTerminal, SessionConfigOption, SessionInfo } from '@agentclientprotocol/sdk';
 import { connectAgent } from './agent';
 import type { AgentAuthentication, AgentMetadata, AgentOptions, AgentSession, PermissionPrompt, ResourceAttachment } from './contracts';
 import { draftKey, editDraft, isCursorOnFirstRow, isCursorOnLastRow, type Draft } from './draft';
 import { Conversation, type ToolStep, type TranscriptEntry } from './model';
-import { commandCatalog, commandCategory, commandQuery, configLabel, configValues, filterCommands, modelOption, resolveCommand, type Command } from './commands';
+import { commandCatalog, commandQuery, configLabel, configValues, filterCommands, modelOption, resolveCommand, type Command } from './commands';
 import {
   addMcpServer,
   installPlugin,
@@ -25,8 +25,8 @@ import {
   type PluginEntry,
   type PluginValidationReport,
 } from './extensions';
-import { parseQuotaReport, readOfficialReport, type OfficialReport } from './reports';
-import { readOfficialBrainTranscript, TranscriptStore } from './history';
+import { readOfficialReport, type OfficialReport } from './reports';
+import { readOfficialBrainTranscript, readSessionPreview, TranscriptStore, type SessionPreview } from './history';
 import { SessionNames } from './session-names';
 import { PromptTemplatesStore, type PromptTemplate } from './templates';
 import { openInTernSplit, runCommandInTernSplit, sendTerminalAttention } from './tern-window';
@@ -36,10 +36,6 @@ import {
   DEFAULT_PREFS,
   DEFAULT_THINKING_ID,
   PrefsStore,
-  type ComposerLines,
-  type DiffMode,
-  type ToolDisplay,
-  type TranscriptDensity,
   type UserPrefs,
 } from './prefs';
 import {
@@ -52,10 +48,12 @@ import {
   listWorkspaceEntries,
   loadDirectorySummaryResources,
   loadEmbeddedResourceAttachments,
+  readClipboardImage,
   readImageAttachment,
   readGitFileDiff,
   readWorkspaceTextPreview,
   resolvePastedImagePath,
+  searchWorkspacePrefix,
   stripAtMention,
   writeTranscriptExport,
   type GitStatusEntry,
@@ -64,7 +62,6 @@ import {
 } from './files';
 import {
   buildUnifiedDiffHunks,
-  clipInlinePreview,
   collectSessionDiffs,
   compactToolHeaderText,
   computeResponsiveLayout,
@@ -79,7 +76,6 @@ import {
   formatTranscriptMarkdown,
   parseUnifiedGitDiff,
   searchTranscript,
-  summarizeQuotaRows,
   summarizeToolCall,
   thinkingOption,
   type ResponsiveLayout,
@@ -97,6 +93,7 @@ import {
   stepPickerKey,
 } from './picker-nav';
 import {
+  cachedPathExists,
   clockTime,
   copyToClipboard,
   Entry,
@@ -105,6 +102,11 @@ import {
   type EntryCallbacks,
   type InspectTarget,
 } from './transcript-view';
+import {
+  renderActivePanel,
+  type Choice,
+  type Panel,
+} from './panels';
 
 export interface ChatLaunchState {
   draft?: Draft;
@@ -119,27 +121,12 @@ export interface ChatLaunchState {
 export type NativeChatResult = { kind: 'unavailable' } | { kind: 'quit' } |
   { kind: 'login'; method: AuthMethodTerminal; draft: Draft; previousSessionId?: string };
 
-type Panel = { kind: 'commands' } | { kind: 'settings' } | { kind: 'config'; id: string } |
-  { kind: 'report'; report: OfficialReport } | { kind: 'permissions' } | { kind: 'sessions' } |
-  { kind: 'rename'; sessionId: string } | { kind: 'account' } | { kind: 'account-switch' } |
-  { kind: 'changes' } | { kind: 'find' } | { kind: 'tasks' } | { kind: 'mcp' } | { kind: 'plugins' } | { kind: 'agents' } |
-  { kind: 'templates' } | { kind: 'template-save' } | { kind: 'mcp-add' } | { kind: 'plugin-install' } |
-  { kind: 'confirm'; title: string; detail: string; actionLabel: string; returnTo?: Panel; onConfirm(): void } |
-  { kind: 'inspect'; title: string; subtitle?: string; item: InspectTarget };
-
 interface QueuedPrompt {
   id: string;
   text: string;
   files: string[];
   dirs: string[];
   images: LoadedImageAttachment[];
-}
-interface Choice {
-  label: string;
-  detail: string;
-  value?: string;
-  disabled?: boolean;
-  choose(): void;
 }
 
 export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchState): Promise<NativeChatResult> {
@@ -200,7 +187,18 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
   let reportAbort: AbortController | undefined;
   let reportTask: Promise<void> | undefined;
   let configTask: Promise<void> | undefined;
-  const expandedThoughts = new Set<string>();
+  let configSyncPromise: Promise<void> = Promise.resolve();
+  let configSyncToken = 0;
+  let workspaceEntriesVersion = 0;
+  let cachedCmdKey = '';
+  let cachedCmdResult: Command[] = [];
+  let cachedAtKey = '';
+  let cachedAtResult: WorkspaceEntry[] = [];
+  const prefixSearchCache = new Map<string, WorkspaceEntry[]>();
+  const prefixSearchInFlight = new Set<string>();
+  const sessionPreviewCache = new Map<string, SessionPreview | null>();
+  const sessionPreviewInFlight = new Set<string>();
+  let focusedTurnIndex: number | undefined;
   const thoughtFoldOverrides = new Map<string, boolean>();
   const toolFoldOverrides = new Map<string, boolean>();
   let lastPrompt = '';
@@ -441,10 +439,81 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     return !!conv?.entries.some(entry => entry.type === 'message' && entry.role === 'agent');
   }
 
+  function requestSessionPreview(id: string): void {
+    if (!id || sessionPreviewCache.has(id) || sessionPreviewInFlight.has(id) || quitting) return;
+    sessionPreviewInFlight.add(id);
+    void readSessionPreview(id, transcriptStore).then(preview => {
+      sessionPreviewInFlight.delete(id);
+      sessionPreviewCache.set(id, preview ?? null);
+      if (!quitting && panel?.kind === 'sessions') scheduleRender();
+    }).catch(() => {
+      sessionPreviewInFlight.delete(id);
+      sessionPreviewCache.set(id, null);
+    });
+  }
+
+  function jumpUserTurn(direction: -1 | 1): void {
+    const userEntries = conversation.entries.filter(
+      (entry): entry is Extract<TranscriptEntry, { type: 'message' }> => entry.type === 'message' && entry.role === 'user',
+    );
+    if (!userEntries.length || !surface) return;
+    let nextIdx: number;
+    if (focusedTurnIndex === undefined) {
+      nextIdx = direction === -1 ? userEntries.length - 1 : userEntries.length;
+    } else {
+      nextIdx = focusedTurnIndex + direction;
+    }
+    if (nextIdx >= userEntries.length) {
+      focusedTurnIndex = undefined;
+      surface.scroll('main.conversation', 'end');
+      showToast('Jumped to latest');
+      return;
+    }
+    nextIdx = Math.max(0, nextIdx);
+    focusedTurnIndex = nextIdx;
+    const target = userEntries[nextIdx]!;
+    const globalIdx = conversation.entries.indexOf(target);
+    if (globalIdx >= 0) {
+      const needed = conversation.entries.length - globalIdx;
+      if (needed > historyVisibleCount) {
+        historyVisibleCount = needed + 20;
+        render();
+      }
+    }
+    surface.reveal(`main.conversation.${target.id}`, 'start');
+    showToast(`Turn ${nextIdx + 1}/${userEntries.length}`);
+  }
+
+  async function loadDeeperBrainHistory(): Promise<void> {
+    if (!activeSessionId || quitting || busy) return;
+    const targetId = activeSessionId;
+    const brain = await readOfficialBrainTranscript(targetId, { maxEntries: 400, maxReadBytes: 8_000_000 });
+    if (quitting || activeSessionId !== targetId) return;
+    if (!brain || !brain.entries.length) {
+      showToast('No older brain log entries found');
+      return;
+    }
+    conversation.restoreEntries([
+      ...brain.entries,
+      {
+        type: 'notice',
+        id: `history-restored-${Date.now()}`,
+        text: brain.truncated
+          ? `Showing latest ${brain.entries.length} entries from official session log.`
+          : `Loaded full ${brain.entries.length} entries from official session log.`,
+        error: false,
+      },
+    ]);
+    historyVisibleCount = Math.max(historyVisibleCount, brain.entries.length + 10);
+    render();
+    showToast(`Loaded ${brain.entries.length} history entries`);
+  }
+
   function persistActiveTranscript(): Promise<void> {
     if (!activeSessionId || !conversation.entries.some(entry => entry.type === 'message')) {
       return Promise.resolve();
     }
+    sessionPreviewCache.delete(activeSessionId);
     return transcriptStore.save(activeSessionId, conversation.entries).catch(() => {});
   }
 
@@ -458,8 +527,11 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       conversation = fallback;
       return;
     }
-    const disk = (await transcriptStore.load(targetSessionId)) ?? (await readOfficialBrainTranscript(targetSessionId));
+    const cache = await transcriptStore.load(targetSessionId);
     if (quitting) return;
+    const brain = cache ? undefined : await readOfficialBrainTranscript(targetSessionId);
+    if (quitting) return;
+    const disk = cache ?? brain;
     const replayedNonNotice = conversation.entries.filter(entry => entry.type !== 'notice').length;
     if (disk && disk.entries.length > replayedNonNotice) {
       conversation.restoreEntries([
@@ -471,6 +543,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
             ? `Showing latest ${disk.entries.length} entries from local session history.`
             : 'Restored conversation history from local session log.',
           error: false,
+          ...(disk.truncated ? { action: 'load_deeper_history' as const } : {}),
         },
       ]);
       return;
@@ -707,10 +780,16 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
 
   function runSessionAction(label: string, action: (connected: AgentSession) => Promise<void>): void {
     if (!agent || busy || changingConfig || sessionOperation || authBusy || disconnected || permissions.length || quitting) return;
+    configSyncToken++;
     sessionOperation = label;
     panelError = '';
     render();
-    sessionTask = action(agent).catch(error => {
+    const active = agent;
+    sessionTask = (async () => {
+      await configSyncPromise.catch(() => {});
+      if (quitting) return;
+      await action(active);
+    })().catch(error => {
       if (quitting) return;
       const message = error instanceof Error ? error.message : String(error);
       if (panel?.kind === 'sessions' || panel?.kind === 'rename') panelError = message;
@@ -942,6 +1021,9 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
 
   function setWorkspaceEntries(entries: WorkspaceEntry[]): void {
     workspaceEntries = entries;
+    workspaceEntriesVersion++;
+    prefixSearchCache.clear();
+    cachedAtKey = '';
     ignoredPathsSet = new Set(entries.filter(item => item.ignored).map(item => item.path));
   }
 
@@ -952,10 +1034,30 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     }).catch(() => {});
   }
 
+  function startConfigSync(
+    connected: AgentSession,
+    allowExplicitWarnings: boolean,
+    applyDefaults = true,
+  ): Promise<void> {
+    const token = ++configSyncToken;
+    const sessionId = connected.sessionId;
+    const task = applyPreferredConfigOptions(
+      connected,
+      allowExplicitWarnings,
+      applyDefaults,
+      () => quitting || token !== configSyncToken || connected.sessionId !== sessionId,
+    ).catch(() => {}).finally(() => {
+      if (!quitting && token === configSyncToken) scheduleRender();
+    });
+    configSyncPromise = task;
+    return task;
+  }
+
   async function applyPreferredConfigOptions(
     connected: AgentSession,
     allowExplicitWarnings: boolean,
     applyDefaults = true,
+    shouldCancel?: () => boolean,
   ): Promise<void> {
     const requestedModel = options.initialConfig?.model;
     const requestedThinking = options.initialConfig?.thinking;
@@ -974,7 +1076,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       ...(preferredThinking ? [{ opt: thinkingOption(connected.metadata.configOptions), wanted: preferredThinking, label: 'thinking level', explicit: !!requestedThinking }] : []),
     ];
     for (const item of requests) {
-      if (quitting) break;
+      if (quitting || shouldCancel?.()) break;
       if (!item.opt) {
         if (item.explicit && allowExplicitWarnings) {
           conversation.notice(`Requested --${item.label.replace(' level', '')} "${item.wanted}", but this ACP session did not advertise that option.`);
@@ -1058,7 +1160,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       if (mode === 'load') finishHistoryReplay();
       else clearReplayState();
       await hydrateSessionHistoryFallback(id, cached, mode);
-      await applyPreferredConfigOptions(connected, false, true);
+      void startConfigSync(connected, false, true);
       phase = 'Ready';
       closePanel();
       surface?.scroll('main.conversation', 'end');
@@ -1080,7 +1182,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     runSessionAction('Starting conversation', async connected => {
       clearReplayState();
       await connected.newSession();
-      await applyPreferredConfigOptions(connected, false);
+      void startConfigSync(connected, false);
       phase = 'Ready';
       closePanel();
     });
@@ -1144,10 +1246,15 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
 
   function changeConfig(option: SessionConfigOption, value: string | boolean): void {
     if (!agent || busy || changingConfig || sessionOperation || authBusy || disconnected || permissions.length) return;
+    configSyncToken++;
     changingConfig = true;
     panelError = '';
     render();
-    configTask = agent.setConfigOption(option.id, value).then(() => {
+    const active = agent;
+    configTask = configSyncPromise.catch(() => {}).then(() => {
+      if (quitting) return;
+      return active.setConfigOption(option.id, value);
+    }).then(() => {
       if (!quitting && userPrefs.rememberModel && typeof value === 'string') {
         if (option.category === 'model' || option.id === 'model') updatePrefs({ lastModel: value });
         else if (option.category === 'thought_level' || option.id === 'thought_level') updatePrefs({ lastThinking: value });
@@ -1160,6 +1267,25 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     }).finally(() => {
       changingConfig = false;
       render();
+    });
+  }
+
+  function attachClipboardImage(): void {
+    if (quitting || authBusy || permissions.length) return;
+    if (agent && !agent.promptCapabilities?.image) {
+      showToast('Images not supported', 'This ACP agent did not advertise image prompt support');
+      return;
+    }
+    void readClipboardImage().then(loaded => {
+      if (quitting) return;
+      if (!attachedImages.some(item => item.path === loaded.path)) {
+        attachedImages = [...attachedImages, loaded];
+      }
+      showToast('Attached clipboard image', `${loaded.mimeType} (${Math.max(1, Math.round(loaded.size / 1024))} KB)`);
+      render();
+      surface?.focus('dock.draft');
+    }).catch(error => {
+      if (!quitting) showToast('Clipboard image unavailable', error instanceof Error ? error.message : String(error));
     });
   }
 
@@ -1188,6 +1314,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         case 'permissions': openPanel({ kind: 'permissions' }); return;
         case 'changes': openPanel({ kind: 'changes' }); return;
         case 'tasks': openPanel({ kind: 'tasks' }); return;
+        case 'paste-image': closePanel(); attachClipboardImage(); return;
         case 'find':
           openPanel({ kind: 'find' });
           if (args) { panelDraft = { text: args, cursor: args.length }; render(); }
@@ -1258,6 +1385,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     lastFiles = [...attachedFilePaths];
     lastDirs = [...attachedDirPaths];
     busy = true;
+    focusedTurnIndex = undefined;
     turnStartedAt = Date.now();
     cancelling = false;
     autocompleteDismissed = true;
@@ -1275,6 +1403,8 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     const entryCountBeforePrompt = conversation.entries.length;
     turn = (async () => {
       const resources: ResourceAttachment[] = [];
+      await configSyncPromise.catch(() => {});
+      if (quitting || disconnected) return;
       if (activeAgent.promptCapabilities?.embeddedContext && (attachedFilePaths.length || attachedDirPaths.length)) {
         const [fileLoaded, dirLoaded] = await Promise.all([
           attachedFilePaths.length ? loadEmbeddedResourceAttachments(options.cwd, attachedFilePaths) : Promise.resolve({ resources: [], overflowPaths: [] }),
@@ -1361,8 +1491,14 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
 
   function autocomplete(): Command[] {
     const query = commandQuery(draft.text);
-    return !panel && !autocompleteDismissed && query !== undefined && !permissions.length && !sessionOperation && !authBusy
-      ? filterCommands(availableCommands(), query) : [];
+    const active = !panel && !autocompleteDismissed && query !== undefined && !permissions.length && !sessionOperation && !authBusy;
+    if (!active || query === undefined) return [];
+    const cmds = availableCommands();
+    const key = `${query}|${cmds.length}|${metadata.availableCommands.length}`;
+    if (key === cachedCmdKey) return cachedCmdResult;
+    cachedCmdKey = key;
+    cachedCmdResult = filterCommands(cmds, query);
+    return cachedCmdResult;
   }
 
   function activeAtMention(): { start: number; end: number; query: string } | undefined {
@@ -1371,18 +1507,52 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     return atMentionQuery(draft.text, draft.cursor);
   }
 
+  function triggerPrefixSearch(query: string): void {
+    const clean = query.trim();
+    if (clean.length < 2 || prefixSearchCache.has(clean) || prefixSearchInFlight.has(clean) || quitting) return;
+    prefixSearchInFlight.add(clean);
+    void searchWorkspacePrefix(options.cwd, clean, 120, options.additionalDirectories).then(found => {
+      prefixSearchInFlight.delete(clean);
+      prefixSearchCache.set(clean, found);
+      cachedAtKey = '';
+      if (!quitting && found.length) {
+        for (const item of found) {
+          if (item.ignored) ignoredPathsSet.add(item.path);
+        }
+        scheduleRender();
+      }
+    }).catch(() => {
+      prefixSearchInFlight.delete(clean);
+      prefixSearchCache.set(clean, []);
+    });
+  }
+
   function atFileMatches(): WorkspaceEntry[] {
     const mention = activeAtMention();
     if (!mention) return [];
+    const prefixExtra = prefixSearchCache.get(mention.query.trim()) ?? [];
+    const key = `${mention.query}|${workspaceEntriesVersion}|${attachedFiles.join(',')}|${attachedDirs.join(',')}|${attachedImages.map(i => i.path).join(',')}|${prefixExtra.length}`;
+    if (key === cachedAtKey) return cachedAtResult;
+
     const imagePaths = new Set(attachedImages.map(image => image.path));
-    return filterWorkspaceEntries(
-      workspaceEntries.filter(entry =>
-        entry.kind === 'dir'
-          ? !attachedDirs.includes(entry.path)
-          : !attachedFiles.includes(entry.path) && !imagePaths.has(entry.path)),
-      mention.query,
-      10,
-    );
+    const combined = prefixExtra.length ? [...workspaceEntries, ...prefixExtra] : workspaceEntries;
+    const seen = new Set<string>();
+    const available: WorkspaceEntry[] = [];
+    for (const entry of combined) {
+      if (seen.has(entry.path)) continue;
+      seen.add(entry.path);
+      if (entry.kind === 'dir' ? attachedDirs.includes(entry.path) : (attachedFiles.includes(entry.path) || imagePaths.has(entry.path))) {
+        continue;
+      }
+      available.push(entry);
+    }
+    const matches = filterWorkspaceEntries(available, mention.query, 10);
+    cachedAtKey = key;
+    cachedAtResult = matches;
+    if ((workspaceEntries.length >= 2_400 || (mention.query.includes('/') && matches.length < 5)) && !prefixExtra.length) {
+      triggerPrefixSearch(mention.query);
+    }
+    return matches;
   }
 
   function isDirectoryTarget(targetPath: string): boolean {
@@ -1574,593 +1744,10 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     return choices.filter(choice => `${choice.label} ${choice.detail}`.toLowerCase().includes(query));
   }
 
-  function renderPrefsPanel(): JSX.Element {
-    const pages = [
-      { id: 'appearance', label: 'Appearance & UI', icon: 'appearance' as const },
-      { id: 'session', label: 'Session & Model', icon: 'model' as const },
-      { id: 'permissions', label: 'Permissions & Sandbox', icon: 'shield' as const },
-      { id: 'keys', label: 'Keybindings', icon: 'keyboard' as const },
-    ];
-    const leadByPage: Record<string, string> = {
-      appearance: 'Transcript rendering, diff layout, and composer settings saved locally for agy-tern.',
-      session: 'Dynamic session options supplied by agy over ACP. Changes apply to the active session.',
-      permissions: 'Session mode reported by agy and sandbox boundary status.',
-      keys: 'Keyboard shortcuts for the native composer, transcript, and one-time approvals.',
-    };
-    const lockReason = busy || changingConfig || !!sessionOperation || disconnected || !agent
-      ? 'Wait until the active session is idle and connected'
-      : undefined;
-    const sessionRows: PrefsRow[] = metadata.configOptions.map(option => ({
-      id: `cfg:${option.id}`,
-      label: option.name,
-      hint: option.description ?? option.id,
-      disabled: lockReason,
-      control: option.type === 'boolean'
-        ? { k: 'switch', on: Boolean(option.currentValue) }
-        : {
-          k: 'choice',
-          value: option.currentValue,
-          style: configValues(option).length <= 3 ? 'segmented' : 'menu',
-          options: configValues(option).map(entry => ({
-            value: entry.value,
-            label: entry.name,
-            detail: entry.description ?? undefined,
-          })),
-        },
-    }));
-    const mode = modeOption();
-    return <prefs key="prefs" title="agy-tern settings" page={prefsPage}
-      lead={leadByPage[prefsPage]} query={panelDraft.text} cursor={panelDraft.cursor}
-      pages={pages}
-      sections={[
-        {
-          id: 'transcript',
-          title: 'Transcript & Diffs',
-          page: 'appearance',
-          rows: [
-            {
-              id: 'diffMode',
-              label: 'Diff layout',
-              hint: 'How file edit diffs render inside tool cards',
-              changed: userPrefs.diffMode !== DEFAULT_PREFS.diffMode,
-              defaultLabel: DEFAULT_PREFS.diffMode,
-              control: {
-                k: 'choice',
-                value: userPrefs.diffMode,
-                style: 'segmented',
-                options: [
-                  { value: 'auto', label: 'Auto' },
-                  { value: 'unified', label: 'Unified' },
-                  { value: 'split', label: 'Split' },
-                ],
-              },
-            },
-            {
-              id: 'toolDisplay',
-              label: 'Tool activity default',
-              hint: 'Compact collapses read/search/command bodies until clicked; Expanded opens all tools',
-              changed: userPrefs.toolDisplay !== DEFAULT_PREFS.toolDisplay,
-              defaultLabel: DEFAULT_PREFS.toolDisplay,
-              control: {
-                k: 'choice',
-                value: userPrefs.toolDisplay,
-                style: 'segmented',
-                options: [
-                  { value: 'compact', label: 'Compact' },
-                  { value: 'expanded', label: 'Expanded' },
-                ],
-              },
-            },
-            {
-              id: 'thoughtExpanded',
-              label: 'Expand Thought blocks by default',
-              hint: 'Keep agent reasoning open automatically instead of collapsed as Thought >',
-              changed: userPrefs.thoughtExpanded !== DEFAULT_PREFS.thoughtExpanded,
-              control: { k: 'switch', on: userPrefs.thoughtExpanded },
-            },
-            {
-              id: 'transcriptDensity',
-              label: 'Transcript density',
-              hint: 'Comfortable adds turn dividers and avatars; Compact tightens spacing',
-              changed: userPrefs.transcriptDensity !== DEFAULT_PREFS.transcriptDensity,
-              defaultLabel: DEFAULT_PREFS.transcriptDensity,
-              control: {
-                k: 'choice',
-                value: userPrefs.transcriptDensity,
-                style: 'segmented',
-                options: [
-                  { value: 'comfortable', label: 'Comfortable' },
-                  { value: 'compact', label: 'Compact' },
-                ],
-              },
-            },
-            {
-              id: 'showTimestamps',
-              label: 'Show turn timestamps',
-              hint: 'Display HH:MM timestamps on messages and turn dividers',
-              changed: userPrefs.showTimestamps !== DEFAULT_PREFS.showTimestamps,
-              control: { k: 'switch', on: userPrefs.showTimestamps },
-            },
-            {
-              id: 'autoPreviewMedia',
-              label: 'Auto-open modal popup for images during turns',
-              hint: 'Default off: screenshots and images display inline; click any image to open its modal preview',
-              changed: userPrefs.autoPreviewMedia !== DEFAULT_PREFS.autoPreviewMedia,
-              control: { k: 'switch', on: userPrefs.autoPreviewMedia },
-            },
-            {
-              id: 'notifyOnTurnComplete',
-              label: 'Terminal attention notifications',
-              hint: 'Notify terminal when long turns (>= 8s) finish or approvals await',
-              changed: userPrefs.notifyOnTurnComplete !== DEFAULT_PREFS.notifyOnTurnComplete,
-              control: { k: 'switch', on: userPrefs.notifyOnTurnComplete },
-            },
-          ],
-        },
-        {
-          id: 'composer',
-          title: 'Composer & Dock',
-          page: 'appearance',
-          rows: [
-            {
-              id: 'composerLines',
-              label: 'Composer max lines',
-              hint: 'Maximum visible lines before the input box scrolls',
-              changed: userPrefs.composerLines !== DEFAULT_PREFS.composerLines,
-              defaultLabel: String(DEFAULT_PREFS.composerLines),
-              control: {
-                k: 'choice',
-                value: String(userPrefs.composerLines),
-                style: 'segmented',
-                options: [
-                  { value: '4', label: '4 lines' },
-                  { value: '6', label: '6 lines' },
-                  { value: '10', label: '10 lines' },
-                ],
-              },
-            },
-            {
-              id: 'showKeyLegend',
-              label: 'Show shortcut legend below dock',
-              hint: 'Approval shortcuts still appear automatically while a permission prompt is active',
-              changed: userPrefs.showKeyLegend !== DEFAULT_PREFS.showKeyLegend,
-              control: { k: 'switch', on: userPrefs.showKeyLegend },
-            },
-            {
-              id: 'resetPrefs',
-              label: 'Reset local UI preferences',
-              hint: 'Restore default transcript and composer settings without touching agy session config',
-              control: { k: 'action', act: 'reset-prefs', label: 'Reset defaults' },
-            },
-          ],
-        },
-        {
-          id: 'acp-session',
-          title: sessionRows.length ? 'Server Session Options' : 'No ACP Options Reported',
-          page: 'session',
-          rows: sessionRows.length ? sessionRows : [{
-            id: 'no-acp-options',
-            label: 'No session settings supplied by agy',
-            hint: 'Available options appear here after ACP session creation',
-          }],
-        },
-        {
-          id: 'model-memory',
-          title: 'Model Defaults & Memory',
-          page: 'session',
-          rows: [
-            {
-              id: 'rememberModel',
-              label: 'Remember last selected model & thinking level',
-              hint: `Falls back to ${DEFAULT_MODEL_ID} (${DEFAULT_THINKING_ID}) for new sessions until changed`,
-              changed: userPrefs.rememberModel !== DEFAULT_PREFS.rememberModel,
-              control: { k: 'switch', on: userPrefs.rememberModel },
-            },
-            {
-              id: 'clearRememberedModel',
-              label: 'Reset remembered model choice',
-              hint: userPrefs.lastModel || userPrefs.lastThinking
-                ? `Saved: ${userPrefs.lastModel ?? DEFAULT_MODEL_ID} · ${userPrefs.lastThinking ?? DEFAULT_THINKING_ID}`
-                : `Using built-in default (${DEFAULT_MODEL_ID} · ${DEFAULT_THINKING_ID})`,
-              changed: !!(userPrefs.lastModel || userPrefs.lastThinking),
-              control: { k: 'action', act: 'clear-remembered-model', label: 'Use default' },
-            },
-          ],
-        },
-        {
-          id: 'perms-summary',
-          title: 'Sandbox & Mode',
-          page: 'permissions',
-          rows: [
-            ...(mode && mode.type === 'select' ? [{
-              id: `cfg:${mode.id}`,
-              label: mode.name,
-              hint: 'Session mode supplied by agy; Plan mode does not verify read-only OS enforcement',
-              disabled: lockReason,
-              control: {
-                k: 'choice' as const,
-                value: mode.currentValue,
-                style: 'segmented' as const,
-                options: configValues(mode).map(entry => ({ value: entry.value, label: entry.name })),
-              },
-            }] : []),
-            {
-              id: 'sandbox-flag',
-              label: 'Sandbox status (--sandbox)',
-              hint: 'Requested when launching agy acp; OS containment and allow/deny rules are owned by agy',
-              control: { k: 'action', act: 'open-permissions', label: 'View details' },
-            },
-            {
-              id: 'account-shortcut',
-              label: 'Account & official login',
-              hint: 'Manage shared agy CLI authentication or check quota',
-              control: { k: 'action', act: 'open-account', label: 'Open Account' },
-            },
-          ],
-        },
-        {
-          id: 'keys-list',
-          title: 'Shortcuts',
-          page: 'keys',
-          rows: [
-            { id: 'k-send', label: 'Send message', control: { k: 'keys', keys: [['enter']] } },
-            { id: 'k-newline', label: 'Insert newline', control: { k: 'keys', keys: [['shift', 'enter']] } },
-            { id: 'k-line-edges', label: 'Line start / end (shell style)', control: { k: 'keys', keys: [['ctrl', 'a'], ['ctrl', 'e']] } },
-            { id: 'k-words', label: 'Jump by word', control: { k: 'keys', keys: [['ctrl', 'left'], ['ctrl', 'right']] } },
-            { id: 'k-lines-hist', label: 'Move line / prompt history (when empty)', control: { k: 'keys', keys: [['up'], ['down']] } },
-            { id: 'k-kill', label: 'Delete word / line start / line end', control: { k: 'keys', keys: [['ctrl', 'w'], ['ctrl', 'u'], ['ctrl', 'k']] } },
-            { id: 'k-undo', label: 'Undo composer edit', control: { k: 'keys', keys: [['ctrl', 'z']] } },
-            { id: 'k-slash', label: 'Slash commands', control: { k: 'keys', keys: [['/']] } },
-            { id: 'k-at', label: 'Attach file or image (or paste image path)', control: { k: 'keys', keys: [['@']] } },
-            { id: 'k-stop', label: 'Stop turn / Close modal', control: { k: 'keys', keys: [['esc']] } },
-            { id: 'k-scroll', label: 'Scroll conversation', control: { k: 'keys', keys: [['page_up'], ['page_down']] } },
-            { id: 'k-allow', label: 'Allow / Deny tool once', control: { k: 'keys', keys: [['ctrl', 'y'], ['ctrl', 'n']] } },
-            { id: 'k-quit', label: 'Quit frontend', control: { k: 'keys', keys: [['ctrl', 'q']] } },
-          ],
-        },
-      ]}
-      onAction={{
-        close: closePanel,
-        page: event => {
-          if (typeof event.value === 'string') { prefsPage = event.value; render(); }
-        },
-        'reset-prefs': resetPrefs,
-        'clear-remembered-model': () => {
-          updatePrefs({ lastModel: undefined, lastThinking: undefined });
-          showToast('Remembered model cleared', `Default for new sessions: ${DEFAULT_MODEL_ID} (${DEFAULT_THINKING_ID})`);
-        },
-        'open-permissions': () => openPanel({ kind: 'permissions' }),
-        'open-account': () => openPanel({ kind: 'account' }),
-      }}
-      onChange={event => {
-        const key = event.item;
-        if (!key) return;
-        if (key === 'diffMode' && (event.value === 'auto' || event.value === 'unified' || event.value === 'split')) {
-          updatePrefs({ diffMode: event.value as DiffMode });
-        } else if (key === 'toolDisplay' && (event.value === 'compact' || event.value === 'expanded')) {
-          updatePrefs({ toolDisplay: event.value as ToolDisplay });
-        } else if (key === 'thoughtExpanded' && typeof event.value === 'boolean') {
-          updatePrefs({ thoughtExpanded: event.value });
-        } else if (key === 'transcriptDensity' && (event.value === 'comfortable' || event.value === 'compact')) {
-          updatePrefs({ transcriptDensity: event.value as TranscriptDensity });
-        } else if (key === 'showTimestamps' && typeof event.value === 'boolean') {
-          updatePrefs({ showTimestamps: event.value });
-        } else if (key === 'autoPreviewMedia' && typeof event.value === 'boolean') {
-          updatePrefs({ autoPreviewMedia: event.value });
-        } else if (key === 'notifyOnTurnComplete' && typeof event.value === 'boolean') {
-          updatePrefs({ notifyOnTurnComplete: event.value });
-        } else if (key === 'rememberModel' && typeof event.value === 'boolean') {
-          updatePrefs({ rememberModel: event.value });
-        } else if (key === 'showKeyLegend' && typeof event.value === 'boolean') {
-          updatePrefs({ showKeyLegend: event.value });
-        } else if (key === 'composerLines') {
-          const n = Number(event.value);
-          if (n === 4 || n === 6 || n === 10) updatePrefs({ composerLines: n as ComposerLines });
-        } else if (key.startsWith('cfg:')) {
-          const configId = key.slice(4);
-          const option = metadata.configOptions.find(candidate => candidate.id === configId);
-          if (option && (typeof event.value === 'string' || typeof event.value === 'boolean')) {
-            changeConfig(option, event.value);
-          }
-        }
-      }} />;
-  }
-
-  function renderSelectConfigPicker(option: Extract<SessionConfigOption, { type: 'select' }>): JSX.Element {
-    const query = panelDraft.text.trim().toLowerCase();
-    const groups = groupSelectConfigOptions(option);
-    const visibleGroups = groups
-      .filter(group => pickerTab === 'all' || group.id === pickerTab)
-      .map(group => ({
-        ...group,
-        options: group.options.filter(val =>
-          `${val.name} ${val.value} ${val.description ?? ''}`.toLowerCase().includes(query)),
-      }))
-      .filter(group => group.options.length > 0);
-    const flat = visibleGroups.flatMap(group => group.options.map(val => ({ group, val })));
-    const selectedId = flat.some(entry => entry.val.value === pickerSelected)
-      ? pickerSelected
-      : flat[0]?.val.value ?? '';
-    const highlighted = flat.find(entry => entry.val.value === selectedId);
-    const order: Array<string | PickerGroup> = [];
-    for (const group of visibleGroups) {
-      if (visibleGroups.length > 1 || groups.length > 1) {
-        order.push({ group: group.id, label: group.label, count: group.options.length });
-      }
-      for (const val of group.options) order.push(val.value);
-    }
-    const items: PickerItem[] = flat.map(({ val }) => ({
-      id: val.value,
-      label: val.name,
-      detail: val.description ?? (val.value !== val.name ? val.value : undefined),
-      badges: option.currentValue === val.value ? [{ text: 'Current', tone: 'success' }] : undefined,
-      node: 'pv',
-    }));
-    const totalCount = groups.reduce((sum, group) => sum + group.options.length, 0);
-    const tabs = groups.length > 1
-      ? [
-        { id: 'all', label: 'All', count: totalCount },
-        ...groups.map(group => ({ id: group.id, label: group.label, count: group.options.length })),
-      ]
-      : undefined;
-
-    const modalSize = currentResponsiveLayout().panelSize;
-    return <picker key="picker" size={modalSize} title={option.name} icon={option.category === 'model' || option.id === 'model' ? 'model' : 'settings'}
-      subtitle={option.description ?? 'Options supplied by the active agy ACP session'}
-      placeholder={`Search ${option.name.toLowerCase()}...`}
-      query={panelDraft.text} cursor={panelDraft.cursor}
-      tabs={tabs} tab={tabs ? pickerTab : undefined}
-      order={order} items={items} selected={selectedId} current={[option.currentValue]}
-      state={changingConfig ? 'loading' : panelError ? 'error' : 'ready'}
-      message={changingConfig ? `Applying ${option.name} through agy...` : panelError || (busy ? 'Wait for the active turn before changing this option.' : undefined)}
-      empty="No matching options supplied by this agy session."
-      preview={highlighted ? 'below' : 'none'}
-      actions={[
-        { id: 'close', label: 'Close', keys: ['esc'] },
-        { id: 'apply', label: `Use ${option.name.toLowerCase()}`, primary: true, keys: ['enter'],
-          disabled: (!highlighted || busy || changingConfig || disconnected) ? true : undefined },
-      ]}
-      onSelect={event => { pickerSelected = event.item; render(); }}
-      onActivate={event => {
-        if (!busy && !changingConfig && !disconnected) changeConfig(option, event.item);
-      }}
-      onAction={{
-        close: closePanel,
-        tab: event => {
-          if (typeof event.value === 'string') { pickerTab = event.value; render(); }
-        },
-        apply: () => {
-          if (highlighted && !busy && !changingConfig && !disconnected) changeConfig(option, highlighted.val.value);
-        },
-      }}>
-      {highlighted && <kv key="pv" items={[
-        { k: 'Name', v: highlighted.val.name },
-        { k: 'Option ID', v: highlighted.val.value },
-        { k: 'Group', v: highlighted.group.label },
-        ...(highlighted.val.description ? [{ k: 'Description', v: highlighted.val.description }] : []),
-        { k: 'Status', v: highlighted.val.value === option.currentValue ? 'Active in session' : 'Available via ACP metadata' },
-      ]} />}
-    </picker>;
-  }
-
-  function renderSessionsPicker(): JSX.Element {
-    const rows = new Map(listedSessions.map(row => [row.sessionId, row]));
-    if (activeSessionId) rows.set(activeSessionId, sessionInfo.get(activeSessionId) ?? { sessionId: activeSessionId, cwd: options.cwd });
-    const allRows = [...rows.values()];
-    const namedRows = allRows.filter(row => !!localNames.get(row.sessionId));
-    const filtered = filterSessionRows(allRows, localNames, activeSessionId, sessionTitle, pickerTab, panelDraft.text);
-    const selectedId = filtered.some(row => row.sessionId === pickerSelected)
-      ? pickerSelected
-      : filtered[0]?.sessionId ?? '';
-    const highlighted = filtered.find(row => row.sessionId === selectedId);
-    const items: PickerItem[] = filtered.map(row => {
-      const badges = [
-        ...(row.sessionId === activeSessionId ? [{ text: 'Current', tone: 'success' as const }] : []),
-        ...(previousSessionId && row.sessionId === previousSessionId ? [{ text: 'Previous', tone: 'info' as const }] : []),
-        ...(localNames.get(row.sessionId) ? [{ text: 'Local name', tone: 'accent' as const }] : []),
-      ];
-      return {
-        id: row.sessionId,
-        label: sessionTitle(row.sessionId),
-        detail: `${row.updatedAt ?? 'No timestamp'} · ${row.sessionId.slice(0, 12)}`,
-        badges: badges.length ? badges : undefined,
-        disabled: row.sessionId !== activeSessionId && !agent?.capabilities.loadSession
-          ? 'agy does not advertise loading previous sessions' : undefined,
-        node: 'pv',
-      };
-    });
-    const cannotSwitch = busy || changingConfig || !!sessionOperation || disconnected;
-    const modalSize = currentResponsiveLayout().panelSize;
-    return <picker key="picker" size={modalSize} title="Workspace conversations" icon="history"
-      subtitle={`Filtered by cwd reported by agy (${options.cwd}); original workspace is not verified.`}
-      placeholder="Search conversations by title, local name, or ID..."
-      query={panelDraft.text} cursor={panelDraft.cursor}
-      tabs={[
-        { id: 'all', label: 'All', count: allRows.length },
-        { id: 'named', label: 'Local named', count: namedRows.length },
-      ]}
-      tab={pickerTab}
-      order={filtered.map(row => row.sessionId)}
-      items={items} selected={selectedId}
-      current={activeSessionId ? [activeSessionId] : undefined}
-      state={sessionOperation || (sessionsLoading && !listedSessions.length) ? 'loading' : panelError ? 'error' : 'ready'}
-      message={sessionOperation ?? (sessionsLoading ? 'Syncing conversations from agy...' : panelError || (!agent?.capabilities.listSessions ? 'agy does not advertise session listing.' : undefined))}
-      empty="No saved conversations matched your filter."
-      preview={highlighted ? 'below' : 'none'}
-      actions={[
-        { id: 'new', label: 'New', disabled: cannotSwitch ? (true as const) : undefined },
-        { id: 'rename', label: 'Rename', disabled: (cannotSwitch || !activeSessionId) ? (true as const) : undefined },
-        ...(agent?.capabilities.listSessions ? [{ id: 'refresh', label: 'Refresh', disabled: cannotSwitch ? (true as const) : undefined }] : []),
-        ...(nextSessionsCursor ? [{ id: 'more', label: 'Load older', disabled: cannotSwitch ? (true as const) : undefined }] : []),
-        ...(agent?.capabilities.resumeSession ? [{ id: 'resume', label: 'Fast resume',
-          disabled: (cannotSwitch || !highlighted || highlighted.sessionId === activeSessionId) ? (true as const) : undefined }] : []),
-        ...(agent?.capabilities.closeSession ? [{ id: 'closeSession', label: 'Close session',
-          disabled: (cannotSwitch || !highlighted || highlighted.sessionId === activeSessionId) ? (true as const) : undefined }] : []),
-        { id: 'close', label: 'Close', keys: ['esc'] },
-        { id: 'open', label: 'Open', primary: true, keys: ['enter'],
-          disabled: (cannotSwitch || !highlighted || (highlighted.sessionId !== activeSessionId && !agent?.capabilities.loadSession)) ? (true as const) : undefined },
-      ]}
-      onSelect={event => { pickerSelected = event.item; render(); }}
-      onActivate={event => {
-        if (!cannotSwitch) openConversation(event.item);
-      }}
-      onAction={{
-        close: closePanel,
-        tab: event => {
-          if (typeof event.value === 'string') { pickerTab = event.value; render(); }
-        },
-        new: newConversation,
-        rename: () => openPanel({ kind: 'rename', sessionId: activeSessionId }),
-        refresh: () => loadSessions(),
-        more: () => loadSessions(true),
-        resume: () => {
-          if (highlighted && !cannotSwitch) openConversation(highlighted.sessionId, 'resume');
-        },
-        closeSession: () => {
-          if (highlighted && !cannotSwitch && highlighted.sessionId !== activeSessionId) closeSavedSession(highlighted.sessionId);
-        },
-        open: () => {
-          if (highlighted && !cannotSwitch) openConversation(highlighted.sessionId, 'load');
-        },
-      }}>
-      {highlighted && <kv key="pv" items={[
-        { k: 'Title', v: sessionTitle(highlighted.sessionId) },
-        { k: 'Session ID', v: highlighted.sessionId },
-        { k: 'Reported cwd', v: highlighted.cwd },
-        { k: 'Updated', v: highlighted.updatedAt ?? 'Not reported' },
-        { k: 'Label source', v: localNames.get(highlighted.sessionId) ? 'Local agy-tern label (not renamed on server)' : 'Reported by agy' },
-      ]} />}
-    </picker>;
-  }
-
-  function renderChangesPicker(): JSX.Element {
-    const query = panelDraft.text.trim().toLowerCase();
-    const sessionDiffs = getSessionDiffs();
-    const filteredEdits = sessionDiffs.filter(item => item.path.toLowerCase().includes(query));
-    const filteredGit = gitChanges.filter(item => `${item.status} ${item.path}`.toLowerCase().includes(query));
-    const usingGit = pickerTab === 'git';
-    const order = usingGit ? filteredGit.map(item => `git:${item.path}`) : filteredEdits.map(item => item.id);
-    const selectedId = order.includes(pickerSelected) ? pickerSelected : (order[0] ?? '');
-    const highlightedEdit = usingGit ? undefined : filteredEdits.find(item => item.id === selectedId);
-    const highlightedGit = usingGit ? filteredGit.find(item => `git:${item.path}` === selectedId) : undefined;
-    const highlightedGitDiff = highlightedGit
-      ? [...sessionDiffs].reverse().find(item => item.path === highlightedGit.path)
-      : undefined;
-    if (highlightedGit && !highlightedGitDiff) {
-      loadGitDiffPreview(highlightedGit);
-    }
-    const cachedGitDiff = highlightedGit ? gitDiffCache.get(highlightedGit.path) : undefined;
-    const highlightedPath = highlightedEdit?.path ?? highlightedGit?.path;
-
-    const items: PickerItem[] = usingGit
-      ? filteredGit.map(entry => ({
-        id: `git:${entry.path}`,
-        label: basename(entry.path),
-        detail: entry.path,
-        badges: [{
-          text: entry.status,
-          tone: entry.status === 'D' ? 'error' as const : entry.status === '?' || entry.status === 'A' ? 'success' as const : 'accent' as const,
-        }],
-        node: 'pv',
-      }))
-      : filteredEdits.map(item => ({
-        id: item.id,
-        label: basename(item.path),
-        detail: item.path,
-        badges: [
-          ...(item.added ? [{ text: `+${item.added}`, tone: 'success' as const }] : []),
-          ...(item.removed ? [{ text: `-${item.removed}`, tone: 'error' as const }] : []),
-        ],
-        node: 'pv',
-      }));
-
-    const modalSize = currentResponsiveLayout().panelSize;
-    return <picker key="picker" size={modalSize} title="Changes" icon="diff"
-      subtitle="Session edits and git status"
-      placeholder="Filter modified paths..."
-      query={panelDraft.text} cursor={panelDraft.cursor}
-      tabs={[
-        { id: 'edits', label: 'Session edits', count: sessionDiffs.length },
-        { id: 'git', label: 'Git status', count: gitChanges.length },
-      ]}
-      tab={usingGit ? 'git' : 'edits'}
-      order={order} items={items} selected={selectedId}
-      state="ready"
-      empty={usingGit ? 'Working tree is clean or git status is unavailable.' : 'No file edits recorded in this conversation yet.'}
-      preview={highlightedPath ? 'below' : 'none'}
-      actions={[
-        { id: 'refresh', label: 'Refresh git' },
-        { id: 'inspect', label: 'Fullscreen', disabled: !highlightedPath ? (true as const) : undefined },
-        { id: 'split', label: 'Tern split',
-          disabled: !highlightedPath || !existsSync(resolve(options.cwd, highlightedPath)) ? (true as const) : undefined },
-        { id: 'close', label: 'Close', keys: ['esc'] },
-        { id: 'attach', label: 'Attach to draft', primary: true, keys: ['enter'],
-          disabled: !highlightedPath ? (true as const) : undefined },
-      ]}
-      onSelect={event => { pickerSelected = event.item; render(); }}
-      onActivate={() => {
-        if (highlightedPath) { closePanel(); attachFile(highlightedPath); }
-      }}
-      onAction={{
-        close: closePanel,
-        tab: event => {
-          if (typeof event.value === 'string') { pickerTab = event.value; pickerSelected = ''; render(); }
-        },
-        refresh: () => {
-          gitDiffCache.clear();
-          void detectGitStatus(options.cwd).then(rows => {
-            if (!quitting) { gitChanges = rows; render(); }
-          }).catch(() => {});
-        },
-        split: () => {
-          const line = highlightedEdit?.hunks[0]?.newStart ?? cachedGitDiff?.hunks[0]?.newStart;
-          if (highlightedPath) openSplit(highlightedPath, line);
-        },
-        inspect: () => {
-          const targetEdit = highlightedEdit ?? highlightedGitDiff;
-          if (targetEdit) {
-            if (targetEdit.newFileText !== undefined) {
-              openInspect(basename(targetEdit.path), { type: 'file', path: targetEdit.path, content: targetEdit.newFileText }, targetEdit.path);
-            } else {
-              openInspect(basename(targetEdit.path), { type: 'diff', path: targetEdit.path, hunks: targetEdit.hunks }, targetEdit.path);
-            }
-          } else if (highlightedGit && cachedGitDiff?.hunks.length) {
-            openInspect(basename(highlightedGit.path), { type: 'diff', path: highlightedGit.path, hunks: cachedGitDiff.hunks }, highlightedGit.path);
-          } else if (highlightedGit) {
-            void readWorkspaceTextPreview(options.cwd, highlightedGit.path).then(preview => {
-              if (!quitting) openInspect(basename(highlightedGit.path), { type: 'file', path: preview.path, content: preview.text, truncated: preview.truncated }, highlightedGit.path);
-            }).catch(() => {});
-          }
-        },
-        attach: () => {
-          if (highlightedPath) { closePanel(); attachFile(highlightedPath); }
-        },
-      }}>
-      {highlightedEdit && (highlightedEdit.newFileText !== undefined
-        ? <code key="pv" numbers path={highlightedEdit.path}>{highlightedEdit.newFileText}</code>
-        : highlightedEdit.hunks.length
-          ? <diff key="pv" mode={userPrefs.diffMode} path={highlightedEdit.path} hunks={highlightedEdit.hunks} />
-          : <kv key="pv" items={[{ k: 'File', v: highlightedEdit.path }, { k: 'Status', v: 'No line delta recorded' }]} />)}
-      {!highlightedEdit && highlightedGit && (highlightedGitDiff
-        ? (highlightedGitDiff.newFileText !== undefined
-          ? <code key="pv" numbers path={highlightedGitDiff.path}>{highlightedGitDiff.newFileText}</code>
-          : <diff key="pv" mode={userPrefs.diffMode} path={highlightedGitDiff.path} hunks={highlightedGitDiff.hunks} />)
-        : cachedGitDiff?.status === 'loading'
-          ? <spinner key="pv" label={`Reading git diff for ${highlightedGit.path}`} />
-          : cachedGitDiff?.hunks.length
-            ? <diff key="pv" mode={userPrefs.diffMode} path={highlightedGit.path} hunks={cachedGitDiff.hunks} />
-            : <kv key="pv" items={[
-              { k: 'Path', v: highlightedGit.path },
-              { k: 'Git status', v: highlightedGit.status },
-              { k: 'Diff', v: 'No text diff (untracked or binary)' },
-            ]} />)}
-    </picker>;
-  }
-
   function inspectFindMatch(match: ReturnType<typeof searchTranscript>[number]): void {
     const entry = match.entry;
     if (entry.type === 'tool') {
-      const imgPath = extractToolImagePaths(entry.call, options.cwd).find(p => existsSync(p));
+      const imgPath = extractToolImagePaths(entry.call, options.cwd).find(p => cachedPathExists(p));
       if (imgPath) {
         const label = formatPathLabel(imgPath, options.cwd);
         openInspect(basename(label), { type: 'image-path', path: imgPath }, label);
@@ -2197,500 +1784,6 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     openInspect(match.label, { type: 'file', path: match.detail || match.label, content: match.preview || match.detail }, match.detail);
   }
 
-  function renderFindPicker(): JSX.Element {
-    const matches = searchTranscript(conversation.entries, options.cwd, panelDraft.text);
-    const tabs = [
-      { id: 'all', label: 'All', count: matches.length },
-      { id: 'message', label: 'Messages', count: matches.filter(m => m.kind === 'message').length },
-      { id: 'tool', label: 'Tools & Diffs', count: matches.filter(m => m.kind === 'tool').length },
-      { id: 'thought', label: 'Thoughts', count: matches.filter(m => m.kind === 'thought').length },
-    ];
-    const filtered = pickerTab === 'all' ? matches : matches.filter(m => m.kind === pickerTab);
-    const order = filtered.map(m => m.id);
-    const selectedId = order.includes(pickerSelected) ? pickerSelected : (order[0] ?? '');
-    const highlighted = filtered.find(m => m.id === selectedId);
-    const items: PickerItem[] = filtered.map(m => ({
-      id: m.id,
-      label: m.label,
-      detail: m.detail,
-      badges: [{ text: m.kind.toUpperCase(), tone: m.kind === 'tool' ? 'info' as const : m.kind === 'plan' ? 'accent' as const : 'neutral' as const }],
-      node: 'pv',
-    }));
-    const hlImgPath = highlighted?.entry.type === 'tool'
-      ? extractToolImagePaths(highlighted.entry.call, options.cwd).find(p => existsSync(p))
-      : undefined;
-
-    const modalSize = currentResponsiveLayout().panelSize;
-    return <picker key="picker" size={modalSize} title="Find" icon="slash"
-      subtitle="Search transcript entries"
-      placeholder="Type keywords to filter transcript..."
-      query={panelDraft.text} cursor={panelDraft.cursor}
-      tabs={tabs}
-      tab={pickerTab}
-      order={order} items={items} selected={selectedId}
-      state="ready"
-      empty={conversation.entries.length ? 'No transcript entries match your search.' : 'Transcript is empty.'}
-      preview={highlighted ? 'below' : 'none'}
-      actions={[
-        { id: 'copy', label: 'Copy', disabled: !highlighted ? (true as const) : undefined },
-        { id: 'jump', label: 'Jump to chat', disabled: !highlighted ? (true as const) : undefined },
-        { id: 'close', label: 'Close', keys: ['esc'] },
-        { id: 'inspect', label: 'Inspect', primary: true, keys: ['enter'],
-          disabled: !highlighted ? (true as const) : undefined },
-      ]}
-      onSelect={event => { pickerSelected = event.item; render(); }}
-      onActivate={() => { if (highlighted) inspectFindMatch(highlighted); }}
-      onAction={{
-        close: closePanel,
-        tab: event => {
-          if (typeof event.value === 'string') { pickerTab = event.value; pickerSelected = ''; render(); }
-        },
-        copy: () => {
-          if (!highlighted) return;
-          void copyToClipboard(highlighted.preview || highlighted.detail).then(copied => {
-            if (!quitting) showToast(copied ? 'Copied match to clipboard' : 'Clipboard unavailable');
-          });
-        },
-        jump: () => {
-          if (!highlighted) return;
-          const targetEntry = highlighted.entry;
-          const idx = conversation.entries.indexOf(targetEntry);
-          if (idx >= 0) {
-            const needed = conversation.entries.length - idx;
-            if (needed > historyVisibleCount) historyVisibleCount = needed + 20;
-          }
-          if (targetEntry.type === 'thought') thoughtFoldOverrides.set(targetEntry.id, true);
-          else if (targetEntry.type === 'tool') toolFoldOverrides.set(targetEntry.id, false);
-          closePanel();
-          surface?.reveal(`main.conversation.${targetEntry.id}`, 'start');
-        },
-        inspect: () => { if (highlighted) inspectFindMatch(highlighted); },
-      }}>
-      {highlighted && <col key="pv" gap="xs">
-        <text><span s="muted">{highlighted.detail}</span></text>
-        {hlImgPath && <col align="center"><media path={hlImgPath} /></col>}
-        <md>{(highlighted.preview || highlighted.detail).slice(0, 1200)}</md>
-      </col>}
-    </picker>;
-  }
-
-  function renderInspectOverlay(p: Extract<Panel, { kind: 'inspect' }>): JSX.Element {
-    const item = p.item;
-    const isMedia = item.type === 'image-path' || item.type === 'image-blob';
-    const isDir = item.type === 'dir';
-    const rLayout = currentResponsiveLayout();
-    const overlaySize = isMedia ? rLayout.panelSize : rLayout.inspectSize;
-    const bodyMaxH = rLayout.inspectBodyMaxH;
-    const copyText = item.type === 'file' ? item.content
-      : item.type === 'diff' ? item.hunks.flatMap(h => h.lines).join('\n')
-      : isDir ? item.preview.entries.map(e => `${e.kind === 'dir' ? `${e.name}/` : e.name}${e.ignored ? ' [gitignored]' : ''}`).join('\n')
-      : undefined;
-    const attachablePath = item.type === 'image-path' || item.type === 'diff' || item.type === 'file'
-      ? item.path
-      : isDir ? item.preview.path : undefined;
-    const cleanInspectDir = isDir ? item.preview.path.replace(/\/+$/, '') : '';
-    const parentInspectDir = isDir && cleanInspectDir.includes('/')
-      ? `${cleanInspectDir.slice(0, cleanInspectDir.lastIndexOf('/'))}/`
-      : isDir && cleanInspectDir && cleanInspectDir !== '.'
-        ? '.'
-        : undefined;
-
-    return <overlay key="panel" anchor="center" modal size={overlaySize}
-      head={p.title}
-      icon={isMedia ? 'file-image' : isDir ? 'folder' : item.type === 'diff' ? 'diff' : 'file'}
-      meta={p.subtitle}
-      end={<button keys={['esc']} variant="quiet" onClick={closePanel}>Close</button>}
-      foot={<row gap="xs" justify="between" align="center" wrap>
-        <text><span s="muted">{item.type === 'file' && item.truncated ? 'Preview truncated at 64 KB · '
-          : isDir && item.preview.truncated ? `Showing ${item.preview.entries.length} of ${item.preview.totalCount} entries · ` : ''}Esc closes without cancelling</span></text>
-        <row gap="xs">
-          {parentInspectDir && <button size="sm" icon="back" onClick={() => {
-            void listDirectoryEntriesPreview(options.cwd, parentInspectDir).then(pv => {
-              if (!quitting) openInspect(pv.path, { type: 'dir', preview: pv }, pv.path);
-            }).catch(() => {});
-          }}>Up</button>}
-          {item.type === 'diff' && <button size="sm" onClick={() => {
-            const next: DiffMode = userPrefs.diffMode === 'auto' ? 'unified' : userPrefs.diffMode === 'unified' ? 'split' : 'auto';
-            updatePrefs({ diffMode: next });
-          }}>Layout: {userPrefs.diffMode}</button>}
-          {copyText !== undefined && <button size="sm" icon="copy" onClick={() => {
-            void copyToClipboard(copyText).then(copied => {
-              if (!quitting) showToast(copied ? 'Copied to clipboard' : 'Clipboard unavailable');
-            });
-          }}>Copy</button>}
-          {attachablePath && !isMedia && existsSync(resolve(options.cwd, attachablePath.replace(/\/+$/, ''))) && <>
-            {!isDir && <button size="sm" icon="split" onClick={() => openSplit(attachablePath)}>Tern split</button>}
-            <button size="sm" variant="primary" onClick={() => {
-              closePanel();
-              attachFile(attachablePath);
-            }}>Attach</button>
-          </>}
-        </row>
-      </row>}>
-      {item.type === 'image-path' && <col align="center" justify="center" gap="sm">
-        <media path={item.path} />
-      </col>}
-      {item.type === 'image-blob' && <col align="center" justify="center" gap="sm">
-        <image blob={item.blob} alt={item.name ?? item.mimeType} />
-      </col>}
-      {item.type === 'diff' && (item.hunks.length
-        ? <scroll max={{ h: bodyMaxH }}><diff mode={userPrefs.diffMode} path={item.path} hunks={item.hunks} /></scroll>
-        : <text><span s="muted">No diff hunks recorded.</span></text>)}
-      {item.type === 'file' && <scroll max={{ h: bodyMaxH }}>
-        <code numbers path={item.path}>{item.content}</code>
-      </scroll>}
-      {isDir && <scroll max={{ h: bodyMaxH }}>
-        <col gap="xs">
-          <kv items={[
-            { k: 'Directory', v: item.preview.path },
-            { k: 'Items', v: String(item.preview.totalCount) },
-          ]} />
-          <list max={{ lines: rLayout.dirListMaxLines }} empty="Directory is empty.">
-            {item.preview.entries.map(entry => <item key={entry.path}
-              icon={entry.kind === 'dir' ? 'folder' : imageMimeType(entry.name) ? 'file-image' : 'file'}
-              label={entry.kind === 'dir' ? `${entry.name}/` : entry.name}
-              detail={entry.ignored ? `${entry.path} [gitignored]` : entry.path}
-              value={entry.ignored ? 'gitignored' : entry.kind === 'dir' ? 'Dir' : 'File'}
-              onClick={() => {
-                if (entry.kind === 'dir') {
-                  void listDirectoryEntriesPreview(options.cwd, entry.path).then(pv => {
-                    if (!quitting) openInspect(pv.path, { type: 'dir', preview: pv }, pv.path);
-                  }).catch(() => {});
-                } else {
-                  closePanel();
-                  attachFile(entry.path);
-                }
-              }} />)}
-          </list>
-        </col>
-      </scroll>}
-    </overlay>;
-  }
-
-  function renderCommandsPicker(): JSX.Element {
-    const all = filterCommands(availableCommands(), panelDraft.text);
-    const tabs = [
-      { id: 'all', label: 'All', count: all.length },
-      { id: 'frontend', label: 'Frontend', count: all.filter(c => commandCategory(c) === 'frontend').length },
-      { id: 'workflow', label: 'Workflows', count: all.filter(c => commandCategory(c) === 'workflow').length },
-      { id: 'skill', label: 'Skills', count: all.filter(c => commandCategory(c) === 'skill').length },
-    ];
-    const filtered = filterCommandsForTab(availableCommands(), pickerTab, panelDraft.text);
-    const order = filtered.map(c => c.name);
-    const selectedId = order.includes(pickerSelected) ? pickerSelected : (order[0] ?? '');
-    const highlighted = filtered.find(c => c.name === selectedId);
-    const items: PickerItem[] = filtered.map(cmd => {
-      const cat = commandCategory(cmd);
-      return {
-        id: cmd.name,
-        label: `/${cmd.name}`,
-        detail: cmd.description,
-        badges: [{
-          text: cat === 'frontend' ? 'Frontend' : cat === 'workflow' ? 'Workflow' : 'Skill',
-          tone: cat === 'frontend' ? 'accent' as const : cat === 'workflow' ? 'info' as const : 'neutral' as const,
-        }],
-        node: 'pv',
-      };
-    });
-    const modalSize = currentResponsiveLayout().panelSize;
-    return <picker key="picker" size={modalSize} title="Commands & skills" icon="slash"
-      subtitle="Frontend, workflows, and skills"
-      placeholder="Filter commands by name or description..."
-      query={panelDraft.text} cursor={panelDraft.cursor}
-      tabs={tabs} tab={pickerTab} order={order} items={items} selected={selectedId}
-      state="ready"
-      empty="No commands match your filter."
-      preview={highlighted ? 'below' : 'none'}
-      actions={[
-        { id: 'fill', label: 'Fill draft', disabled: !highlighted ? (true as const) : undefined },
-        { id: 'close', label: 'Close', keys: ['esc'] },
-        { id: 'run', label: highlighted?.local ? 'Open' : highlighted?.hint ? 'Prepare' : 'Send', primary: true, keys: ['enter'],
-          disabled: !highlighted ? (true as const) : undefined },
-      ]}
-      onSelect={event => { pickerSelected = event.item; render(); }}
-      onActivate={() => { if (highlighted) chooseCommand(highlighted); }}
-      onAction={{
-        close: closePanel,
-        tab: event => {
-          if (typeof event.value === 'string') { pickerTab = event.value; pickerSelected = ''; render(); }
-        },
-        fill: () => { if (highlighted) chooseCommand(highlighted, '', true); },
-        run: () => { if (highlighted) chooseCommand(highlighted); },
-      }}>
-      {highlighted && <col key="pv" gap="xs">
-        <kv items={[
-          { k: 'Command', v: `/${highlighted.name}${highlighted.hint ? ` <${highlighted.hint}>` : ''}` },
-          { k: 'Owner', v: highlighted.local ? 'agy-tern native panel' : `Official agy (${commandCategory(highlighted)})` },
-        ]} />
-        <md>{highlighted.description}</md>
-      </col>}
-    </picker>;
-  }
-
-  function renderMcpPicker(): JSX.Element {
-    const visible = filterMcpServers(mcpServers, 'all', panelDraft.text);
-    const filtered = filterMcpServers(mcpServers, pickerTab, panelDraft.text);
-    const order = filtered.map(s => s.name);
-    const selectedId = order.includes(pickerSelected) ? pickerSelected : (order[0] ?? '');
-    const highlighted = filtered.find(s => s.name === selectedId);
-    const items: PickerItem[] = filtered.map(server => ({
-      id: server.name,
-      label: server.name,
-      detail: server.target || server.type,
-      badges: [
-        { text: server.type, tone: 'neutral' as const },
-        { text: server.status, tone: server.status === 'enabled' ? 'success' as const : 'muted' as const },
-      ],
-      node: 'pv',
-    }));
-    const canToggle = !!highlighted && !extLoading;
-    const targetEnabled = highlighted?.status !== 'enabled';
-    const modalSize = currentResponsiveLayout().panelSize;
-    return <picker key="picker" size={modalSize} title="MCP servers" icon="settings"
-      subtitle="Configured via agy mcp CLI"
-      placeholder="Filter MCP servers..."
-      query={panelDraft.text} cursor={panelDraft.cursor}
-      tabs={[
-        { id: 'all', label: 'All', count: visible.length },
-        { id: 'enabled', label: 'Enabled', count: visible.filter(s => s.status === 'enabled').length },
-        { id: 'disabled', label: 'Disabled', count: visible.filter(s => s.status !== 'enabled').length },
-      ]}
-      tab={pickerTab} order={order} items={items} selected={selectedId}
-      state={extLoading ? 'loading' : panelError ? 'error' : 'ready'}
-      message={extLoading ? 'Querying official `agy mcp`...' : (panelError || undefined)}
-      empty="No MCP servers configured."
-      preview={highlighted ? 'below' : 'none'}
-      actions={[
-        { id: 'refresh', label: 'Refresh', disabled: extLoading ? (true as const) : undefined },
-        { id: 'add', label: 'Add', disabled: extLoading ? (true as const) : undefined },
-        { id: 'remove', label: 'Remove', disabled: !canToggle ? (true as const) : undefined },
-        { id: 'close', label: 'Close', keys: ['esc'] },
-        { id: 'toggle', label: highlighted ? (targetEnabled ? 'Enable' : 'Disable') : 'Toggle', primary: true, keys: ['enter'],
-          disabled: !canToggle ? (true as const) : undefined },
-      ]}
-      onSelect={event => { pickerSelected = event.item; render(); }}
-      onActivate={() => { if (canToggle && highlighted) toggleMcp(highlighted.name, targetEnabled); }}
-      onAction={{
-        close: closePanel,
-        tab: event => {
-          if (typeof event.value === 'string') { pickerTab = event.value; pickerSelected = ''; render(); }
-        },
-        refresh: () => loadExtensions('mcp'),
-        add: () => openPanel({ kind: 'mcp-add' }),
-        remove: () => {
-          if (!canToggle || !highlighted) return;
-          openPanel({
-            kind: 'confirm',
-            title: `Remove MCP server "${highlighted.name}"?`,
-            detail: `Runs \`agy mcp remove ${highlighted.name}\` via official CLI.`,
-            actionLabel: 'Remove MCP server',
-            returnTo: { kind: 'mcp' },
-            onConfirm: () => runRemoveMcp(highlighted.name),
-          });
-        },
-        toggle: () => { if (canToggle && highlighted) toggleMcp(highlighted.name, targetEnabled); },
-      }}>
-      {highlighted && <kv key="pv" items={[
-        { k: 'Server', v: highlighted.name },
-        { k: 'Transport', v: highlighted.type },
-        { k: 'Status', v: highlighted.status },
-        { k: 'Command / URL', v: highlighted.target || 'Not reported' },
-      ]} />}
-    </picker>;
-  }
-
-  function renderPluginsPicker(): JSX.Element {
-    const visible = filterPluginsList(pluginsList, 'all', panelDraft.text);
-    const filtered = filterPluginsList(pluginsList, pickerTab, panelDraft.text);
-    const order = filtered.map(p => p.name);
-    const selectedId = order.includes(pickerSelected) ? pickerSelected : (order[0] ?? '');
-    const highlighted = filtered.find(p => p.name === selectedId);
-    const items: PickerItem[] = filtered.map(plugin => ({
-      id: plugin.name,
-      label: plugin.name,
-      detail: `${plugin.skills.length} skill${plugin.skills.length === 1 ? '' : 's'}${plugin.rules.length ? ` · ${plugin.rules.length} rule` : ''}`,
-      badges: [
-        ...(plugin.version ? [{ text: `v${plugin.version}`, tone: 'neutral' as const }] : []),
-        { text: plugin.enabled ? 'enabled' : 'disabled', tone: plugin.enabled ? 'success' as const : 'muted' as const },
-      ],
-      node: 'pv',
-    }));
-    const canToggle = !!highlighted && !extLoading;
-    const targetEnabled = !(highlighted?.enabled ?? false);
-    const modalSize = currentResponsiveLayout().panelSize;
-    return <picker key="picker" size={modalSize} title="Plugins & skills" icon="compass"
-      subtitle="Installed Antigravity plugins via official `agy plugin list --json`"
-      placeholder="Filter plugins or skill names..."
-      query={panelDraft.text} cursor={panelDraft.cursor}
-      tabs={[
-        { id: 'all', label: 'All', count: visible.length },
-        { id: 'enabled', label: 'Enabled', count: visible.filter(p => p.enabled).length },
-        { id: 'disabled', label: 'Disabled', count: visible.filter(p => !p.enabled).length },
-      ]}
-      tab={pickerTab} order={order} items={items} selected={selectedId}
-      state={extLoading ? 'loading' : panelError ? 'error' : 'ready'}
-      message={extLoading ? 'Reading installed plugins...' : (panelError || undefined)}
-      empty="No plugins match your filter."
-      preview={highlighted ? 'below' : 'none'}
-      actions={[
-        { id: 'refresh', label: 'Refresh', disabled: extLoading ? (true as const) : undefined },
-        ...(highlighted?.enabled && highlighted.skills.length ? [{ id: 'useSkill', label: `Use /${highlighted.skills[0]}`, disabled: extLoading ? (true as const) : undefined }] : []),
-        { id: 'validate', label: 'Validate', disabled: !highlighted?.path || extLoading ? (true as const) : undefined },
-        { id: 'install', label: 'Install', disabled: extLoading ? (true as const) : undefined },
-        { id: 'uninstall', label: 'Uninstall', disabled: !canToggle ? (true as const) : undefined },
-        { id: 'close', label: 'Close', keys: ['esc'] },
-        { id: 'toggle', label: highlighted ? (targetEnabled ? 'Enable' : 'Disable') : 'Toggle', primary: true, keys: ['enter'],
-          disabled: !canToggle ? (true as const) : undefined },
-      ]}
-      onSelect={event => { pickerSelected = event.item; render(); }}
-      onActivate={() => { if (canToggle && highlighted) togglePlugin(highlighted.name, targetEnabled); }}
-      onAction={{
-        close: closePanel,
-        tab: event => {
-          if (typeof event.value === 'string') { pickerTab = event.value; pickerSelected = ''; render(); }
-        },
-        refresh: () => loadExtensions('plugins'),
-        useSkill: () => {
-          const skillName = highlighted?.skills[0];
-          if (!skillName) return;
-          closePanel();
-          draft = { text: `/${skillName} `, cursor: skillName.length + 2 };
-          render();
-          surface?.focus('dock.draft');
-        },
-        validate: () => { if (highlighted && !extLoading) runValidatePlugin(highlighted); },
-        install: () => openPanel({ kind: 'plugin-install' }),
-        uninstall: () => {
-          if (!canToggle || !highlighted) return;
-          openPanel({
-            kind: 'confirm',
-            title: `Uninstall plugin "${highlighted.name}"?`,
-            detail: `Runs \`agy plugin uninstall ${highlighted.name}\` via official CLI.`,
-            actionLabel: 'Uninstall plugin',
-            returnTo: { kind: 'plugins' },
-            onConfirm: () => runUninstallPlugin(highlighted.name),
-          });
-        },
-        toggle: () => { if (canToggle && highlighted) togglePlugin(highlighted.name, targetEnabled); },
-      }}>
-      {highlighted && <col key="pv" gap="xs">
-        <kv items={[
-          { k: 'Plugin', v: `${highlighted.name}${highlighted.version ? ` (v${highlighted.version})` : ''}` },
-          { k: 'Status', v: highlighted.enabled ? 'Enabled' : 'Disabled' },
-          ...(highlighted.source ? [{ k: 'Source', v: highlighted.source }] : []),
-          { k: 'Path', v: highlighted.path || 'Not reported' },
-          ...(highlighted.rules.length ? [{ k: 'Rules', v: highlighted.rules.join(', ') }] : []),
-        ]} />
-        {highlighted.skills.length > 0 && <text wrap="word">
-          <span s="muted">Skills: </span>
-          <span>{highlighted.skills.map(s => `/${s}`).join(', ')}</span>
-        </text>}
-      </col>}
-    </picker>;
-  }
-
-  function renderAgentsPicker(): JSX.Element {
-    const extraDirs = options.additionalDirectories ?? [];
-    const filtered = filterAgentsList(agentsList, panelDraft.text);
-    const order = filtered.map(a => a.name);
-    const selectedId = order.includes(pickerSelected) ? pickerSelected : (order[0] ?? '');
-    const highlighted = filtered.find(a => a.name === selectedId);
-    const items: PickerItem[] = filtered.map(a => ({
-      id: a.name,
-      label: a.name,
-      detail: a.detail || 'Custom agy agent',
-      badges: options.agentName === a.name ? [{ text: 'Active', tone: 'success' as const }] : undefined,
-      node: 'pv',
-    }));
-    const modalSize = currentResponsiveLayout().panelSize;
-    return <picker key="picker" size={modalSize} title="Agents & workspace scope" icon="tern"
-      subtitle={`Active profile: ${options.agentName ?? 'Default'} · Workspace roots: ${1 + extraDirs.length}`}
-      placeholder="Filter agents..."
-      query={panelDraft.text} cursor={panelDraft.cursor}
-      tabs={[{ id: 'all', label: 'Configured agents', count: filtered.length }]}
-      tab="all" order={order} items={items} selected={selectedId}
-      state={extLoading ? 'loading' : panelError ? 'error' : 'ready'}
-      message={extLoading ? 'Checking `agy agent`...' : (panelError || undefined)}
-      empty="No custom agents reported by `agy agent`. Launch with `--agent <name>` or `--add-dir <dir>` to customize scope."
-      preview={highlighted ? 'below' : 'none'}
-      actions={[
-        { id: 'refresh', label: 'Refresh', disabled: extLoading ? (true as const) : undefined },
-        { id: 'close', label: 'Close', primary: true, keys: ['esc'] },
-      ]}
-      onSelect={event => { pickerSelected = event.item; render(); }}
-      onAction={{
-        close: closePanel,
-        refresh: () => loadExtensions('agents'),
-      }}>
-      {highlighted && <kv key="pv" items={[
-        { k: 'Agent', v: highlighted.name },
-        { k: 'Details', v: highlighted.detail || 'Configured in official agy CLI' },
-        { k: 'Launch flag', v: `agy-tern --agent ${highlighted.name}` },
-        ...(extraDirs.length ? [{ k: 'Extra roots (--add-dir)', v: extraDirs.join(', ') }] : []),
-      ]} />}
-    </picker>;
-  }
-
-  function renderTemplatesPicker(): JSX.Element {
-    const filtered = filterTemplatesList(templatesList, panelDraft.text);
-    const order = filtered.map(tpl => tpl.name);
-    const selectedId = order.includes(pickerSelected) ? pickerSelected : (order[0] ?? '');
-    const highlighted = filtered.find(tpl => tpl.name === selectedId);
-    const items: PickerItem[] = filtered.map(tpl => ({
-      id: tpl.name,
-      label: tpl.name,
-      detail: tpl.text.replace(/\s+/g, ' ').slice(0, 72),
-      node: 'pv',
-    }));
-    const insertTemplate = (tpl: PromptTemplate): void => {
-      closePanel();
-      draft = { text: tpl.text, cursor: tpl.text.length };
-      render();
-      surface?.focus('dock.draft');
-    };
-    const modalSize = currentResponsiveLayout().panelSize;
-    return <picker key="picker" size={modalSize} title="Workspace prompt templates" icon="edit"
-      subtitle={`Saved locally per workspace (${workspaceName})`}
-      placeholder="Filter templates..."
-      query={panelDraft.text} cursor={panelDraft.cursor}
-      tabs={[{ id: 'all', label: 'Templates', count: filtered.length }]}
-      tab="all" order={order} items={items} selected={selectedId}
-      state={extLoading ? 'loading' : panelError ? 'error' : 'ready'}
-      message={panelError || undefined}
-      empty="No workspace prompt templates saved yet. Draft a prompt first, then click Save draft."
-      preview={highlighted ? 'below' : 'none'}
-      actions={[
-        { id: 'save', label: 'Save draft', disabled: !draft.text.trim() || extLoading ? (true as const) : undefined },
-        { id: 'delete', label: 'Delete', disabled: !highlighted || extLoading ? (true as const) : undefined },
-        { id: 'close', label: 'Close', keys: ['esc'] },
-        { id: 'insert', label: 'Insert into draft', primary: true, keys: ['enter'],
-          disabled: !highlighted ? (true as const) : undefined },
-      ]}
-      onSelect={event => { pickerSelected = event.item; render(); }}
-      onActivate={() => { if (highlighted) insertTemplate(highlighted); }}
-      onAction={{
-        close: closePanel,
-        save: () => openPanel({ kind: 'template-save' }),
-        delete: () => {
-          if (!highlighted) return;
-          openPanel({
-            kind: 'confirm',
-            title: `Delete template "${highlighted.name}"?`,
-            detail: 'Removes this saved prompt snippet from local workspace storage.',
-            actionLabel: 'Delete template',
-            returnTo: { kind: 'templates' },
-            onConfirm: () => removePromptTemplate(highlighted.name),
-          });
-        },
-        insert: () => { if (highlighted) insertTemplate(highlighted); },
-      }}>
-      {highlighted && <col key="pv" gap="xs">
-        <text><span s="muted">Updated {highlighted.updatedAt.slice(0, 10)}</span></text>
-        <code wrap>{highlighted.text}</code>
-      </col>}
-    </picker>;
-  }
-
   function activeToolSteps(): ToolStep[] {
     return conversation.entries.filter((entry): entry is ToolStep =>
       entry.type === 'tool' && (entry.call.status === 'in_progress' || entry.call.status === 'pending'));
@@ -2708,296 +1801,145 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     openInspect(s.title, { type: 'file', path: 'task.log', content: detailText }, s.target);
   }
 
-  function renderTasksPicker(): JSX.Element {
-    const query = panelDraft.text.trim().toLowerCase();
-    const allTools = conversation.entries
-      .filter((entry): entry is ToolStep => entry.type === 'tool')
-      .slice()
-      .reverse();
-    const filtered = allTools.filter(step => {
-      const summary = summarizeToolCall(step.call, options.cwd);
-      const isRunning = step.call.status === 'in_progress' || step.call.status === 'pending';
-      if (pickerTab === 'running' && !isRunning) return false;
-      if (pickerTab === 'done' && isRunning) return false;
-      if (!query) return true;
-      return `${summary.title} ${summary.target ?? ''} ${step.call.toolCallId}`.toLowerCase().includes(query);
-    });
-    const order = filtered.map(step => step.id);
-    const selectedId = order.includes(pickerSelected) ? pickerSelected : (order[0] ?? '');
-    const highlighted = filtered.find(step => step.id === selectedId);
-    const highlightedSummary = highlighted ? summarizeToolCall(highlighted.call, options.cwd) : undefined;
-    const now = Date.now();
-    const runningCount = allTools.filter(step => step.call.status === 'in_progress' || step.call.status === 'pending').length;
-
-    const items: PickerItem[] = filtered.map(step => {
-      const summary = summarizeToolCall(step.call, options.cwd);
-      const isRunning = step.call.status === 'in_progress' || step.call.status === 'pending';
-      const elapsedMs = isRunning && step.startedAt !== undefined
-        ? Math.max(0, now - step.startedAt)
-        : step.startedAt !== undefined && step.endedAt !== undefined
-          ? Math.max(0, step.endedAt - step.startedAt)
-          : undefined;
-      const elapsedLabel = elapsedMs !== undefined ? `${(elapsedMs / 1000).toFixed(1)}s` : '';
-      return {
-        id: step.id,
-        label: summary.title,
-        detail: [summary.target, elapsedLabel].filter(Boolean).join(' · ') || step.call.toolCallId,
-        badges: [
-          {
-            text: isRunning ? 'Running' : step.call.status === 'failed' ? 'Failed' : 'Done',
-            tone: isRunning ? 'accent' : step.call.status === 'failed' ? 'error' : 'success',
-          },
-          ...(summary.exit !== undefined ? [{ text: `exit ${summary.exit}`, tone: summary.exit === 0 ? ('neutral' as const) : ('error' as const) }] : []),
-        ],
-        node: 'pv',
-      };
-    });
-
-    const modalSize = currentResponsiveLayout().panelSize;
-    return <picker key="picker" size={modalSize} title="Tasks & tool activity" icon="timer"
-      subtitle={busy || runningCount ? `${runningCount} active tool(s) in current turn · Stop cancels the active ACP turn` : `${allTools.length} tool call(s) recorded in this session`}
-      placeholder="Filter tasks by tool, command, or path..."
-      query={panelDraft.text} cursor={panelDraft.cursor}
-      tabs={[
-        { id: 'all', label: 'All', count: allTools.length },
-        { id: 'running', label: 'Running', count: runningCount },
-        { id: 'done', label: 'Finished', count: allTools.length - runningCount },
-      ]}
-      tab={pickerTab}
-      order={order}
-      items={items} selected={selectedId}
-      state="ready"
-      empty={pickerTab === 'running' ? 'No tool tasks are currently running.' : 'No tool activity recorded in this conversation yet.'}
-      preview={highlighted ? 'below' : 'none'}
-      actions={[
-        ...(busy ? [{ id: 'stopTurn', label: cancelling ? 'Stopping...' : 'Stop active turn', keys: ['esc'], disabled: cancelling ? (true as const) : undefined }] : []),
-        { id: 'close', label: 'Close', keys: ['esc'] },
-        { id: 'inspect', label: 'Inspect details', primary: true, keys: ['enter'], disabled: !highlighted ? (true as const) : undefined },
-      ]}
-      onSelect={event => { pickerSelected = event.item; render(); }}
-      onActivate={() => {
-        if (highlighted) inspectTaskStep(highlighted);
-      }}
-      onAction={{
-        close: closePanel,
-        tab: event => {
-          if (typeof event.value === 'string') { pickerTab = event.value; render(); }
-        },
-        stopTurn: () => stop(),
-        inspect: () => {
-          if (highlighted) inspectTaskStep(highlighted);
-        },
-      }}>
-      {highlighted && highlightedSummary && <ToolBody call={highlighted.call} cwd={options.cwd} showRawInput={highlightedSummary.showRawInput}
-        fullCommand={highlightedSummary.fullCommand} diffMode={userPrefs.diffMode}
-        getBlob={blobForImage} onInspect={openInspect} onOpenSplit={openSplit}
-        onCopy={text => { void copyToClipboard(text).then(ok => { if (!quitting) showToast(ok ? 'Copied to clipboard' : 'Clipboard unavailable'); }); }} />}
-    </picker>;
-  }
-
   function renderPanel(): JSX.Element | null {
     if (!panel) return null;
-    const currentPanel = panel;
-    if (currentPanel.kind === 'settings') return renderPrefsPanel();
-    const config = currentPanel.kind === 'config' ? metadata.configOptions.find(option => option.id === currentPanel.id) : undefined;
-    if (currentPanel.kind === 'config' && config?.type === 'select') return renderSelectConfigPicker(config);
-    if (currentPanel.kind === 'commands') return renderCommandsPicker();
-    if (currentPanel.kind === 'mcp') return renderMcpPicker();
-    if (currentPanel.kind === 'plugins') return renderPluginsPicker();
-    if (currentPanel.kind === 'agents') return renderAgentsPicker();
-    if (currentPanel.kind === 'templates') return renderTemplatesPicker();
-    if (currentPanel.kind === 'sessions') return renderSessionsPicker();
-    if (currentPanel.kind === 'changes') return renderChangesPicker();
-    if (currentPanel.kind === 'find') return renderFindPicker();
-    if (currentPanel.kind === 'tasks') return renderTasksPicker();
-    if (currentPanel.kind === 'inspect') return renderInspectOverlay(currentPanel);
-
-    const mode = modeOption();
-    const title = currentPanel.kind === 'report' ? (currentPanel.report === 'usage' ? 'Usage & Quota' : `Official agy /${currentPanel.report}`)
-      : currentPanel.kind === 'permissions' ? 'Permissions & sandbox'
-      : currentPanel.kind === 'rename' ? 'Local conversation name'
-      : currentPanel.kind === 'template-save' ? 'Save prompt template'
-      : currentPanel.kind === 'mcp-add' ? 'Add MCP server'
-      : currentPanel.kind === 'plugin-install' ? 'Install Antigravity plugin'
-      : currentPanel.kind === 'confirm' ? currentPanel.title
-      : currentPanel.kind === 'account' ? 'Account & sign-in'
-      : currentPanel.kind === 'account-switch' ? 'Change shared account?'
-      : config?.name ?? 'Session option';
-    const choices = panelChoices();
-    const selected = Math.min(panelSelection, Math.max(0, choices.length - 1));
-    const quotas = currentPanel.kind === 'report' && currentPanel.report === 'usage' ? parseQuotaReport(reportText) : undefined;
-    const quotaSummary = summarizeQuotaRows(quotas);
-    const contextUsage = formatContextUsage(metadata.usage);
-    const method = loginMethod();
-    const loginProblem = method ? terminalLoginProblem(method) : undefined;
-
-    const rLayout = currentResponsiveLayout();
-    return <overlay key="panel" head={title} modal size={rLayout.panelSize}
-      icon={currentPanel.kind === 'report' ? 'context' : currentPanel.kind === 'permissions' ? 'shield' :
-        currentPanel.kind === 'account' || currentPanel.kind === 'account-switch' ? 'user' : 'slash'}
-      end={<button keys={['esc']} variant="quiet" disabled={authBusy} onClick={closePanel}>Close</button>}>
-      {currentPanel.kind === 'report' ? <>
-        {currentPanel.report === 'usage' ? <col gap="md">
-          <tabs variant="segmented" active={usageTab}
-            items={[
-              { id: 'overview', label: 'Overview' },
-              { id: 'details', label: 'Details' },
-              { id: 'raw', label: 'Raw report' },
-            ]}
-            onChange={event => { usageTab = String(event.value ?? 'overview'); render(); }} />
-          {reportLoading && <spinner label="Reading official /usage report" />}
-          {usageTab === 'overview' && <>
-            <stats items={[
-              {
-                label: 'Tightest quota',
-                value: quotaSummary ? quotaSummary.tightest.remaining : (reportLoading ? 'Loading' : 'Unavailable'),
-                sub: quotaSummary
-                  ? `${quotaSummary.tightest.group} · ${quotaSummary.tightest.limit}${metadata.tier ? ` · ${metadata.tier.name}` : ''}`
-                  : (metadata.tier ? `${metadata.tier.name} · Official CLI /usage` : 'From official CLI /usage'),
-                tone: quotaSummary
-                  ? (quotaSummary.tightest.fraction <= 0.15 ? 'error' : quotaSummary.tightest.fraction <= 0.35 ? 'warning' : 'success')
-                  : 'muted',
-              },
-              {
-                label: 'Model groups',
-                value: quotaSummary ? String(quotaSummary.groupCount) : '0',
-                sub: quotaSummary ? `${quotaSummary.rows.length} tracked limits` : 'Parsed from /usage',
-                tone: 'neutral',
-              },
-              {
-                label: 'Session context',
-                value: contextUsage ? `${contextUsage.percent}%` : 'Not reported',
-                sub: contextUsage ? `${contextUsage.usedLabel} / ${contextUsage.sizeLabel} tokens` : 'Waiting for ACP usage_update',
-                tone: contextUsage ? 'info' : 'muted',
-              },
-            ]} />
-            {quotaSummary ? <table cols={[
-              { id: 'group', head: 'Model group', grow: 1, priority: 4 },
-              { id: 'limit', head: 'Limit', priority: 2 },
-              { id: 'meter', head: 'Quota bar', priority: 3 },
-              { id: 'remaining', head: 'Left', align: 'end', mono: true, priority: 4 },
-              { id: 'reset', head: 'Reset', mono: true, priority: 1 },
-            ]} rows={quotaSummary.rows.map((row, index) => ({
-              id: `quota-${index}`,
-              cells: {
-                group: row.group,
-                limit: row.limit,
-                meter: { meter: {
-                  value: row.fraction,
-                  tone: row.fraction <= 0.15 ? 'error' : row.fraction <= 0.35 ? 'warning' : 'success',
-                } },
-                remaining: row.remaining,
-                reset: row.reset,
-              },
-              title: `${row.group}: ${row.limit}, ${row.remaining} remaining, reset ${row.reset}`,
-            }))} /> : reportText && <md>{reportText}</md>}
-          </>}
-          {usageTab === 'details' && <>
-            {(metadata.tier || metadata.usage) ? <kv items={[
-              ...(metadata.tier ? [{ k: 'Subscription tier', v: metadata.tier.name }] : []),
-              ...(metadata.usage ? [
-                { k: 'Session context tokens', v: metadata.usage.used.toLocaleString() },
-                { k: 'Context window', v: metadata.usage.size.toLocaleString() },
-                ...(metadata.usage.cost ? [{ k: 'Session cost', v: `${metadata.usage.cost.amount} ${metadata.usage.cost.currency}` }] : []),
-              ] : []),
-            ]} /> : <text>No session-context usage or plan tier has been reported by ACP yet.</text>}
-            {quotas ? <table cols={[
-              { id: 'group', head: 'Model group', grow: 1, priority: 4 },
-              { id: 'limit', head: 'Limit', priority: 2 },
-              { id: 'remaining', head: 'Remaining', align: 'end', mono: true, priority: 3 },
-              { id: 'reset', head: 'Reset', mono: true, priority: 1 },
-            ]} rows={quotas.map((row, index) => ({
-              id: `detail-${index}`,
-              cells: { group: row.group, limit: row.limit, remaining: row.remaining, reset: row.reset },
-            }))} /> : reportText && <md>{reportText}</md>}
-          </>}
-          {usageTab === 'raw' && (reportText
-            ? <code wrap>{reportText}</code>
-            : <text><span s="muted">No raw report output captured yet.</span></text>)}
-        </col> : <>
-          {reportLoading && <spinner label={`Reading official /${currentPanel.report} report`} />}
-          {reportText && <md>{reportText}</md>}
-        </>}
-        {panelError && <text wrap="word"><span s="error">{panelError}</span></text>}
-        <button keys={['enter']} on={panelSelection % 2 === 0} disabled={reportLoading && 'Report is loading'}
-          onClick={() => loadReport(currentPanel.report)}>Refresh report</button>
-        <text wrap="word">Tab selects Refresh or Close. Enter activates; Esc returns to the conversation.</text>
-      </> : <>
-        {currentPanel.kind === 'account' && <>
-          <kv items={[
-            { k: 'ACP connection', v: disconnected ? 'Disconnected' : agent ? 'Connected; model access not guaranteed' : 'Connecting' },
-            { k: 'Subscription tier', v: metadata.tier ? metadata.tier.name : 'Not reported by ACP' },
-            { k: 'Account identity', v: 'Not exposed by this ACP connection' },
-            { k: 'Credential owner', v: 'Official agy shared authentication' },
-          ]} />
-          <text wrap="word">Sign in through agy’s interactive flow. This frontend stores no accounts or tokens. Switching requires signing in again, not selecting a saved-account pool. Login reconnects a fresh session and keeps your unsent draft.</text>
-          {!authenticationKnown && <text wrap="word">{disconnected ? 'No login descriptor received. Use the official CLI terminal login from your shell.' : 'Waiting for agy to advertise sign-in options.'}</text>}
-          {authenticationKnown && !method && <text>agy did not advertise terminal sign-in support.</text>}
-          {loginProblem && <text wrap="word"><span s="error">{loginProblem}</span></text>}
-          {method && !loginProblem && <code wrap>{JSON.stringify([options.executable ?? 'agy', 'acp', '--sandbox', ...(method.args ?? [])])}</code>}
-          {(busy || changingConfig || sessionOperation) && <text>Wait for the active operation before signing in or changing accounts.</text>}
-        </>}
-        {currentPanel.kind === 'account-switch' && <>
-          <text wrap="word">This signs out first. Antigravity shares credentials across CLI, App and IDE extensions, so they may also lose their login. If login is cancelled, the old credentials are not restored.</text>
-          <text wrap="word">Choose your other account in the official login flow. Afterwards this frontend starts a fresh session and keeps only your unsent draft. It does not replay the failed prompt or automatically transfer the old conversation.</text>
-          {method && <code wrap>{JSON.stringify([options.executable ?? 'agy', 'acp', '--sandbox', ...(method.args ?? [])])}</code>}
-        </>}
-        {currentPanel.kind === 'permissions' && <>
-          <kv items={[
-            { k: 'Session mode', v: mode ? configLabel(mode) : 'Not reported by agy' },
-            { k: 'Agent profile', v: options.agentName ?? 'Default' },
-            { k: 'Workspace roots', v: options.additionalDirectories?.length ? `${options.cwd} (+${options.additionalDirectories.length} --add-dir)` : options.cwd },
-            { k: 'Sandbox flag', v: '--sandbox requested' },
-            { k: 'OS containment', v: 'Not reported through ACP; not verified' },
-            { k: 'ACP capabilities', v: [
-              ...(agent?.promptCapabilities?.image ? ['image'] : []),
-              ...(agent?.promptCapabilities?.embeddedContext ? ['embeddedContext'] : []),
-              ...(agent?.capabilities.loadSession ? ['load'] : []),
-              ...(agent?.capabilities.resumeSession ? ['resume'] : []),
-              ...(agent?.capabilities.closeSession ? ['close'] : []),
-              ...(agent?.capabilities.additionalDirectories ? ['add-dir'] : []),
-            ].join(', ') || 'Connecting...' },
-            { k: 'Effective allow/deny rules', v: 'Owned by agy; not reported through ACP' },
-            { k: 'Frontend approvals', v: 'One-time allow or deny only; never automatic' },
-          ]} />
-          <text wrap="word">Existing agy rules can run tools without another prompt. Plan mode does not prove read-only access.</text>
-          <text wrap="word">No permission bypass flag is enabled. This frontend does not provide filesystem or terminal RPC.</text>
-        </>}
-        {currentPanel.kind === 'rename' && <text wrap="word">Local to agy-tern; does not rename the conversation in Antigravity. Up to 160 characters. Leave empty to use agy’s title.</text>}
-        {currentPanel.kind === 'template-save' && <text wrap="word">Enter a short template name (e.g. review-diff). Saved locally per workspace in your XDG state directory.</text>}
-        {currentPanel.kind === 'mcp-add' && <text wrap="word">Syntax: [--type stdio|http] &lt;name&gt; &lt;commandOrUrl&gt; [args...]. Executed via `agy mcp add`.</text>}
-        {currentPanel.kind === 'plugin-install' && <text wrap="word">Enter a local plugin directory path or `plugin@marketplace` identifier. Executed via `agy plugin install`.</text>}
-        {currentPanel.kind === 'confirm' && <text wrap="word">{currentPanel.detail}</text>}
-        {currentPanel.kind !== 'permissions' && currentPanel.kind !== 'account' && currentPanel.kind !== 'account-switch' && currentPanel.kind !== 'confirm' && <input key="query"
-          aria={currentPanel.kind === 'rename' ? 'Local conversation name' : currentPanel.kind === 'template-save' ? 'Template name'
-            : currentPanel.kind === 'mcp-add' ? 'MCP server command' : currentPanel.kind === 'plugin-install' ? 'Plugin target'
-            : `Filter ${title.toLowerCase()}`}
-          text={panelDraft.text} cursor={panelDraft.cursor} anchor={panelDraft.anchor}
-          placeholder={currentPanel.kind === 'rename' ? 'Conversation name (local)'
-            : currentPanel.kind === 'template-save' ? 'e.g. audit-security'
-            : currentPanel.kind === 'mcp-add' ? 'e.g. --type stdio github npx -y @modelcontextprotocol/server-github'
-            : currentPanel.kind === 'plugin-install' ? 'e.g. /path/to/plugin or my-plugin@official'
-            : `Filter ${title.toLowerCase()}`}
-          onFocus={() => surface?.focus('layer.panel.query')}
-          onEdit={event => { panelDraft = editDraft(panelDraft, event); panelSelection = 0; render(); }} />}
-        {panelError && <text wrap="word"><span s="error">{panelError}</span></text>}
-        <list key="choices" selected={`layer.panel.choices.row-${selected}`} max={{ lines: rLayout.modalListMaxLines }}
-          empty="No matching choices.">
-          {choices.map((choice, index) => <item key={`row-${index}`} label={choice.label} detail={choice.detail}
-            value={choice.value} title={`${choice.label}: ${choice.detail}`}
-            disabled={choice.disabled || authBusy || changingConfig || !!sessionOperation || (currentPanel.kind === 'config' && busy) ||
-              (currentPanel.kind === 'rename' && busy)}
-            onClick={choice.choose} />)}
-        </list>
-        {extLoading && <spinner label="Running official agy CLI command" />}
-        {changingConfig && <spinner label="Applying the session option through agy" />}
-        {sessionOperation && <spinner label={sessionOperation} />}
-        {authBusy && <spinner label="Preparing official login; signing out if confirmed" />}
-        {currentPanel.kind === 'config' && busy && <text>Wait for the active turn before changing this option.</text>}
-        {currentPanel.kind === 'rename' && busy && <text>Wait for the active turn before changing conversation names.</text>}
-        <text wrap="word">Up/Down or Tab selects; Enter chooses; Esc closes. Hover a row for its full description.</text>
-      </>}
-    </overlay>;
+    return renderActivePanel({
+      panel,
+      options,
+      workspaceName,
+      rLayout: currentResponsiveLayout(),
+      agent,
+      metadata,
+      authentication,
+      authenticationKnown,
+      disconnected,
+      agentConnecting,
+      authBusy,
+      busy,
+      cancelling,
+      changingConfig,
+      extLoading,
+      reportLoading,
+      reportText,
+      sessionsLoading,
+      sessionOperation,
+      activeSessionId,
+      previousSessionId,
+      listedSessions,
+      nextSessionsCursor,
+      sessionInfo,
+      localNames,
+      sessionPreviews: sessionPreviewCache,
+      mcpServers,
+      pluginsList,
+      agentsList,
+      templatesList,
+      gitChanges,
+      gitDiffCache,
+      entries: conversation.entries,
+      draftText: draft.text,
+      panelDraft,
+      panelSelection,
+      pickerTab,
+      pickerSelected,
+      prefsPage,
+      usageTab,
+      panelError,
+      userPrefs,
+      commands: availableCommands(),
+      sessionDiffs: panel.kind === 'changes' ? getSessionDiffs() : [],
+      choices: panelChoices(),
+      loginMethod: loginMethod(),
+      modeOption: modeOption(),
+      sessionTitle,
+      blobForImage,
+      onRender: render,
+      onFocus: target => surface?.focus(target),
+      onEditPanelDraft: (event: EditEvent) => {
+        panelDraft = editDraft(panelDraft, event);
+        panelSelection = 0;
+        render();
+      },
+      onSetPickerTab: (tab, clearSelected) => {
+        pickerTab = tab;
+        if (clearSelected) pickerSelected = '';
+        render();
+      },
+      onSetPickerSelected: item => {
+        pickerSelected = item;
+        render();
+      },
+      onSetPrefsPage: page => {
+        prefsPage = page;
+        render();
+      },
+      onSetUsageTab: tab => {
+        usageTab = tab;
+        render();
+      },
+      onOpenPanel: openPanel,
+      onClosePanel: closePanel,
+      onUpdatePrefs: updatePrefs,
+      onResetPrefs: resetPrefs,
+      onShowToast: showToast,
+      onChangeConfig: changeConfig,
+      onChooseCommand: chooseCommand,
+      onOpenConversation: openConversation,
+      onNewConversation: newConversation,
+      onLoadSessions: append => loadSessions(append),
+      onCloseSavedSession: closeSavedSession,
+      onRequestSessionPreview: requestSessionPreview,
+      onLoadExtensions: loadExtensions,
+      onToggleMcp: toggleMcp,
+      onRemoveMcp: runRemoveMcp,
+      onTogglePlugin: togglePlugin,
+      onValidatePlugin: runValidatePlugin,
+      onUninstallPlugin: runUninstallPlugin,
+      onRemoveTemplate: removePromptTemplate,
+      onSetDraft: next => {
+        draft = next;
+        render();
+      },
+      onRefreshGitChanges: () => {
+        gitDiffCache.clear();
+        void detectGitStatus(options.cwd).then(rows => {
+          if (!quitting) { gitChanges = rows; render(); }
+        }).catch(() => {});
+      },
+      onLoadGitDiffPreview: loadGitDiffPreview,
+      onInspectGitFile: filePath => {
+        void readWorkspaceTextPreview(options.cwd, filePath).then(preview => {
+          if (!quitting) openInspect(basename(filePath), { type: 'file', path: preview.path, content: preview.text, truncated: preview.truncated }, filePath);
+        }).catch(() => {});
+      },
+      onOpenInspect: openInspect,
+      onOpenSplit: openSplit,
+      onAttachFile: attachFile,
+      onInspectFindMatch: inspectFindMatch,
+      onJumpToEntry: targetEntry => {
+        const idx = conversation.entries.indexOf(targetEntry);
+        if (idx >= 0) {
+          const needed = conversation.entries.length - idx;
+          if (needed > historyVisibleCount) historyVisibleCount = needed + 20;
+        }
+        if (targetEntry.type === 'thought') thoughtFoldOverrides.set(targetEntry.id, true);
+        else if (targetEntry.type === 'tool') toolFoldOverrides.set(targetEntry.id, false);
+        closePanel();
+        surface?.reveal(`main.conversation.${targetEntry.id}`, 'start');
+      },
+      onInspectDirPath: dirPath => {
+        void listDirectoryEntriesPreview(options.cwd, dirPath).then(pv => {
+          if (!quitting) openInspect(pv.path, { type: 'dir', preview: pv }, pv.path);
+        }).catch(() => {});
+      },
+      onCopy: text => {
+        void copyToClipboard(text).then(copied => {
+          if (!quitting) showToast(copied ? 'Copied to clipboard' : 'Clipboard unavailable', copied ? undefined : 'Install wl-copy or xclip to copy');
+        });
+      },
+      onStopTurn: stop,
+      onLoadReport: loadReport,
+    });
   }
 
   function render(): void {
@@ -3117,6 +2059,9 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         draft = { text, cursor: text.length };
         render();
         surface?.focus('dock.draft');
+      },
+      onLoadDeeperHistory() {
+        void loadDeeperBrainHistory();
       },
     };
     const editorButtons = busy
@@ -3353,7 +2298,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
           readonly={authBusy} maxLines={layout.composerMaxLines} variant="field"
           buttons={editorButtons}
           onFocus={() => surface?.focus('dock.draft')}
-          onEdit={event => { if (!authBusy) { const next = editDraft(draft, event); recordUndo(draft, next); draft = next; autocompleteDismissed = false; commandSelection = 0; fileSelection = 0; render(); } }}
+          onEdit={event => { if (!authBusy) { const next = editDraft(draft, event); recordUndo(draft, next); draft = next; autocompleteDismissed = false; commandSelection = 0; fileSelection = 0; scheduleRender(); } }}
           onUndo={() => { if (!authBusy) applyUndo(); }}
           onAction={{ send, stop }} />
         <status key="bar">
@@ -3527,7 +2472,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
             drafts.set(activeSessionId, draft);
             conversation = new Conversation();
             draft = drafts.get(id) ?? { text: '', cursor: 0 };
-            expandedThoughts.clear();
+            focusedTurnIndex = undefined;
             thoughtFoldOverrides.clear();
             toolFoldOverrides.clear();
             previewedMedia.clear();
@@ -3565,7 +2510,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
             if (update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update') {
               const call = conversation.getTool(update.toolCallId)?.call;
               if (call) {
-                const imgPath = extractToolImagePaths(call, options.cwd).find(p => existsSync(p) && !previewedMedia.has(`path:${p}`));
+                const imgPath = extractToolImagePaths(call, options.cwd).find(p => cachedPathExists(p) && !previewedMedia.has(`path:${p}`));
                 if (imgPath) {
                   previewedMedia.add(`path:${imgPath}`);
                   const label = formatPathLabel(imgPath, options.cwd);
@@ -3642,7 +2587,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         const targetId = resumeId ?? launch?.conversationId;
         const loadingExisting = Boolean((targetId && targetId !== connected.sessionId) || (!resumeId && launch?.continueLast));
         if (!resumeId && !loadingExisting) {
-          await applyPreferredConfigOptions(connected, true, true);
+          void startConfigSync(connected, true, true);
         }
         if (quitting) return;
         if (targetId && targetId !== connected.sessionId) {
@@ -3662,7 +2607,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
             clearReplayState();
             conversation.notice(`Failed to open conversation ${targetId}: ${err instanceof Error ? err.message : String(err)}`, true);
           }
-          await applyPreferredConfigOptions(connected, !resumeId, true);
+          void startConfigSync(connected, !resumeId, true);
         } else if (!resumeId && launch?.continueLast && connected.capabilities.listSessions) {
           try {
             const list = await connected.listSessions();
@@ -3678,7 +2623,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
                 await connected.resumeSession(latest.sessionId);
                 await hydrateSessionHistoryFallback(latest.sessionId, undefined, 'resume');
               }
-              await applyPreferredConfigOptions(connected, true, true);
+              void startConfigSync(connected, true, true);
             } else if (!latest) {
               conversation.notice('No previous conversation found in this workspace for --continue; started a new session.');
             }
@@ -3950,6 +2895,14 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         applyUndo();
         continue;
       }
+      if (key.alt && !key.ctrl && key.name === 'v') {
+        attachClipboardImage();
+        continue;
+      }
+      if (key.ctrl && !key.alt && !key.meta && (key.name === 'up' || key.name === 'down')) {
+        jumpUserTurn(key.name === 'up' ? -1 : 1);
+        continue;
+      }
       if (key.name === 'paste' && key.text) {
         const pastedImg = resolvePastedImagePath(options.cwd, key.text);
         if (pastedImg) {
@@ -3978,7 +2931,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       commandSelection = 0;
       fileSelection = 0;
       if (result.send) send();
-      else render();
+      else scheduleRender();
     }
   } catch (error) {
     if (!session) throw error;

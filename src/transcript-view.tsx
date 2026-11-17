@@ -20,6 +20,29 @@ import {
   summarizeToolCall,
 } from './ui-format';
 
+const PATH_EXISTS_TTL_MS = 4_000;
+const MAX_PATH_EXISTS_CACHE = 512;
+const pathExistsCache = new Map<string, { exists: boolean; at: number }>();
+
+/** Bounded TTL cache for synchronous path-existence checks during transcript render. */
+export function cachedPathExists(targetPath: string): boolean {
+  const now = Date.now();
+  const cached = pathExistsCache.get(targetPath);
+  if (cached && now - cached.at <= PATH_EXISTS_TTL_MS) return cached.exists;
+  let exists = false;
+  try {
+    exists = existsSync(targetPath);
+  } catch {
+    exists = false;
+  }
+  if (pathExistsCache.size >= MAX_PATH_EXISTS_CACHE) {
+    const oldest = pathExistsCache.keys().next().value;
+    if (oldest !== undefined) pathExistsCache.delete(oldest);
+  }
+  pathExistsCache.set(targetPath, { exists, at: now });
+  return exists;
+}
+
 export async function copyToClipboard(text: string): Promise<boolean> {
   const candidates: ReadonlyArray<readonly [string, string[]]> = process.platform === 'darwin'
     ? [['pbcopy', []]]
@@ -125,7 +148,7 @@ export function ToolBody({ call, cwd, showRawInput, fullCommand, diffMode, getBl
   onOpenSplit?(path: string, line?: number): void;
   onCopy?(text: string): void;
 }): JSX.Element {
-  const imagePaths = extractToolImagePaths(call, cwd).filter(path => existsSync(path));
+  const imagePaths = extractToolImagePaths(call, cwd).filter(path => cachedPathExists(path));
   const copyableOutput = extractToolOutputText(call.rawOutput);
   const commandClip = !showRawInput && fullCommand ? clipInlinePreview(fullCommand, 6, 450) : undefined;
   const rawInputClip = showRawInput && call.rawInput !== undefined
@@ -166,7 +189,7 @@ export function ToolBody({ call, cwd, showRawInput, fullCommand, diffMode, getBl
       </text>;
       const pathLabel = formatPathLabel(content.path, cwd);
       const absPath = isAbsolute(content.path) ? content.path : resolve(cwd, content.path);
-      const canSplit = !!onOpenSplit && existsSync(absPath);
+      const canSplit = !!onOpenSplit && cachedPathExists(absPath);
       if (content.oldText == null) {
         const clippedFile = clipInlinePreview(content.newText, 24, 3_000);
         return <col key={`content-${index}`} gap="xs">
@@ -258,6 +281,7 @@ export interface EntryCallbacks {
   onExport(): void;
   onCopy(text: string): void;
   onResend(text: string): void;
+  onLoadDeeperHistory?(): void;
 }
 
 export function Entry({ entry, continued, streaming, recent, turnNumber, callbacks }: {
@@ -365,7 +389,7 @@ export function Entry({ entry, continued, streaming, recent, turnNumber, callbac
     case 'tool': {
       const summary = summarizeToolCall(entry.call, callbacks.cwd);
       const hasMedia = extractToolInlineImages(entry.call).length > 0 ||
-        extractToolImagePaths(entry.call, callbacks.cwd).some(path => existsSync(path));
+        extractToolImagePaths(entry.call, callbacks.cwd).some(path => cachedPathExists(path));
       const running = entry.call.status === 'in_progress' || entry.call.status === 'pending';
       const defaultCollapsed = callbacks.prefs.toolDisplay === 'expanded'
         ? !recent && !running && entry.call.status !== 'failed'
@@ -421,6 +445,14 @@ export function Entry({ entry, continued, streaming, recent, turnNumber, callbac
             <button variant="quiet" size="sm" icon="info" onClick={callbacks.onOpenAccount}>Account</button>
           </buttons>
         </card>;
+      }
+      if (entry.action === 'load_deeper_history' && callbacks.onLoadDeeperHistory) {
+        return <row key={entry.id} justify="between" align="center" gap="sm" wrap>
+          <rule variant="note" icon="info" label={entry.text} />
+          <button size="sm" variant="quiet" icon="history" onClick={callbacks.onLoadDeeperHistory}>
+            Load older brain log
+          </button>
+        </row>;
       }
       return <rule key={entry.id} variant="note" icon="info" label={entry.text} />;
     case 'compaction': {
