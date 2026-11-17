@@ -22,6 +22,15 @@ function detectClipboardCommand(): string | undefined {
   return undefined;
 }
 
+function detectClipboardPasteCommand(): string | undefined {
+  const candidates = process.platform === 'darwin' ? ['pngpaste'] : ['wl-paste', 'xclip'];
+  for (const cmd of candidates) {
+    const found = Bun.which(cmd);
+    if (found) return found;
+  }
+  return undefined;
+}
+
 function inspectEntrypointLink(): { path: string; target?: string; valid: boolean } | undefined {
   const entry = process.argv[1];
   if (!entry) return undefined;
@@ -57,6 +66,7 @@ async function main(): Promise<void> {
     const agyVersion = probeVersionLine(executable, ['--version']);
     const ternVersion = ternPath ? probeVersionLine(ternPath, ['--version']) : undefined;
     const clipboard = detectClipboardCommand();
+    const clipboardPaste = detectClipboardPasteCommand();
     const symlink = inspectEntrypointLink();
     const report = {
       bun: Bun.version,
@@ -66,6 +76,7 @@ async function main(): Promise<void> {
       tern: ternPath ?? null,
       ...(ternVersion ? { ternVersion } : {}),
       clipboard: clipboard ?? null,
+      clipboardPaste: clipboardPaste ?? null,
       ...(symlink ? { launcherSymlink: symlink } : {}),
       workspace: parsed.cwd,
       unverified: ['authentication', 'os_sandbox_enforcement'],
@@ -79,7 +90,8 @@ async function main(): Promise<void> {
       `agy: ${report.agy}${agyVersion ? ` (${agyVersion})` : ''}`,
       'ACP: stdio and sandbox options available',
       `Tern: ${ternPath ? `${ternPath}${ternVersion ? ` (${ternVersion})` : ''}` : 'not on PATH (official agy fallback available)'}`,
-      `Clipboard: ${clipboard ?? 'not found (install wl-copy, xclip, or xsel)'}`,
+      `Clipboard copy: ${clipboard ?? 'not found (install wl-copy, xclip, or xsel)'}`,
+      `Clipboard image paste: ${clipboardPaste ?? 'not found (install wl-paste or xclip)'}`,
       ...(symlink ? [`Launcher: ${symlink.path} -> ${symlink.target} (${symlink.valid ? 'ok' : 'broken'})`] : []),
       `Workspace: ${report.workspace}`,
       'Authentication and OS sandbox enforcement: not checked',

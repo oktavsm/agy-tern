@@ -26,7 +26,7 @@ import {
   type PluginValidationReport,
 } from './extensions';
 import { readOfficialReport, type OfficialReport } from './reports';
-import { readOfficialBrainTranscript, readSessionPreview, TranscriptStore, type SessionPreview } from './history';
+import { PromptHistoryStore, readOfficialBrainTranscript, readSessionPreview, selectRicherTranscript, TranscriptStore, type SessionPreview } from './history';
 import { SessionNames } from './session-names';
 import { PromptTemplatesStore, type PromptTemplate } from './templates';
 import { openInTernSplit, runCommandInTernSplit, sendTerminalAttention } from './tern-window';
@@ -144,6 +144,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
   const drafts = new Map<string, Draft>();
   const names = new SessionNames(options.cwd);
   const transcriptStore = new TranscriptStore(options.cwd);
+  const promptHistoryStore = new PromptHistoryStore(options.cwd);
   const localNames = new Map<string, string | undefined>();
   const sessionInfo = new Map<string, SessionInfo>();
   let activeSessionId = '';
@@ -527,11 +528,12 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       conversation = fallback;
       return;
     }
-    const cache = await transcriptStore.load(targetSessionId);
+    const [cache, brain] = await Promise.all([
+      transcriptStore.load(targetSessionId),
+      readOfficialBrainTranscript(targetSessionId),
+    ]);
     if (quitting) return;
-    const brain = cache ? undefined : await readOfficialBrainTranscript(targetSessionId);
-    if (quitting) return;
-    const disk = cache ?? brain;
+    const disk = selectRicherTranscript(cache, brain);
     const replayedNonNotice = conversation.entries.filter(entry => entry.type !== 'notice').length;
     if (disk && disk.entries.length > replayedNonNotice) {
       conversation.restoreEntries([
@@ -1469,7 +1471,11 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     }
     if (!agent || disconnected) return;
     const trimmedPrompt = text.trim();
-    if (trimmedPrompt && promptHistory.at(-1) !== trimmedPrompt) promptHistory.push(trimmedPrompt);
+    if (trimmedPrompt && promptHistory.at(-1) !== trimmedPrompt) {
+      promptHistory.push(trimmedPrompt);
+      if (promptHistory.length > 50) promptHistory.splice(0, promptHistory.length - 50);
+      void promptHistoryStore.save(promptHistory).catch(() => {});
+    }
     const filesToSend = attachedFiles;
     const dirsToSend = attachedDirs;
     const imagesToSend = attachedImages;
@@ -1513,6 +1519,10 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     prefixSearchInFlight.add(clean);
     void searchWorkspacePrefix(options.cwd, clean, 120, options.additionalDirectories).then(found => {
       prefixSearchInFlight.delete(clean);
+      if (prefixSearchCache.size >= 32) {
+        const oldest = prefixSearchCache.keys().next().value;
+        if (oldest !== undefined) prefixSearchCache.delete(oldest);
+      }
       prefixSearchCache.set(clean, found);
       cachedAtKey = '';
       if (!quitting && found.length) {
@@ -2436,6 +2446,14 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     surface = session.open({ mode: 'screen', title: 'Antigravity · agy-tern', font: 'sans' });
     prefsReady = prefsStore.load().then(loaded => {
       if (!quitting) { userPrefs = loaded; render(); }
+    }).catch(() => {});
+    void promptHistoryStore.load().then(saved => {
+      if (quitting || !saved.length) return;
+      const merged = [...saved];
+      for (const item of promptHistory) {
+        if (merged.at(-1) !== item) merged.push(item);
+      }
+      promptHistory.splice(0, promptHistory.length, ...merged.slice(-50));
     }).catch(() => {});
     refreshWorkspaceFiles();
     void detectGitBranch(options.cwd).then(branch => {

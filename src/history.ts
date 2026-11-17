@@ -7,6 +7,7 @@ import type { TranscriptEntry } from './model';
 
 const MAX_STORE_ENTRIES = 100;
 const MAX_STORE_FILES = 30;
+const MAX_PROMPT_HISTORY = 50;
 const MAX_READ_BYTES = 1_500_000;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -14,6 +15,78 @@ export interface LoadedTranscript {
   entries: TranscriptEntry[];
   truncated: boolean;
   source: 'cache' | 'brain';
+}
+
+/** Prefer whichever local history source holds richer/newer entries (e.g. session continued externally). */
+export function selectRicherTranscript(
+  cache: LoadedTranscript | undefined,
+  brain: LoadedTranscript | undefined,
+): LoadedTranscript | undefined {
+  if (!cache) return brain;
+  if (!brain) return cache;
+  if (brain.entries.length > cache.entries.length) return brain;
+  return cache;
+}
+
+function defaultPromptHistoryDir(): string {
+  const xdgState = process.env.XDG_STATE_HOME;
+  return join(
+    xdgState && isAbsolute(xdgState) ? xdgState : join(homedir(), '.local', 'state'),
+    'agy-tern',
+    'prompt-history',
+  );
+}
+
+/** Persistent per-workspace prompt history under `$XDG_STATE_HOME/agy-tern/prompt-history` (`0700`/`0600`). */
+export class PromptHistoryStore {
+  private readonly directory: string;
+  private readonly filePath: string;
+
+  constructor(cwd: string, stateDirectory?: string) {
+    const cleanCwd = resolve(cwd);
+    this.directory = resolve(stateDirectory ?? defaultPromptHistoryDir());
+    const digest = createHash('sha256').update(cleanCwd).digest('hex').slice(0, 32);
+    this.filePath = join(this.directory, `${digest}.json`);
+  }
+
+  async load(): Promise<string[]> {
+    try {
+      const raw = await readFile(this.filePath, 'utf8');
+      const parsed = JSON.parse(raw) as { version?: number; prompts?: unknown };
+      if (parsed?.version !== 1 || !Array.isArray(parsed.prompts)) return [];
+      return parsed.prompts
+        .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+        .slice(-MAX_PROMPT_HISTORY);
+    } catch {
+      return [];
+    }
+  }
+
+  async save(prompts: readonly string[]): Promise<void> {
+    const cleaned: string[] = [];
+    for (const rawItem of prompts) {
+      const item = rawItem.trim();
+      if (!item) continue;
+      if (cleaned.at(-1) !== item) cleaned.push(item);
+    }
+    const sliced = cleaned.slice(-MAX_PROMPT_HISTORY);
+    if (!sliced.length) return;
+    await mkdir(this.directory, { recursive: true, mode: 0o700 });
+    await chmod(this.directory, 0o700);
+    const temporary = join(this.directory, `${randomUUID()}.tmp`);
+    const file = await open(temporary, 'wx', 0o600);
+    try {
+      await file.chmod(0o600);
+      await file.writeFile(JSON.stringify({ version: 1, updatedAt: Date.now(), prompts: sliced }), 'utf8');
+    } finally {
+      await file.close();
+    }
+    try {
+      await rename(temporary, this.filePath);
+    } finally {
+      await rm(temporary, { force: true });
+    }
+  }
 }
 
 function sanitizeEntryForDisk(entry: TranscriptEntry): TranscriptEntry | undefined {

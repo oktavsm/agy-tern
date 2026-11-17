@@ -2,7 +2,13 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import { mkdir, mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { readOfficialBrainTranscript, readSessionPreview, TranscriptStore } from '../src/history';
+import {
+  PromptHistoryStore,
+  readOfficialBrainTranscript,
+  readSessionPreview,
+  selectRicherTranscript,
+  TranscriptStore,
+} from '../src/history';
 import { Conversation } from '../src/model';
 
 const dirs: string[] = [];
@@ -95,5 +101,29 @@ describe('local transcript store & official brain log reader', () => {
       lastUser: 'audit project',
       lastAgent: 'Audit complete.',
     });
+
+    const richer = selectRicherTranscript(
+      { source: 'cache', truncated: false, entries: loaded!.entries.slice(0, 1) },
+      loaded,
+    );
+    expect(richer?.source).toBe('brain');
+    expect(richer?.entries.length).toBe(4);
+  });
+
+  test('persists deduplicated workspace prompt history capped to 50 items', async () => {
+    const cwd = await tempDir();
+    const stateDir = await tempDir();
+    const historyStore = new PromptHistoryStore(cwd, stateDir);
+    const entries = Array.from({ length: 55 }, (_, i) => `prompt-${i + 1}`);
+    entries.push('prompt-55');
+    await historyStore.save(entries);
+
+    const loaded = await historyStore.load();
+    expect(loaded).toHaveLength(50);
+    expect(loaded[0]).toBe('prompt-6');
+    expect(loaded[49]).toBe('prompt-55');
+    if (process.platform !== 'win32') {
+      expect((await stat(stateDir)).mode & 0o777).toBe(0o700);
+    }
   });
 });
