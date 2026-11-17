@@ -221,5 +221,19 @@ describe('workspace @file mention helpers', () => {
       hasCommand: cmd => cmd === 'xclip',
       exec: async () => Buffer.from('UTF8_STRING\ntext/plain\n'),
     })).rejects.toThrow('Clipboard does not contain a PNG, JPEG, or WebP image.');
+
+    const macLoaded = await readClipboardImage({
+      platform: 'darwin',
+      hasCommand: cmd => cmd === 'pngpaste',
+      exec: async (cmd, args) => (cmd === 'pngpaste' && args[0] === '-' ? pngBytes : undefined),
+    });
+    expect(macLoaded.mimeType).toBe('image/png');
+    expect(macLoaded.size).toBe(pngBytes.byteLength);
+    expect(macLoaded.data).toBe(pngBytes.toString('base64'));
+
+    await expect(readClipboardImage({
+      platform: 'darwin',
+      hasCommand: () => false,
+    })).rejects.toThrow('install pngpaste');
   });
 });

@@ -64,14 +64,15 @@ async function runBinaryCommand(cmd: string, args: string[], maxBytes: number): 
 }
 
 /**
- * Read a PNG/JPEG/WebP screenshot directly from system clipboard (`wl-paste` or `xclip`).
+ * Read a PNG/JPEG/WebP screenshot directly from system clipboard (`wl-paste`, `xclip`, or `pngpaste` on macOS).
  * Enforces the 10 MB ACP attachment limit cleanly without shell interpolation.
  */
 export async function readClipboardImage(
-  options?: { exec?: ClipboardExec; hasCommand?: (cmd: string) => boolean },
+  options?: { exec?: ClipboardExec; hasCommand?: (cmd: string) => boolean; platform?: NodeJS.Platform },
 ): Promise<LoadedImageAttachment> {
   const exec = options?.exec ?? runBinaryCommand;
   const hasCmd = options?.hasCommand ?? ((cmd: string) => !!Bun.which(cmd));
+  const platform = options?.platform ?? process.platform;
 
   const tryTool = async (
     cmd: string,
@@ -102,15 +103,35 @@ export async function readClipboardImage(
     };
   };
 
-  const candidates = process.env.WAYLAND_DISPLAY
-    ? [
-      () => tryTool('wl-paste', ['--list-types'], mime => ['--no-newline', '--type', mime]),
-      () => tryTool('xclip', ['-selection', 'clipboard', '-t', 'TARGETS', '-o'], mime => ['-selection', 'clipboard', '-t', mime, '-o']),
-    ]
-    : [
-      () => tryTool('xclip', ['-selection', 'clipboard', '-t', 'TARGETS', '-o'], mime => ['-selection', 'clipboard', '-t', mime, '-o']),
-      () => tryTool('wl-paste', ['--list-types'], mime => ['--no-newline', '--type', mime]),
-    ];
+  const tryPngpaste = async (): Promise<{ tried: boolean; loaded?: LoadedImageAttachment; error?: string }> => {
+    if (!hasCmd('pngpaste')) return { tried: false };
+    const payload = await exec('pngpaste', ['-'], MAX_IMAGE_BYTES + 1);
+    if (!payload || payload.byteLength === 0) return { tried: true };
+    if (payload.byteLength > MAX_IMAGE_BYTES) {
+      return { tried: true, error: `Clipboard image exceeds 10 MB limit (${(payload.byteLength / (1024 * 1024)).toFixed(1)} MB).` };
+    }
+    return {
+      tried: true,
+      loaded: {
+        path: `clipboard-${Date.now().toString(36)}.png`,
+        mimeType: 'image/png',
+        size: payload.byteLength,
+        data: payload.toString('base64'),
+      },
+    };
+  };
+
+  const candidates = platform === 'darwin'
+    ? [tryPngpaste]
+    : process.env.WAYLAND_DISPLAY
+      ? [
+        () => tryTool('wl-paste', ['--list-types'], mime => ['--no-newline', '--type', mime]),
+        () => tryTool('xclip', ['-selection', 'clipboard', '-t', 'TARGETS', '-o'], mime => ['-selection', 'clipboard', '-t', mime, '-o']),
+      ]
+      : [
+        () => tryTool('xclip', ['-selection', 'clipboard', '-t', 'TARGETS', '-o'], mime => ['-selection', 'clipboard', '-t', mime, '-o']),
+        () => tryTool('wl-paste', ['--list-types'], mime => ['--no-newline', '--type', mime]),
+      ];
 
   let anyToolAvailable = false;
   for (const probe of candidates) {
@@ -120,7 +141,11 @@ export async function readClipboardImage(
     if (res.loaded) return res.loaded;
   }
   if (!anyToolAvailable) {
-    throw new Error('No clipboard image utility available (install wl-paste or xclip).');
+    throw new Error(
+      platform === 'darwin'
+        ? 'No clipboard image utility available (install pngpaste: brew install pngpaste).'
+        : 'No clipboard image utility available (install wl-paste or xclip).',
+    );
   }
   throw new Error('Clipboard does not contain a PNG, JPEG, or WebP image.');
 }
