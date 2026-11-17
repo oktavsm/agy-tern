@@ -50,6 +50,8 @@ describe('local user preferences', () => {
       autoPreviewMedia: true,
       notifyOnTurnComplete: false,
       rememberModel: false,
+      maxFps: 25,
+      motion: 'auto',
       lastModel: 'gemini-4-hydrogen',
     });
   });
@@ -75,6 +77,8 @@ describe('local user preferences', () => {
       autoPreviewMedia: false,
       notifyOnTurnComplete: true,
       rememberModel: true,
+      maxFps: 25,
+      motion: 'auto',
       lastModel: 'gemini-4-hydrogen',
       lastThinking: 'high',
     });

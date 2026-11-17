@@ -8,7 +8,10 @@ const key = (name: string, overrides: Partial<Key> = {}): Key => ({
 
 describe('keyboard draft', () => {
   test('deletes and navigates whole graphemes using UTF-16 offsets', () => {
-    const clusters = ['😀', 'e\u0301', '👩‍👩‍👧‍👦', '🇮🇩'];
+    const smile = '\u{1F600}';
+    const family = '\u{1F469}\u200D\u{1F469}\u200D\u{1F467}\u200D\u{1F466}';
+    const flag = '\u{1F1EE}\u{1F1E9}';
+    const clusters = [smile, 'e\u0301', family, flag];
     for (const cluster of clusters) {
       const text = `a${cluster}b`;
       const end = 1 + cluster.length;
@@ -20,26 +23,29 @@ describe('keyboard draft', () => {
   });
 
   test('pastes a multiline block without sending, then requires a separate Enter', () => {
-    const pasted = draftKey({ text: 'ab', cursor: 1 }, key('paste', { text: '😀\r\nnext\rlast\n' }));
+    const smile = '\u{1F600}';
+    const pasted = draftKey({ text: 'ab', cursor: 1 }, key('paste', { text: `${smile}\r\nnext\rlast\n` }));
     expect(pasted.send).toBe(false);
-    expect(pasted.draft).toEqual({ text: 'a😀\nnext\nlast\nb', cursor: 14 });
+    expect(pasted.draft).toEqual({ text: `a${smile}\nnext\nlast\nb`, cursor: 14 });
     const newline = draftKey(pasted.draft, key('enter', { shift: true }));
     expect(newline.send).toBe(false);
-    expect(newline.draft.text).toBe('a😀\nnext\nlast\n\nb');
+    expect(newline.draft.text).toBe(`a${smile}\nnext\nlast\n\nb`);
     expect(draftKey(newline.draft, key('enter')).send).toBe(true);
     expect(draftKey(newline.draft, key('enter', { ctrl: true })).send).toBe(false);
   });
 
   test('replaces a keyboard selection and handles a leading empty line', () => {
-    const selected = draftKey({ text: 'a😀b', cursor: 3 }, key('left', { shift: true })).draft;
-    expect(selected).toEqual({ text: 'a😀b', cursor: 1, anchor: 3 });
+    const smile = '\u{1F600}';
+    const selected = draftKey({ text: `a${smile}b`, cursor: 3 }, key('left', { shift: true })).draft;
+    expect(selected).toEqual({ text: `a${smile}b`, cursor: 1, anchor: 3 });
     expect(draftKey(selected, key('paste', { text: 'é' })).draft).toEqual({ text: 'aéb', cursor: 2 });
-    expect(draftKey({ text: '\n😀x', cursor: 0 }, key('home')).draft.cursor).toBe(0);
-    expect(draftKey({ text: '\n😀x', cursor: 1 }, key('up')).draft.cursor).toBe(0);
+    expect(draftKey({ text: `\n${smile}x`, cursor: 0 }, key('home')).draft.cursor).toBe(0);
+    expect(draftKey({ text: `\n${smile}x`, cursor: 1 }, key('up')).draft.cursor).toBe(0);
   });
 
   test('applies native edits only against the expected text length', () => {
-    const draft = { text: 'a😀b', cursor: 3 };
+    const smile = '\u{1F600}';
+    const draft = { text: `a${smile}b`, cursor: 3 };
     expect(editDraft(draft, { from: 1, to: 3, text: 'é', cursor: 2, len: 4 })).toEqual({ text: 'aéb', cursor: 2 });
     expect(editDraft(draft, { from: 1, to: 3, text: '', cursor: 1, len: 2 })).toBe(draft);
   });

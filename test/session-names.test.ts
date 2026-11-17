@@ -126,7 +126,7 @@ describe('session name validation', () => {
     ['paragraph separator', 'first\u2029second'],
     ['unpaired surrogate', 'first\ud800second'],
     ['161 UTF-16 units', 'x'.repeat(161)],
-    ['81 supplementary characters', '😀'.repeat(81)],
+    ['81 supplementary characters', '\u{1F600}'.repeat(81)],
   ])('rejects %s without replacing an existing label', async (_description, input) => {
     await names.set('session', 'Original');
     await expect(names.set('session', input)).rejects.toThrow();
@@ -137,8 +137,8 @@ describe('session name validation', () => {
   test('accepts exactly 160 UTF-16 units including supplementary characters', async () => {
     await names.set('session', 'x'.repeat(160));
     expect(await names.get('session')).toBe('x'.repeat(160));
-    await names.set('session', `  ${'😀'.repeat(80)}  `);
-    expect(await names.get('session')).toBe('😀'.repeat(80));
+    await names.set('session', `  ${'\u{1F600}'.repeat(80)}  `);
+    expect(await names.get('session')).toBe('\u{1F600}'.repeat(80));
   });
 
   test.each([
@@ -149,7 +149,7 @@ describe('session name validation', () => {
     ['control', Buffer.from('first\u001bsecond')],
     ['line separator', Buffer.from('first\u2028second')],
     ['oversized', Buffer.from('x'.repeat(161))],
-    ['oversized supplementary characters', Buffer.from('😀'.repeat(81))],
+    ['oversized supplementary characters', Buffer.from('\u{1F600}'.repeat(81))],
     ['invalid UTF-8', Buffer.from([0xc3, 0x28])],
     ['UTF-8 surrogate', Buffer.from([0xed, 0xa0, 0x80])],
   ])('surfaces corrupt %s stored labels rather than treating them as absent', async (_description, contents) => {

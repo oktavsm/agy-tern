@@ -270,6 +270,7 @@ describe('official ACP subprocess boundary', () => {
       resumeSession: true,
       closeSession: true,
       additionalDirectories: true,
+      appendSystemPrompt: false,
     });
     const first = await session.listSessions();
     expect(first.sessions).toEqual([]);
@@ -463,6 +464,7 @@ describe('official ACP subprocess boundary', () => {
       resumeSession: false,
       closeSession: false,
       additionalDirectories: false,
+      appendSystemPrompt: false,
     });
     await expect(session.listSessions()).rejects.toThrow('does not support listing sessions');
     await expect(session.loadSession('fixture-planning')).rejects.toThrow('does not support loading sessions');

@@ -47,6 +47,9 @@ describe('CLI argument parser', () => {
       model: 'gemini-4-argon',
       mode: 'plan',
       thinking: 'high',
+      appendSystemPrompt: undefined,
+      maxFps: undefined,
+      motion: undefined,
       continueLast: true,
       conversationId: undefined,
       initialPrompt: 'Audit this module',
@@ -75,7 +78,29 @@ describe('CLI argument parser', () => {
     expect(() => parseCliArgs(['one', 'two'], root)).toThrow('Unexpected extra arguments');
     expect(() => parseCliArgs(['--cwd', filePath], root)).toThrow('Not a workspace directory');
     expect(() => parseCliArgs(['--add-dir', 'missing-dir'], root)).toThrow('Not an additional workspace directory');
-    expect(() => parseCliArgs(['--json'], root)).toThrow('--doctor');
+    expect(() => parseCliArgs(['--doctor', '--json'], root)).not.toThrow();
     expect(parseCliArgs(['--doctor', '--json'], root)).toMatchObject({ doctor: true, doctorJson: true });
+  });
+
+  test('parses and validates --max-fps, --motion, and --append-system-prompt flags', async () => {
+    const root = await makeTempDir();
+    const parsed = parseCliArgs([
+      '--cwd', root,
+      '--max-fps', '40',
+      '--motion', 'reduce',
+      '--append-system-prompt', 'Keep patches minimal.',
+    ], root);
+
+    expect(parsed).toMatchObject({
+      cwd: root,
+      maxFps: 40,
+      motion: 'reduced',
+      appendSystemPrompt: 'Keep patches minimal.',
+    });
+
+    expect(() => parseCliArgs(['--max-fps', '4'], root)).toThrow('--max-fps');
+    expect(() => parseCliArgs(['--max-fps', '61'], root)).toThrow('--max-fps');
+    expect(() => parseCliArgs(['--max-fps', 'fast'], root)).toThrow('--max-fps');
+    expect(() => parseCliArgs(['--motion', 'hyper'], root)).toThrow('--motion');
   });
 });
