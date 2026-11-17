@@ -108,6 +108,7 @@ agy-tern --agy /abs/path/to/agy --doctor
 | `/settings`, `/config` | Open 4-page `<prefs>` modal (`Appearance & UI`, `Session & Model`, `Permissions & Sandbox`, `Keybindings`) persisted under `$XDG_STATE_HOME/agy-tern/prefs.json` |
 | `/templates [query]`, `/snippets [query]` | Save, browse, filter, insert, or delete workspace-scoped prompt templates |
 | `/find [query]`, `/search [query]` | Search messages, thoughts, tools, diffs, plans, and notices with `Jump to chat`, `Copy`, and `Inspect` actions |
+| `/tasks`, `/running`, `/ps` | Inspect running and recent session tools, view live command/output details, or cancel the active ACP turn |
 | `/changes`, `/diff` | Inspect session edits and workspace `git status` (including live `git diff` previews) with `Fullscreen` and `Tern split` (`tern open --split right`) actions |
 | `/mcp` | List `agy mcp list` servers; enable, disable, add (`[--type stdio\|http] <name> <target> [args...]`), or remove servers with confirmation |
 | `/plugins`, `/skills` | Browse `agy plugin list --json`; toggle state, insert `/<skill>`, validate manifests (`InspectOverlay` report), install, or uninstall |
