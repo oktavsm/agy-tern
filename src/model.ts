@@ -117,6 +117,27 @@ export class Conversation {
     }
   }
 
+  /** Replace active transcript entries from a local snapshot cleanly while advancing sequence/tool indexes. */
+  restoreEntries(entries: readonly TranscriptEntry[]): void {
+    this.entries.length = 0;
+    this.tools.clear();
+    this.messages.clear();
+    this.compactions.clear();
+    this.plan = undefined;
+    this.activeThought = undefined;
+    let maxSeq = this.sequence;
+    for (const entry of entries) {
+      this.entries.push(entry);
+      this.touch(entry);
+      const idMatch = /^entry-(\d+)$/.exec(entry.id);
+      if (idMatch) maxSeq = Math.max(maxSeq, Number(idMatch[1]));
+      if (entry.type === 'tool') this.tools.set(entry.call.toolCallId, entry);
+      if (entry.type === 'plan') this.plan = entry;
+      if (entry.type === 'compaction') this.compactions.set(entry.compactionId, entry);
+    }
+    this.sequence = maxSeq;
+  }
+
   startPrompt(text: string, time?: string): void {
     this.closeThought();
     this.messages.clear();
