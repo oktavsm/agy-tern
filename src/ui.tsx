@@ -683,6 +683,35 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     openPanel({ kind: 'inspect', title, subtitle, item });
   }
 
+  function openInspectFile(rawPath: string, line?: number): void {
+    if (permissions.length || quitting || !rawPath) return;
+    const abs = resolve(options.cwd, rawPath);
+    const label = formatPathLabel(abs, options.cwd);
+    const subtitle = line ? `${label}:${line}` : label;
+    try {
+      const info = statSync(abs);
+      if (info.isDirectory()) {
+        void listDirectoryEntriesPreview(options.cwd, abs).then(pv => {
+          if (!quitting) openInspect(pv.path, { type: 'dir', preview: pv }, pv.path);
+        }).catch(err => {
+          if (!quitting) showToast('Cannot inspect directory', err instanceof Error ? err.message : label);
+        });
+        return;
+      }
+    } catch {
+      // Fall through to readWorkspaceTextPreview so any clean error surface shows via toast.
+    }
+    if (imageMimeType(abs)) {
+      openInspect(basename(label), { type: 'image-path', path: abs }, subtitle);
+      return;
+    }
+    void readWorkspaceTextPreview(options.cwd, abs).then(pv => {
+      if (!quitting) openInspect(basename(label), { type: 'file', path: pv.path, content: pv.text, truncated: pv.truncated }, subtitle);
+    }).catch(err => {
+      if (!quitting) showToast('Cannot open file', err instanceof Error ? err.message : label);
+    });
+  }
+
   function parentPanel(current: Panel): Panel | undefined {
     if (current.kind === 'inspect') return inspectReturnPanel;
     if (current.kind === 'confirm') return current.returnTo;
@@ -2024,6 +2053,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       pathExists,
       getBlob: blobForImage,
       onInspect: openInspect,
+      onInspectFile: openInspectFile,
       onToggleThought(id, open) {
         st.thoughtFoldOverrides.set(id, open);
         render();
@@ -2108,7 +2138,9 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       const entryNow = entry.type === 'thought' || entry.type === 'tool'
         ? ((entry.startedAt ?? renderNow) + stableAgeMs)
         : renderNow;
-      const sig = `${conv.revisionOf(entry)}|${continued ? 1 : 0}|${streaming ? 1 : 0}|${recent ? 1 : 0}|${turnNumber ?? ''}|${settled ? 1 : 0}|${foldKey}|${errorKey}|${agentStatus}|${userPrefs.diffMode}|${userPrefs.toolDisplay}|${Number(userPrefs.thoughtExpanded)}|${userPrefs.transcriptDensity}|${Number(userPrefs.showTimestamps)}|${layout.proseMaxW}|${pathPresenceCache.version}`;
+      const entryAgentStatus = entry.type === 'message' && entry.role === 'agent' ? agentStatus : '';
+      const entryRecent = entry.type === 'tool' ? (recent ? 1 : 0) : 0;
+      const sig = `${conv.revisionOf(entry)}|${continued ? 1 : 0}|${streaming ? 1 : 0}|${entryRecent}|${turnNumber ?? ''}|${settled ? 1 : 0}|${foldKey}|${errorKey}|${entryAgentStatus}|${userPrefs.diffMode}|${userPrefs.toolDisplay}|${Number(userPrefs.thoughtExpanded)}|${userPrefs.transcriptDensity}|${Number(userPrefs.showTimestamps)}|${layout.proseMaxW}|${pathPresenceCache.version}`;
       const record = rc.renderEntryMemoized(entry, { sig, settled }, () => (
         <Entry key={entry.id} entry={entry} continued={continued} streaming={streaming} recent={recent} turnNumber={turnNumber}
           callbacks={entryNow === renderNow ? entryCallbacks : { ...entryCallbacks, now: entryNow }} />
@@ -2540,7 +2572,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         {renderPanel()}
       </col>,
     };
-    rc.commitFrame(view, renderedEntries, replayCoordinator.isReplaying);
+    rc.commitFrame(view, renderedEntries, replayCoordinator.isReplaying, busy);
   }
 
   process.on('SIGTERM', terminate);
@@ -2803,6 +2835,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         }
         continue;
       }
+      renderController.noteVisibleActivity(render);
       const key = input.key;
       if (((key.ctrl || key.meta) && key.name === 'q') || (key.ctrl && key.name === 'c')) { quit(); continue; }
       if (key.name === 'escape') {

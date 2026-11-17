@@ -209,4 +209,65 @@ describe('isEntrySettled and TernRenderController', () => {
 
     ctrl.dispose();
   });
+
+  test('defers settle ops during active turns, wakes hidden busy panes gently, and restores visibility on input', () => {
+    const fake = makeFakeSession({ features: ['settle'], reduceMotion: false });
+    const { timers, advanceBy } = makeFakeTimers();
+    const ctrl = new TernRenderController({
+      session: fake.session,
+      surface: fake.surface,
+      title: 'Test',
+      maxFps: 25,
+      motion: 'auto',
+      timers,
+    });
+
+    // When hidden during an active turn, scheduleRender keeps dirtyWhenHidden=true synchronously
+    // and catches up after ~300ms instead of dropping frames for the whole turn.
+    let busyRenders = 0;
+    ctrl.handleSessionEvent({ ev: 'visible', visible: false } as TspEvent, () => { busyRenders++; });
+    ctrl.scheduleRender(true, () => { busyRenders++; });
+    expect(busyRenders).toBe(0);
+    expect(ctrl.dirtyWhenHidden).toBe(true);
+    advanceBy(320);
+    expect(busyRenders).toBe(1);
+
+    // noteVisibleActivity restores visible=true and catches up any pending dirty frame.
+    ctrl.handleSessionEvent({ ev: 'visible', visible: false } as TspEvent, () => { busyRenders++; });
+    ctrl.scheduleRender(false, () => { busyRenders++; });
+    expect(ctrl.visible).toBe(false);
+    expect(ctrl.dirtyWhenHidden).toBe(true);
+    ctrl.noteVisibleActivity(() => { busyRenders++; });
+    expect(ctrl.visible).toBe(true);
+    expect(ctrl.dirtyWhenHidden).toBe(false);
+    expect(busyRenders).toBe(2);
+
+    // During active turns (busy=true), commitFrame does not synchronously spend the 2nd credit on settle ops.
+    const conv = new Conversation();
+    conv.startPrompt('Check files', '12:00');
+    conv.update({ sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'Thinking' } }, 1_000, '12:00');
+    conv.update({ sessionUpdate: 'tool_call', toolCallId: 't1', kind: 'read', title: 'Read package.json', status: 'completed' }, 1_050, '12:00');
+    conv.update({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Working...' } }, 1_100, '12:00');
+
+    const recs = conv.entries.map((entry, idx) => {
+      const settled = isEntrySettled(entry, idx, conv.entries.length, true, false, undefined);
+      return ctrl.renderEntryMemoized(
+        entry,
+        { sig: `${conv.revisionOf(entry)}|${settled ? 1 : 0}`, settled },
+        () => jsx('text', { children: entry.id }, entry.id),
+      );
+    });
+
+    const pending = ctrl.commitFrame({ main: jsx('col', {}) }, recs, false, true);
+    expect(pending.length).toBeGreaterThanOrEqual(1);
+    // Synchronous sentOps remain empty mid-turn so Tern keeps flow-control credit available for streaming frames.
+    expect(fake.sentOps.length).toBe(0);
+
+    // Deferred settle ops flush quietly after pause.
+    advanceBy(250);
+    expect(fake.sentOps.length).toBe(1);
+    expect(fake.sentOps[0]).toEqual(pending.map(id => ['settle', id] as Op));
+
+    ctrl.dispose();
+  });
 });

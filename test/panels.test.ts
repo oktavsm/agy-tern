@@ -1,8 +1,10 @@
 import { describe, expect, test } from 'bun:test';
+import { resolve } from 'node:path';
 import { DEFAULT_PREFS } from '../src/prefs';
+import type { ToolStep } from '../src/model';
 import { computeResponsiveLayout } from '../src/ui-format';
 import { renderActivePanel, type Panel, type PanelRenderContext } from '../src/panels';
-import { cachedPathExists } from '../src/transcript-view';
+import { cachedPathExists, Entry, type EntryCallbacks } from '../src/transcript-view';
 
 function baseContext(panel: Panel): PanelRenderContext {
   return {
@@ -164,5 +166,124 @@ describe('panel renderers & transcript view helpers', () => {
     expect(cachedPathExists('package.json')).toBe(true);
     expect(cachedPathExists('definitely-missing-agy-tern-path-12345')).toBe(false);
     expect(cachedPathExists('\0invalid')).toBe(false);
+  });
+
+  test('tool entries expose clickable modal, file, copy, and split actions for every task kind', () => {
+    const inspectedFiles: Array<{ path: string; line?: number }> = [];
+    const inspectedTargets: Array<{ title: string; kind: string; subtitle?: string }> = [];
+    const copiedTexts: string[] = [];
+    const splitTargets: Array<{ path: string; line?: number }> = [];
+    const runCommands: string[] = [];
+
+    const callbacks: EntryCallbacks = {
+      cwd: process.cwd(),
+      working: false,
+      now: 1_000,
+      agentStatus: 'success',
+      prefs: DEFAULT_PREFS,
+      thoughtFoldOverrides: new Map(),
+      toolFoldOverrides: new Map(),
+      canRetry: false,
+      canReconnect: false,
+      canSwitchAccount: false,
+      pathExists: target => target === resolve(process.cwd(), 'package.json'),
+      getBlob: () => undefined,
+      onInspect(title, target, subtitle) {
+        inspectedTargets.push({ title, kind: target.type, subtitle });
+      },
+      onInspectFile(filePath, line) {
+        inspectedFiles.push({ path: filePath, line });
+      },
+      onToggleThought: () => {},
+      onToggleTool: () => {},
+      onRetry: () => {},
+      onReconnect: () => {},
+      onSwitchModel: () => {},
+      onSwitchAccount: () => {},
+      onOpenAccount: () => {},
+      onOpenChanges: () => {},
+      onOpenSplit(path, line) {
+        splitTargets.push({ path, line });
+      },
+      onRunCommand(command) {
+        runCommands.push(command);
+      },
+      onAttachPath: () => {},
+      onExport: () => {},
+      onCopy(text) {
+        copiedTexts.push(text);
+      },
+      onResend: () => {},
+    };
+
+    const readStep: ToolStep = {
+      id: 'tool-read-1',
+      type: 'tool',
+      startedAt: 500,
+      endedAt: 650,
+      call: {
+        toolCallId: 'tool-read-1',
+        kind: 'read',
+        title: 'Read package.json',
+        status: 'completed',
+        locations: [{ path: 'package.json', line: 12 }],
+      },
+    };
+    const readNode = Entry({ entry: readStep, continued: false, streaming: false, recent: true, callbacks }) as unknown as {
+      props: {
+        tools?: Array<{ id: string; label?: string }>;
+      };
+      handlers: {
+        onAction?: Record<string, (ev: unknown) => void>;
+        onToggle?: (ev: { collapsed?: boolean }) => void;
+      };
+    };
+    expect(readNode.props.tools?.map(t => t.id)).toEqual(['view-file', 'split', 'toggle']);
+
+    // Clicking a plain read task opens the file contents modal directly.
+    readNode.handlers.onToggle?.({ collapsed: false });
+    expect(inspectedFiles).toEqual([{ path: resolve(process.cwd(), 'package.json'), line: 12 }]);
+
+    readNode.handlers.onAction?.split?.({});
+    expect(splitTargets).toEqual([{ path: resolve(process.cwd(), 'package.json'), line: 12 }]);
+
+    const cmdCallbacks: EntryCallbacks = {
+      ...callbacks,
+      toolFoldOverrides: new Map([['tool-cmd-1', false]]),
+    };
+    const cmdStep: ToolStep = {
+      id: 'tool-cmd-1',
+      type: 'tool',
+      startedAt: 700,
+      endedAt: 900,
+      call: {
+        toolCallId: 'tool-cmd-1',
+        kind: 'execute',
+        title: 'Run tests',
+        status: 'completed',
+        rawInput: { command: 'bun test' },
+        rawOutput: '179 pass',
+      },
+    };
+    const cmdNode = Entry({ entry: cmdStep, continued: false, streaming: false, recent: true, callbacks: cmdCallbacks }) as unknown as {
+      props: {
+        tools?: Array<{ id: string; label?: string }>;
+      };
+      handlers: {
+        onAction?: Record<string, (ev: unknown) => void>;
+      };
+    };
+    expect(cmdNode.props.tools?.map(t => t.id)).toEqual(['inspect', 'copy-output']);
+    cmdNode.handlers.onAction?.inspect?.({});
+    expect(inspectedTargets.at(-1)?.kind).toBe('file');
+    cmdNode.handlers.onAction?.['copy-output']?.({});
+    expect(copiedTexts).toEqual(['179 pass']);
+
+    const cmdJson = JSON.stringify(cmdNode);
+    expect(cmdJson).toContain('Inspect output');
+    expect(cmdJson).toContain('Copy output');
+    expect(cmdJson).toContain('Run in split');
+    expect(cmdJson).toContain('Inspect details');
+    expect(runCommands.length).toBe(0);
   });
 });

@@ -4,10 +4,11 @@ import { existsSync } from 'node:fs';
 import { basename, isAbsolute, resolve } from 'node:path';
 import type { DiffHunk, JSX, NodeJson, Tone } from '@stencil-hq/tern';
 import type { ToolCallUpdate } from '@agentclientprotocol/sdk';
-import { contentText, type TranscriptEntry } from './model';
+import { contentText, type ToolStep, type TranscriptEntry } from './model';
 import type { DirectoryPreview } from './files';
 import type { DiffMode, UserPrefs } from './prefs';
 import {
+  buildTaskDetailText,
   buildUnifiedDiffHunks,
   clipDiffHunks,
   clipInlinePreview,
@@ -164,36 +165,124 @@ export function ToolOutput({ rawOutput }: { rawOutput: unknown }): JSX.Element {
   </col>;
 }
 
-export function ToolBody({ call, cwd, showRawInput, fullCommand, diffMode, pathExists, getBlob, onInspect, onOpenSplit, onCopy }: {
+interface ParsedTargetPath {
+  path: string;
+  absPath: string;
+  line?: number;
+}
+
+function parseToolTargetPath(target: string | undefined, cwd: string): ParsedTargetPath | undefined {
+  if (!target) return undefined;
+  const match = /^(.*):(\d+)$/.exec(target);
+  const path = match ? match[1]! : target;
+  if (!path) return undefined;
+  return {
+    path,
+    absPath: isAbsolute(path) ? path : resolve(cwd, path),
+    line: match ? Number(match[2]) : undefined,
+  };
+}
+
+function firstToolDiffInspectTarget(
+  call: ToolCallUpdate,
+  cwd: string,
+): { title: string; target: InspectTarget; subtitle: string } | undefined {
+  for (const item of call.content ?? []) {
+    if (item.type !== 'diff') continue;
+    const label = formatPathLabel(item.path, cwd);
+    if (item.oldText == null) {
+      return { title: basename(label), target: { type: 'file', path: label, content: item.newText }, subtitle: label };
+    }
+    const diff = buildUnifiedDiffHunks(item.oldText, item.newText);
+    if (diff.hunks.length > 0) {
+      return { title: basename(label), target: { type: 'diff', path: label, hunks: diff.hunks }, subtitle: label };
+    }
+  }
+  return undefined;
+}
+
+function buildToolHeaderActions(opts: {
+  kind?: ToolCallUpdate['kind'];
+  hasDiff: boolean;
+  hasCopyableOutput: boolean;
+  collapsed: boolean;
+  targetExists: boolean;
+  canInspectFile: boolean;
+  canSplit: boolean;
+}): Array<{ id: string; label: string }> {
+  const actions: Array<{ id: string; label: string }> = [];
+  if (opts.kind === 'read' && opts.targetExists && opts.canInspectFile) {
+    actions.push({ id: 'view-file', label: 'Open file' });
+    if (opts.canSplit) actions.push({ id: 'split', label: 'Split' });
+    actions.push({ id: 'toggle', label: opts.collapsed ? 'Details' : 'Collapse' });
+    return actions;
+  }
+  if (opts.hasDiff || opts.kind === 'edit') {
+    actions.push({ id: 'inspect-diff', label: opts.hasDiff ? 'Inspect diff' : 'Inspect' });
+    if (opts.targetExists && opts.canInspectFile) actions.push({ id: 'view-file', label: 'Open file' });
+    if (opts.targetExists && opts.canSplit) actions.push({ id: 'split', label: 'Split' });
+    return actions;
+  }
+  if (opts.targetExists && opts.canInspectFile) {
+    actions.push({ id: 'view-file', label: 'Open file' });
+  }
+  actions.push({ id: 'inspect', label: 'Inspect' });
+  if (opts.hasCopyableOutput) {
+    actions.push({ id: 'copy-output', label: 'Copy' });
+  }
+  return actions;
+}
+
+export function ToolBody({ call, step, cwd, showRawInput, fullCommand, runnableCommand, diffMode, targetInfo, targetExists, summaryTitle, summaryTarget, pathExists, getBlob, onInspect, onInspectFile, onOpenSplit, onRunCommand, onAttachPath, onCopy }: {
   call: ToolCallUpdate;
+  step?: ToolStep;
   cwd: string;
   showRawInput: boolean;
   fullCommand?: string;
+  runnableCommand?: string;
   diffMode: DiffMode;
+  targetInfo?: ParsedTargetPath;
+  targetExists?: boolean;
+  summaryTitle?: string;
+  summaryTarget?: string;
   pathExists?(targetPath: string): boolean;
   getBlob?(key: string, data: string, mimeType: string): string | undefined;
   onInspect?(title: string, target: InspectTarget, subtitle?: string): void;
+  onInspectFile?(filePath: string, line?: number): void;
   onOpenSplit?(path: string, line?: number): void;
+  onRunCommand?(command: string): void;
+  onAttachPath?(path: string): void;
   onCopy?(text: string): void;
 }): JSX.Element {
   const checkPathExists = pathExists ?? cachedPathExists;
   const imagePaths = extractToolImagePaths(call, cwd).filter(checkPathExists);
   const copyableOutput = extractToolOutputText(call.rawOutput);
   const commandClip = !showRawInput && fullCommand ? clipInlinePreview(fullCommand, 6, 450) : undefined;
+  const splitCmd = fullCommand || runnableCommand;
   const rawInputClip = showRawInput && call.rawInput !== undefined
     ? clipInlinePreview(typeof call.rawInput === 'string' ? call.rawInput : JSON.stringify(call.rawInput, null, 2), 8, 600)
     : undefined;
   const extraLocations = (call.locations ?? []).filter(loc => !!loc.path);
+  const showLocations = extraLocations.length > 1 || (extraLocations.length === 1 && !targetInfo);
+  const resolvedTargetExists = targetExists ?? (!!targetInfo && checkPathExists(targetInfo.absPath));
+  const detailTitle = summaryTitle ?? call.title ?? call.toolCallId;
+  const hasInlineSplitForTarget = Boolean(
+    resolvedTargetExists && targetInfo && call.content?.some(c =>
+      c.type === 'diff' && (isAbsolute(c.path) ? c.path : resolve(cwd, c.path)) === targetInfo.absPath),
+  );
   return <col gap="sm">
-    {extraLocations.length > 1 && <row key="locations" gap="xs" align="center" wrap>
+    {showLocations && <row key="locations" gap="xs" align="center" wrap>
       <text><span s="muted">Locations</span></text>
       {extraLocations.slice(0, 6).map((loc, index) => {
         const label = `${formatPathLabel(loc.path, cwd)}${loc.line ? `:${loc.line}` : ''}`;
         const absLoc = isAbsolute(loc.path) ? loc.path : resolve(cwd, loc.path);
-        const canSplitLoc = !!onOpenSplit && checkPathExists(absLoc);
-        return <button key={`loc-${index}`} size="sm" variant="quiet" icon={canSplitLoc ? 'split' : 'file'}
+        const locExists = checkPathExists(absLoc);
+        const canInspectLoc = !!onInspectFile && locExists;
+        const canSplitLoc = !!onOpenSplit && locExists;
+        return <button key={`loc-${index}`} size="sm" variant="quiet" icon={canInspectLoc ? 'file' : canSplitLoc ? 'split' : 'copy'}
           onClick={() => {
-            if (canSplitLoc) onOpenSplit(absLoc, loc.line ?? undefined);
+            if (canInspectLoc) onInspectFile(absLoc, loc.line ?? undefined);
+            else if (canSplitLoc) onOpenSplit(absLoc, loc.line ?? undefined);
             else onCopy?.(absLoc);
           }}>
           {label}
@@ -208,13 +297,17 @@ export function ToolBody({ call, cwd, showRawInput, fullCommand, diffMode, pathE
     </col>}
     {commandClip && <col key="command" gap="xs">
       <code lang="sh" wrap>{commandClip.text}</code>
-      {(commandClip.truncated || onCopy || onInspect) && <row gap="xs" align="center" wrap>
+      {(commandClip.truncated || onCopy || onInspect || onRunCommand) && <row gap="xs" align="center" wrap>
         {onCopy && fullCommand && <button size="sm" variant="quiet" icon="copy" onClick={() => onCopy(fullCommand)}>
           Copy command
         </button>}
         {onInspect && fullCommand && <button size="sm" variant="quiet" icon="expand"
           onClick={() => onInspect('Command', { type: 'file', path: 'command.sh', content: fullCommand })}>
           Fullscreen command
+        </button>}
+        {onRunCommand && fullCommand && <button size="sm" variant="quiet" icon="split"
+          onClick={() => onRunCommand(fullCommand)}>
+          Run in split
         </button>}
       </row>}
     </col>}
@@ -235,10 +328,15 @@ export function ToolBody({ call, cwd, showRawInput, fullCommand, diffMode, pathE
           const absLinkPath = rawPath && !rawPath.includes('://')
             ? (isAbsolute(rawPath) ? rawPath : resolve(cwd, rawPath))
             : undefined;
-          const canSplitLink = !!absLinkPath && !!onOpenSplit && checkPathExists(absLinkPath);
+          const linkExists = !!absLinkPath && checkPathExists(absLinkPath);
+          const canSplitLink = linkExists && !!onOpenSplit;
+          const canInspectLink = linkExists && !!onInspectFile;
           return <row key={`content-${index}`} gap="xs" align="center" wrap>
             <text><span s="muted">{linkLabel}</span></text>
-            {canSplitLink && <button size="sm" variant="quiet" icon="split" onClick={() => onOpenSplit(absLinkPath)}>
+            {canInspectLink && <button size="sm" variant="quiet" icon="file" onClick={() => onInspectFile(absLinkPath!)}>
+              Open file
+            </button>}
+            {canSplitLink && <button size="sm" variant="quiet" icon="split" onClick={() => onOpenSplit(absLinkPath!)}>
               Tern split
             </button>}
             {onCopy && <button size="sm" variant="quiet" icon="copy" onClick={() => onCopy(link.uri)}>
@@ -308,12 +406,40 @@ export function ToolBody({ call, cwd, showRawInput, fullCommand, diffMode, pathE
     })}
     {call.rawOutput !== undefined && call.rawOutput !== null && call.rawOutput !== '' && <col key="output" gap="xs">
       <ToolOutput rawOutput={call.rawOutput} />
-      {onCopy && copyableOutput && <row gap="xs">
-        <button size="sm" variant="quiet" icon="copy" onClick={() => onCopy(copyableOutput)}>
+      {(onCopy || onInspect) && copyableOutput && <row gap="xs" wrap>
+        {onInspect && <button size="sm" variant="quiet" icon="expand"
+          onClick={() => onInspect(detailTitle, { type: 'file', path: 'task.log', content: copyableOutput }, summaryTarget)}>
+          Inspect output
+        </button>}
+        {onCopy && <button size="sm" variant="quiet" icon="copy" onClick={() => onCopy(copyableOutput)}>
           Copy output
-        </button>
+        </button>}
       </row>}
     </col>}
+    {((resolvedTargetExists && targetInfo && (onInspectFile || onOpenSplit || onAttachPath)) || (step && onInspect) || (!commandClip && splitCmd && onRunCommand)) && (
+      <row key="task-actions" gap="xs" wrap>
+        {resolvedTargetExists && targetInfo && onInspectFile && <button size="sm" variant="quiet" icon="file"
+          onClick={() => onInspectFile(targetInfo.absPath, targetInfo.line)}>
+          Open file
+        </button>}
+        {!commandClip && splitCmd && onRunCommand && <button size="sm" variant="quiet" icon="split"
+          onClick={() => onRunCommand(splitCmd)}>
+          Run in split
+        </button>}
+        {step && onInspect && <button size="sm" variant="quiet" icon="expand"
+          onClick={() => onInspect(detailTitle, { type: 'file', path: 'task.log', content: buildTaskDetailText(step, cwd) }, summaryTarget)}>
+          Inspect details
+        </button>}
+        {resolvedTargetExists && targetInfo && onOpenSplit && !hasInlineSplitForTarget && <button size="sm" variant="quiet" icon="split"
+          onClick={() => onOpenSplit(targetInfo.absPath, targetInfo.line)}>
+          Tern split
+        </button>}
+        {resolvedTargetExists && targetInfo && onAttachPath && <button size="sm" variant="quiet" icon="plus"
+          onClick={() => onAttachPath(targetInfo.path)}>
+          Attach
+        </button>}
+      </row>
+    )}
   </col>;
 }
 
@@ -332,6 +458,7 @@ export interface EntryCallbacks {
   pathExists?(targetPath: string): boolean;
   getBlob(key: string, data: string, mimeType: string): string | undefined;
   onInspect(title: string, target: InspectTarget, subtitle?: string): void;
+  onInspectFile?(filePath: string, line?: number): void;
   onToggleThought(id: string, open: boolean): void;
   onToggleTool(id: string, collapsed: boolean): void;
   onRetry(): void;
@@ -469,6 +596,27 @@ export function Entry({ entry, continued, streaming, recent, turnNumber, callbac
       const age = entry.startedAt !== undefined && entry.endedAt === undefined && running
         ? Math.max(0, callbacks.now - entry.startedAt)
         : undefined;
+      const targetInfo = summary.targetKind === 'path' ? parseToolTargetPath(summary.target, callbacks.cwd) : undefined;
+      const targetExists = !!targetInfo && checkPathExists(targetInfo.absPath);
+      const copyableOutput = extractToolOutputText(entry.call.rawOutput);
+      const isPlainFileRead = entry.call.kind === 'read' && !!targetInfo && targetExists && !summary.hasDiff &&
+        !hasMedia && !(entry.call.content?.length) && entry.call.rawOutput === undefined && entry.call.status !== 'failed';
+      const headerActions = buildToolHeaderActions({
+        kind: entry.call.kind,
+        hasDiff: summary.hasDiff,
+        hasCopyableOutput: !!copyableOutput,
+        collapsed,
+        targetExists,
+        canInspectFile: !!callbacks.onInspectFile,
+        canSplit: !!callbacks.onOpenSplit,
+      });
+      const openDetailsModal = (): void => {
+        callbacks.onInspect(
+          summary.title,
+          { type: 'file', path: 'task.log', content: buildTaskDetailText(entry, callbacks.cwd) },
+          summary.target,
+        );
+      };
       return <tool key={entry.id} name={summary.name}
         title={summary.title} target={summary.target} targetKind={summary.targetKind}
         frame={hasMedia ? 'card' : summary.frame} badges={summary.badges.length ? summary.badges : undefined}
@@ -476,24 +624,53 @@ export function Entry({ entry, continued, streaming, recent, turnNumber, callbac
         status={entry.call.status === 'in_progress' ? 'running' : entry.call.status === 'completed' ? 'done' :
           entry.call.status === 'failed' ? 'error' : 'pending'}
         collapsible collapsed={collapsed} preview={{ lines: 4 }}
+        tools={headerActions}
+        onAction={{
+          ...(targetInfo && callbacks.onInspectFile ? {
+            'view-file': () => callbacks.onInspectFile?.(targetInfo.absPath, targetInfo.line),
+          } : {}),
+          'inspect-diff': () => {
+            const diffInspect = firstToolDiffInspectTarget(entry.call, callbacks.cwd);
+            if (diffInspect) callbacks.onInspect(diffInspect.title, diffInspect.target, diffInspect.subtitle);
+            else openDetailsModal();
+          },
+          inspect: openDetailsModal,
+          ...(copyableOutput ? {
+            'copy-output': () => callbacks.onCopy(copyableOutput),
+          } : {}),
+          ...(targetInfo && callbacks.onOpenSplit ? {
+            split: () => callbacks.onOpenSplit?.(targetInfo.absPath, targetInfo.line),
+          } : {}),
+          toggle: () => callbacks.onToggleTool(entry.id, !collapsed),
+        }}
         onMenu={{
+          ...(targetInfo && targetExists && callbacks.onInspectFile ? {
+            'Open file in modal': () => callbacks.onInspectFile?.(targetInfo.absPath, targetInfo.line),
+          } : {}),
+          'Inspect task details': openDetailsModal,
           'Toggle details': () => callbacks.onToggleTool(entry.id, !collapsed),
-          ...(summary.targetKind === 'path' && summary.target ? {
-            'Attach path': () => callbacks.onAttachPath(summary.target!.replace(/:\d+$/, '')),
-            ...(callbacks.onOpenSplit ? {
-              'Open in Tern split': () => {
-                const match = /^(.*):(\d+)$/.exec(summary.target!);
-                const filePath = match ? match[1]! : summary.target!;
-                const line = match ? Number(match[2]) : undefined;
-                callbacks.onOpenSplit?.(filePath, line);
-              },
+          ...(targetInfo ? {
+            'Attach path': () => callbacks.onAttachPath(targetInfo.path),
+            ...(callbacks.onOpenSplit && targetExists ? {
+              'Open in Tern split': () => callbacks.onOpenSplit?.(targetInfo.absPath, targetInfo.line),
             } : {}),
           } : {}),
           ...(summary.hasDiff ? { 'Review in /changes': callbacks.onOpenChanges } : {}),
         }}
-        onToggle={event => callbacks.onToggleTool(entry.id, event.collapsed ?? !collapsed)}>
-        {!collapsed ? <ToolBody call={entry.call} cwd={callbacks.cwd} showRawInput={summary.showRawInput} fullCommand={summary.fullCommand} diffMode={callbacks.prefs.diffMode}
-          pathExists={checkPathExists} getBlob={callbacks.getBlob} onInspect={callbacks.onInspect} onOpenSplit={callbacks.onOpenSplit} onCopy={callbacks.onCopy} />
+        onToggle={event => {
+          if (collapsed && isPlainFileRead && targetInfo && callbacks.onInspectFile) {
+            callbacks.onInspectFile(targetInfo.absPath, targetInfo.line);
+            return;
+          }
+          callbacks.onToggleTool(entry.id, event.collapsed ?? !collapsed);
+        }}>
+        {!collapsed ? <ToolBody call={entry.call} step={entry} cwd={callbacks.cwd} showRawInput={summary.showRawInput}
+          fullCommand={summary.fullCommand} runnableCommand={summary.targetKind === 'command' ? summary.target : undefined}
+          diffMode={callbacks.prefs.diffMode}
+          targetInfo={targetInfo} targetExists={targetExists} summaryTitle={summary.title} summaryTarget={summary.target}
+          pathExists={checkPathExists} getBlob={callbacks.getBlob} onInspect={callbacks.onInspect}
+          onInspectFile={callbacks.onInspectFile} onOpenSplit={callbacks.onOpenSplit}
+          onRunCommand={callbacks.onRunCommand} onAttachPath={callbacks.onAttachPath} onCopy={callbacks.onCopy} />
           : <spacer key="lazy" size="none" />}
       </tool>;
     }

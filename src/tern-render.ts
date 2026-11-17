@@ -193,6 +193,7 @@ export class TernRenderController {
   private readonly timers: RenderTimerAdapter;
   private readonly entryCache = new WeakMap<TranscriptEntry, { key: string; node: JSX.Element }>();
   private readonly settledSigs = new Map<string, string>();
+  private readonly pendingSettle = new Map<string, string>();
   private readonly currentByIdScratch = new Map<string, RenderedEntryRecord>();
   private readonly activeAgeSnapshots = new Map<string, { startedAt: number; initialAgeMs: number }>();
 
@@ -207,6 +208,7 @@ export class TernRenderController {
   private _motionPref: MotionPref;
   private renderTimer: unknown;
   private resizeTimer: unknown;
+  private settleTimer: unknown;
   private lastRenderAt = 0;
   private disposed = false;
 
@@ -263,10 +265,38 @@ export class TernRenderController {
     }
   }
 
+  private clearScheduledSettle(): void {
+    if (this.settleTimer !== undefined) {
+      this.timers.clearTimeout(this.settleTimer);
+      this.settleTimer = undefined;
+    }
+  }
+
+  /** Restore visibility when direct terminal input confirms the pane is interactive. */
+  noteVisibleActivity(onDirty?: () => void): void {
+    if (this.disposed || this.surface.closed) return;
+    if (!this.visible) {
+      this.visible = true;
+      if (this.dirtyWhenHidden) {
+        this.dirtyWhenHidden = false;
+        onDirty?.();
+      }
+    }
+  }
+
   scheduleRender(busy: boolean, renderNowFn: () => void): void {
     if (this.disposed || this.surface.closed) return;
     if (!this.visible) {
       this.dirtyWhenHidden = true;
+      // Keep unfocused/split panes gently synchronized during active turns so updates never pile up until turn end.
+      if (busy && this.renderTimer === undefined) {
+        this.renderTimer = this.timers.setTimeout(() => {
+          this.renderTimer = undefined;
+          if (!this.disposed && !this.surface.closed && !this.surface.blocked) {
+            renderNowFn();
+          }
+        }, 300);
+      }
       return;
     }
     const intervalMs = this.frameIntervalMs(busy);
@@ -279,10 +309,12 @@ export class TernRenderController {
       const waitMs = Math.max(8, intervalMs - (now - this.lastRenderAt));
       this.renderTimer = this.timers.setTimeout(() => {
         this.renderTimer = undefined;
-        if (!this.disposed && !this.surface.closed && this.visible) {
-          renderNowFn();
-        } else if (!this.visible) {
-          this.dirtyWhenHidden = true;
+        if (!this.disposed && !this.surface.closed) {
+          if (this.visible) {
+            renderNowFn();
+          } else {
+            this.dirtyWhenHidden = true;
+          }
         }
       }, waitMs);
     }
@@ -357,30 +389,63 @@ export class TernRenderController {
     return { wireId, sig: meta.sig, settled: meta.settled, node };
   }
 
+  private flushPendingSettle(): void {
+    this.clearScheduledSettle();
+    if (this.disposed || this.surface.closed || this.surface.blocked || !this.pendingSettle.size) return;
+    const ops: Op[] = [];
+    for (const [wireId, sig] of this.pendingSettle) {
+      ops.push(['settle', wireId] as Op);
+      this.settledSigs.set(wireId, sig);
+    }
+    this.pendingSettle.clear();
+    if (ops.length > 0) {
+      this.surface.send(ops);
+    }
+  }
+
+  private schedulePendingSettle(): void {
+    if (this.settleTimer !== undefined || !this.pendingSettle.size || this.disposed || this.surface.closed) return;
+    this.settleTimer = this.timers.setTimeout(() => {
+      this.settleTimer = undefined;
+      if (!this.pendingSettle.size || this.disposed || this.surface.closed) return;
+      if (this.surface.blocked) {
+        this.schedulePendingSettle();
+        return;
+      }
+      this.flushPendingSettle();
+    }, 220);
+  }
+
   commitFrame(
     view: Renderable,
     renderedEntries: readonly RenderedEntryRecord[],
     replayingHistory: boolean,
+    busy = false,
   ): readonly string[] {
     this.clearScheduledRender();
+    this.clearScheduledSettle();
     if (this.disposed || this.surface.closed) return [];
     this.surface.render(view);
     this.lastRenderAt = this.timers.now();
     this.dirtyWhenHidden = false;
 
     const currentById = this.currentByIdScratch;
-    const trackSettled = this.supportsSettle && !replayingHistory && !this.surface.blocked;
-    if (this.settledSigs.size > 0 || trackSettled) {
+    const trackSettled = this.supportsSettle && !replayingHistory;
+    if (this.settledSigs.size > 0 || this.pendingSettle.size > 0 || trackSettled) {
       currentById.clear();
       for (const item of renderedEntries) {
         currentById.set(item.wireId, item);
       }
-      if (this.settledSigs.size > 0) {
-        for (const [wireId, settledSig] of this.settledSigs) {
-          const current = currentById.get(wireId);
-          if (!current || !current.settled || current.sig !== settledSig) {
-            this.settledSigs.delete(wireId);
-          }
+      for (const [wireId, settledSig] of this.settledSigs) {
+        const current = currentById.get(wireId);
+        if (!current || !current.settled || current.sig !== settledSig) {
+          this.settledSigs.delete(wireId);
+        }
+      }
+      for (const [wireId, pendingSig] of this.pendingSettle) {
+        const current = currentById.get(wireId);
+        if (!current || !current.settled || current.sig !== pendingSig) {
+          this.pendingSettle.delete(wireId);
         }
       }
     }
@@ -391,21 +456,25 @@ export class TernRenderController {
 
     const newlySettled: string[] = [];
     for (const item of renderedEntries) {
-      if (item.settled && !this.settledSigs.has(item.wireId)) {
+      if (item.settled && !this.settledSigs.has(item.wireId) && !this.pendingSettle.has(item.wireId)) {
         newlySettled.push(item.wireId);
+        this.pendingSettle.set(item.wireId, item.sig);
       }
     }
-    if (newlySettled.length > 0) {
-      this.surface.send(newlySettled.map(id => ['settle', id] as Op));
-      for (const id of newlySettled) {
-        const rec = currentById.get(id);
-        if (rec) this.settledSigs.set(id, rec.sig);
+    if (this.pendingSettle.size > 0) {
+      // Avoid burning the second flow-control credit synchronously during active streaming; defer settle ops until idle or quiet pause.
+      if (!busy && !this.surface.blocked) {
+        this.flushPendingSettle();
+      } else {
+        this.schedulePendingSettle();
       }
     }
     return newlySettled;
   }
 
   resetSessionTracking(): void {
+    this.clearScheduledSettle();
+    this.pendingSettle.clear();
     this.settledSigs.clear();
     this.activeAgeSnapshots.clear();
   }
@@ -414,6 +483,8 @@ export class TernRenderController {
     if (this.disposed) return;
     this.disposed = true;
     this.clearScheduledRender();
+    this.clearScheduledSettle();
+    this.pendingSettle.clear();
     if (this.resizeTimer !== undefined) {
       this.timers.clearTimeout(this.resizeTimer);
       this.resizeTimer = undefined;
