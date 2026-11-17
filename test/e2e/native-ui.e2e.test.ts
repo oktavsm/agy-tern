@@ -34,8 +34,16 @@ describe('agy-tern native Tern E2E smoke', () => {
     await harness.waitForReady({ timeoutMs: 8_000 });
     harness.assertWireInvariants();
 
-    // Verify composer control bar and effort indicator render on idle screen.
-    const composerBar = harness.findById('dock.composer-bar');
+    // Verify centered rounded composer card, composer control bar, and effort indicator render on idle screen.
+    const composerShell = harness.findById('dock.shell');
+    expect(composerShell).toBeDefined();
+    expect(composerShell?.p['role']).toBe('agy.dock.center');
+    expect(composerShell?.p['max']).toEqual({ w: '92ch' });
+    const composerCard = harness.findById('dock.shell.composer');
+    expect(composerCard?.p['role']).toBe('omp.editor');
+    const draftNode = harness.findById('dock.shell.composer.line.draft');
+    expect(draftNode?.p['variant']).toBe('well');
+    const composerBar = harness.findById('dock.shell.composer.composer-bar');
     expect(composerBar).toBeDefined();
     expect(harness.findByKind('effort', 'dock').length).toBeGreaterThanOrEqual(1);
 

@@ -137,6 +137,40 @@ export interface ChatLaunchState {
 export type NativeChatResult = { kind: 'unavailable' } | { kind: 'quit' } |
   { kind: 'login'; method: AuthMethodTerminal; draft: Draft; previousSessionId?: string };
 
+const DOCK_DRAFT_ID = 'dock.shell.composer.line.draft';
+
+const COMPOSER_LAYOUT_CSS = [
+  ".sf-col[data-role='agy.dock.center'] {",
+  '  width: 100%;',
+  '  max-width: 92ch;',
+  '  align-self: center;',
+  '  margin-left: auto;',
+  '  margin-right: auto;',
+  '  box-sizing: border-box;',
+  '  padding-left: 8px;',
+  '  padding-right: 8px;',
+  '}',
+  ".sf-col[data-role='agy.dock.center'] .sf-col[data-role='omp.editor'],",
+  ".sf-col[data-role='agy.dock.center'] .sf-col[data-role^='omp.editor.'] {",
+  '  margin: 0 0 2px;',
+  '}',
+  ".sf-col[data-role='agy.dock.center'] .sf-row[data-role='omp.composer.bar'] > .sf-place {",
+  '  display: none;',
+  '}',
+  ".sf-col[data-role='agy.dock.center'] .sf-row[data-role='omp.working'],",
+  ".sf-col[data-role='agy.dock.center'] .sf-col[data-role='omp.queue'] {",
+  '  margin-left: 0;',
+  '  margin-right: 0;',
+  '}',
+  ".sf-col[data-role='agy.dock.center'] .sf-status[data-role='agy.dock.status'] {",
+  '  padding-left: 4px;',
+  '  padding-right: 4px;',
+  '}',
+  ".sf-col[data-role='agy.dock.center'] .sf-text[data-role='agy.dock.keys'] {",
+  '  text-align: center;',
+  '}',
+].join('\n');
+
 function thinkingToEffort(value: string | undefined): 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' {
   const normalized = (value ?? '').trim().toLowerCase();
   if (normalized === 'off' || normalized === 'none' || normalized === '0') return 'off';
@@ -260,6 +294,18 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
   let cachedDiffCountConversation: Conversation | undefined;
   let cachedDiffCountRev = -1;
   let cachedDiffCount = 0;
+  let cachedActiveToolsConversation: Conversation | undefined;
+  let cachedActiveToolsRev = -1;
+  let cachedActiveTools: ToolStep[] = [];
+  const hoverKvCache = new Map<string, { sig: string; node: ReturnType<typeof hoverKv> }>();
+
+  function cachedHoverKv(slot: string, sig: string, rows: () => ReadonlyArray<{ k: string; v: string }>): ReturnType<typeof hoverKv> {
+    const existing = hoverKvCache.get(slot);
+    if (existing && existing.sig === sig) return existing.node;
+    const node = hoverKv([...rows()]);
+    hoverKvCache.set(slot, { sig, node });
+    return node;
+  }
   let cachedDiffsConversation: Conversation | undefined;
   let cachedDiffsRev = -1;
   let cachedSessionDiffs: SessionDiffItem[] = [];
@@ -665,7 +711,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     cachedSessionDiffs = [];
     autocompleteDismissed = true;
     render();
-    surface?.focus('dock.draft');
+    surface?.focus(DOCK_DRAFT_ID);
   }
 
   function stepBackPanel(): void {
@@ -1102,7 +1148,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         panel = undefined;
         panelError = '';
         render();
-        surface?.focus('dock.draft');
+        surface?.focus(DOCK_DRAFT_ID);
         void runCommandInTernSplit(options.cwd, trimmed).then(result => {
           if (quitting) return;
           if (result.ok) showToast('Running in Tern split', preview.slice(0, 48));
@@ -1253,7 +1299,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       }
       showToast('Attached clipboard image', `${loaded.mimeType} (${Math.max(1, Math.round(loaded.size / 1024))} KB)`);
       render();
-      surface?.focus('dock.draft');
+      surface?.focus(DOCK_DRAFT_ID);
     }).catch(error => {
       if (!quitting) showToast('Clipboard image unavailable', error instanceof Error ? error.message : String(error));
     });
@@ -1559,7 +1605,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       const dirPath = entry.path.endsWith('/') ? entry.path : `${entry.path}/`;
       if (!st.attachedDirs.includes(dirPath)) st.attachedDirs = [...st.attachedDirs, dirPath];
       render();
-      surface?.focus('dock.draft');
+      surface?.focus(DOCK_DRAFT_ID);
       return;
     }
     const filePath = entry.path;
@@ -1567,7 +1613,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       if (!agent?.promptCapabilities?.image) {
         render();
         showToast('Images not supported', 'This ACP agent did not advertise image prompt support');
-        surface?.focus('dock.draft');
+        surface?.focus(DOCK_DRAFT_ID);
         return;
       }
       render();
@@ -1577,7 +1623,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
           currentSt.attachedImages = [...currentSt.attachedImages, loaded];
         }
         render();
-        surface?.focus('dock.draft');
+        surface?.focus(DOCK_DRAFT_ID);
       }).catch(error => {
         if (!quitting) showToast('Could not attach image', error instanceof Error ? error.message : String(error));
       });
@@ -1585,28 +1631,28 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     }
     if (!st.attachedFiles.includes(filePath)) st.attachedFiles = [...st.attachedFiles, filePath];
     render();
-    surface?.focus('dock.draft');
+    surface?.focus(DOCK_DRAFT_ID);
   }
 
   function removeAttachment(filePath: string): void {
     const st = stateManager.getActive();
     st.attachedFiles = st.attachedFiles.filter(item => item !== filePath);
     render();
-    surface?.focus('dock.draft');
+    surface?.focus(DOCK_DRAFT_ID);
   }
 
   function removeDirAttachment(dirPath: string): void {
     const st = stateManager.getActive();
     st.attachedDirs = st.attachedDirs.filter(item => item !== dirPath);
     render();
-    surface?.focus('dock.draft');
+    surface?.focus(DOCK_DRAFT_ID);
   }
 
   function removeImageAttachment(filePath: string): void {
     const st = stateManager.getActive();
     st.attachedImages = st.attachedImages.filter(item => item.path !== filePath);
     render();
-    surface?.focus('dock.draft');
+    surface?.focus(DOCK_DRAFT_ID);
   }
 
   function panelChoices(): Choice[] {
@@ -1737,8 +1783,15 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
   }
 
   function activeToolSteps(): ToolStep[] {
-    return stateManager.getConversation().entries.filter((entry): entry is ToolStep =>
+    const conv = stateManager.getConversation();
+    if (cachedActiveToolsConversation === conv && cachedActiveToolsRev === conv.revision) {
+      return cachedActiveTools;
+    }
+    cachedActiveToolsConversation = conv;
+    cachedActiveToolsRev = conv.revision;
+    cachedActiveTools = conv.entries.filter((entry): entry is ToolStep =>
       entry.type === 'tool' && (entry.call.status === 'in_progress' || entry.call.status === 'pending'));
+    return cachedActiveTools;
   }
 
   function inspectTaskStep(step: ToolStep): void {
@@ -1804,7 +1857,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       pathExists,
       blobForImage,
       onRender: render,
-      onFocus: target => surface?.focus(target),
+      onFocus: target => surface?.focus(target === 'dock.draft' ? DOCK_DRAFT_ID : target),
       onEditPanelDraft: (event: EditEvent) => {
         panelDraft = editDraft(panelDraft, event);
         panelSelection = 0;
@@ -1915,7 +1968,9 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     const currentModel = modelOption(metadata.configOptions);
     const currentThinking = thinkingOption(metadata.configOptions);
     const currentMode = modeOption();
-    const draftCommand = resolveCommand(st.draft.text, availableCommands());
+    const draftCommand = st.draft.text.trimStart().startsWith('/')
+      ? resolveCommand(st.draft.text, availableCommands())
+      : undefined;
     const hasAttachments = st.attachedFiles.length > 0 || st.attachedDirs.length > 0 || st.attachedImages.length > 0;
     const hasDraftContent = !!(st.draft.text.trim() || hasAttachments);
     const canSend = hasDraftContent && !busy && !changingConfig && !sessionOperation && !authBusy && !permission &&
@@ -2017,21 +2072,12 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       onResend(text) {
         stateManager.getActive().draft = { text, cursor: text.length };
         render();
-        surface?.focus('dock.draft');
+        surface?.focus(DOCK_DRAFT_ID);
       },
       onLoadDeeperHistory() {
         void loadDeeperBrainHistory();
       },
     };
-    const editorButtons = busy
-      ? [
-        ...(hasDraftContent ? [{ act: 'send', text: 'Queue', icon: 'plus', variant: 'default' as const,
-          disabled: !canQueue }] : []),
-        { act: 'stop', text: 'Stop', icon: 'stop', variant: 'danger' as const, keys: ['esc'],
-          disabled: cancelling && 'Cancellation requested' },
-      ]
-      : [{ act: 'send', text: 'Send', icon: 'send', variant: permission ? 'default' as const : 'primary' as const,
-        disabled: !canSend }];
 
     const allEntries = conv.entries;
     const totalEntries = allEntries.length;
@@ -2102,344 +2148,392 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
             </col>}
         </scroll>
       </col>,
-      dock: <col gap="xs">
-        {showHud && <row key="hud" justify="between" align="center" gap="sm" wrap>
-          <row gap="sm" align="center" wrap>
-            {(busy || activeTools.length > 0) && <row key="live-turn" gap="sm" align="center">
-              <spinner style="starburst" />
-              <shimmer text={liveTaskLabel} />
-              <elapsed age={hudAgeMs} />
-              <button size="sm" variant="quiet" onClick={() => openPanel({ kind: 'tasks' })}>Tasks</button>
-              <button size="sm" variant="danger" disabled={cancelling && 'Cancellation requested'} onClick={stop}>
-                {cancelling ? 'Stopping...' : 'Stop'}
-              </button>
-            </row>}
-            {activePlan && planSummary && <checklist key="plan-hud" mode="hud"
-              note={`${planSummary.done}/${planSummary.total}`}
-              phases={[{ title: 'Tasks', items: activePlan.entries.map((item, index) => ({
-                id: String(index), text: item.content,
-                status: item.status === 'in_progress' ? 'active' : item.status === 'completed' ? 'done' : 'pending',
-              })) }]} />}
-          </row>
-          {!showComposerBar && contextUsage && <meter key="context" style="bar" size="sm"
-            value={contextUsage.percent / 100}
-            thresholds={{ warn: 0.75, bad: 0.9 }}
-            label={contextUsage.summary}
-            title={`Session context: ${metadata.usage?.used.toLocaleString()} / ${metadata.usage?.size.toLocaleString()} tokens (click for /usage)`}
-            hovercard={hoverKv([
-              { k: 'Context used', v: `${metadata.usage?.used.toLocaleString()} tokens` },
-              { k: 'Window', v: `${metadata.usage?.size.toLocaleString()} tokens` },
-              ...(metadata.usage?.cost ? [{ k: 'Session cost', v: `${metadata.usage.cost.amount} ${metadata.usage.cost.currency}` }] : []),
-              ...(metadata.tier ? [{ k: 'Subscription tier', v: metadata.tier.name }] : []),
-              { k: 'Action', v: 'Click to open /usage' },
-            ])}
-            onClick={() => { if (agent && !disconnected && !permission) openPanel({ kind: 'report', report: 'usage' }); }} />}
-        </row>}
-        {permission && approvalCall && approvalSummary && <tool key={`approval-${permission.id}`}
-          title={approvalSummary.title}
-          name={approvalSummary.name}
-          target={approvalSummary.target}
-          targetKind={approvalSummary.targetKind}
-          status="pending" note="Approval required">
-          <text>Choose a one-time permission for this tool. Tab selects a choice; Ctrl+Y allows, Ctrl+N denies. Enter never approves.</text>
-          <scroll max={{ h: layout.approvalBodyMaxH }}>
-            <ToolBody call={approvalCall} cwd={options.cwd} showRawInput={approvalSummary.showRawInput}
-              fullCommand={approvalSummary.fullCommand} diffMode={userPrefs.diffMode}
-              pathExists={pathExists} getBlob={blobForImage} onInspect={openInspect}
-              onOpenSplit={openSplit} onCopy={entryCallbacks.onCopy} />
-          </scroll>
-          <buttons variant="toolbar" label="One-time permission choices">
-            {offered.map(option => <button key={option.optionId} on={option === selectedChoice}
-              variant={option === selectedChoice && option.kind === 'allow_once' ? 'primary' : 'default'}
-              keys={option === selectedChoice ? ['ctrl', option.kind === 'allow_once' ? 'y' : 'n'] : undefined}
-              onClick={() => answer(permission, option.optionId)}>{option.name}</button>)}
-            {!firstDeny && <button keys={['ctrl', 'n']} onClick={() => answer(permission, null)}>Cancel request</button>}
-          </buttons>
-          {permissions.length > 1 && <text wrap="char"><span s="muted">Queued: {permissions.slice(1).map(next =>
-            next.request.toolCall.title ?? next.request.toolCall.toolCallId).join('; ')}</span></text>}
-        </tool>}
-        {suggestions.length > 0 && <list key="commands" selected={`dock.commands.row-${selectedCommand}`} max={{ lines: layout.dockPopupMaxLines }}>
-          {suggestions.map((command, index) => <item key={`row-${index}`} label={`/${command.name}`}
-            detail={command.description} value={command.hint ? 'Arguments' : command.local ? 'Panel' : 'agy'}
-            title={`/${command.name}: ${command.description}${command.hint ? ` · ${command.hint}` : ''}`}
-            onClick={() => chooseCommand(command)} />)}
-        </list>}
-        {atMatches.length > 0 && <list key="files" selected={`dock.files.row-${selectedFile}`} max={{ lines: layout.dockPopupMaxLines }}>
-          {atMatches.map((entry, index) => {
-            const isDir = entry.kind === 'dir';
-            const cleanPath = isDir ? entry.path.replace(/\/+$/, '') : entry.path;
-            const isImg = !isDir && !!imageMimeType(entry.path);
-            const icon = isDir ? 'folder' : isImg ? 'file-image' : 'file';
-            const label = isDir ? `${basename(cleanPath) || cleanPath}/` : basename(entry.path);
-            const detail = entry.ignored ? `${entry.path} [gitignored]` : entry.path;
-            const value = isDir
-              ? (entry.ignored ? 'Dir · gitignored' : 'Directory')
-              : isImg
-                ? (entry.ignored ? 'Image · gitignored' : 'Image')
-                : (entry.ignored ? 'gitignored' : 'Attach');
-            return <item key={`row-${index}`} icon={icon} label={label}
-              detail={detail} value={value} title={`Attach ${detail}`}
-              onClick={() => attachFile(entry)} />;
-          })}
-        </list>}
-        {st.queuedPrompts.length > 0 && <col key="queue" gap="xs">
-          {st.queuedPrompts.map((item, idx) => {
-            const label = item.text.trim().replace(/\s+/g, ' ');
-            const preview = label.length > 64 ? `${label.slice(0, 61)}...` : (label || `${item.images.length} image(s)`);
-            const metaParts = [
-              ...(item.files.length ? [`${item.files.length} file${item.files.length === 1 ? '' : 's'}`] : []),
-              ...(item.dirs.length ? [`${item.dirs.length} dir${item.dirs.length === 1 ? '' : 's'}`] : []),
-              ...(item.images.length ? [`${item.images.length} image${item.images.length === 1 ? '' : 's'}`] : []),
-            ];
-            return <row key={item.id} justify="between" align="center" gap="sm">
-              <text wrap="char">
-                <span s="accent">Queued #{idx + 1}</span>
-                <span>: {preview}</span>
-                {metaParts.length > 0 && <span s="muted"> ({metaParts.join(', ')})</span>}
-              </text>
-              <row gap="xs">
-                {idx === 0 && canSendQueueHead && <button size="sm" variant="primary" onClick={() => {
-                  const next = stateManager.pullQueuedAt(0);
-                  if (!next) return;
-                  submitPrompt(formatPromptWithAttachments(next.text, next.files, next.dirs), next.images, next.files, next.dirs);
-                }}>Send</button>}
-                <button size="sm" variant="quiet" onClick={() => {
-                  const pulled = stateManager.pullQueuedAt(idx);
-                  if (!pulled) return;
-                  const currentSt = stateManager.getActive();
-                  currentSt.draft = { text: pulled.text, cursor: pulled.text.length };
-                  currentSt.attachedFiles = [...pulled.files];
-                  currentSt.attachedDirs = [...pulled.dirs];
-                  currentSt.attachedImages = [...pulled.images];
-                  render();
-                  surface?.focus('dock.draft');
-                }}>Edit</button>
-                <button size="sm" variant="quiet" onClick={() => {
-                  stateManager.dropQueuedAt(idx);
-                  render();
-                }}>Drop</button>
-              </row>
-            </row>;
-          })}
-        </col>}
-        {hasAttachments && <row key="attachments" gap="xs" wrap>
-          {st.attachedImages.map(image => <attachment key={`img:${image.path}`} variant="tile"
-            name={basename(image.path)} mime={image.mimeType} size={image.size} path={image.path}
-            blob={blobForImage(`att:${image.path}`, image.data, image.mimeType)}
-            actions={[{ act: 'preview', icon: 'expand', title: 'Center preview' }]}
-            removable
-            onAction={{
-              preview: () => {
-                const blob = blobForImage(`att:${image.path}`, image.data, image.mimeType);
-                if (blob) openInspect(basename(image.path), { type: 'image-blob', blob, mimeType: image.mimeType, name: basename(image.path) }, image.path);
-              },
-              remove: () => removeImageAttachment(image.path),
-            }} />)}
-          {st.attachedDirs.map(dir => {
-            const clean = dir.replace(/\/+$/, '');
-            const isIgnored = ignoredPathsSet.has(dir);
-            return <attachment key={`dir:${dir}`} variant="chip" ext="DIR" mime="inode/directory"
-              name={`${basename(clean) || clean}/`}
-              path={dir} meta={isIgnored ? `${dir} · gitignored` : `${dir} · directory`}
-              actions={[{ act: 'preview', icon: 'expand', title: 'Inspect directory' }]}
-              removable
-              onAction={{
-                preview: () => {
-                  void listDirectoryEntriesPreview(options.cwd, dir).then(pv => {
-                    if (!quitting) openInspect(pv.path, { type: 'dir', preview: pv }, pv.path);
-                  }).catch(() => {});
-                },
-                remove: () => removeDirAttachment(dir),
-              }} />;
-          })}
-          {st.attachedFiles.map(file => {
-            const isIgnored = ignoredPathsSet.has(file);
-            return <attachment key={file} variant="chip" name={basename(file)}
-              path={file} meta={isIgnored ? `${file} · gitignored` : file}
-              actions={[{ act: 'preview', icon: 'expand', title: 'Inspect file' }]}
-              removable
-              onAction={{
-                preview: () => {
-                  void readWorkspaceTextPreview(options.cwd, file).then(pv => {
-                    if (!quitting) openInspect(basename(file), { type: 'file', path: pv.path, content: pv.text, truncated: pv.truncated }, file);
-                  }).catch(() => {});
-                },
-                remove: () => removeAttachment(file),
-              }} />;
-          })}
-        </row>}
-        <editor key="draft" aria="Message to Antigravity" text={st.draft.text} cursor={st.draft.cursor} anchor={st.draft.anchor}
-          placeholder={disconnected ? 'Use /account to sign in, or draft a message' : busy ? 'Draft your next message' : 'Message Antigravity, / for commands, @ for files & dirs'}
-          readonly={authBusy} maxLines={layout.composerMaxLines} variant="field"
-          buttons={editorButtons}
-          onFocus={() => surface?.focus('dock.draft')}
-          onEdit={event => {
-            if (!authBusy) {
-              const currentSt = stateManager.getActive();
-              const next = editDraft(currentSt.draft, event);
-              recordUndo(currentSt.draft, next);
-              currentSt.draft = next;
-              autocompleteDismissed = false;
-              commandSelection = 0;
-              fileSelection = 0;
-              scheduleRender();
-            }
-          }}
-          onUndo={() => { if (!authBusy) applyUndo(); }}
-          onAction={{ send, stop }} />
-        {showComposerBar && <row key="composer-bar" justify="between" align="center" gap="sm" wrap>
-          <row gap="sm" align="center" wrap>
-            {currentModel && <button size="sm" variant="quiet" icon="model"
-              disabled={(!agent || disconnected || !!permission) && 'Wait until connected'}
-              title="Change model (/model)"
-              onClick={() => openPanel({ kind: 'config', id: currentModel.id })}>
-              {configLabel(currentModel)}
-            </button>}
-            {currentThinking && <row gap="xs" align="center">
-              <effort level={thinkingToEffort(String(currentThinking.currentValue))} />
-              <button size="sm" variant="quiet"
-                disabled={(!agent || disconnected || !!permission) && 'Wait until connected'}
-                title="Change thinking effort"
-                onClick={() => openPanel({ kind: 'config', id: currentThinking.id })}>
-                {configLabel(currentThinking)}
-              </button>
-            </row>}
-            {currentMode && <button size="sm" variant="quiet" icon="shield"
-              disabled={(!agent || !!permission) && 'Wait until connected'}
-              title="Session mode (/permissions)"
-              onClick={() => openPanel({ kind: 'config', id: currentMode.id })}>
-              {configLabel(currentMode)}
-            </button>}
-          </row>
-          <row gap="sm" align="center" wrap>
-            {metadata.usage?.cost && <text><span s="muted">{`${metadata.usage.cost.amount.toFixed(4)} ${metadata.usage.cost.currency}`}</span></text>}
-            {contextUsage && <meter key="context" style="bar" size="sm"
+      dock: <col align="center" gap="none">
+        <col key="shell" role="agy.dock.center" max={{ w: '92ch' }} gap="xs">
+          {showHud && <row key="hud" role="omp.working" justify="between" align="center" gap="sm" wrap>
+            <row gap="sm" align="center" wrap>
+              {(busy || activeTools.length > 0) && <row key="live-turn" gap="sm" align="center">
+                <spinner style="starburst" />
+                <shimmer text={liveTaskLabel} />
+                <elapsed age={hudAgeMs} />
+                <button size="sm" variant="quiet" onClick={() => openPanel({ kind: 'tasks' })}>Tasks</button>
+                <button size="sm" variant="danger" disabled={cancelling && 'Cancellation requested'} onClick={stop}>
+                  {cancelling ? 'Stopping...' : 'Stop'}
+                </button>
+              </row>}
+              {activePlan && planSummary && <checklist key="plan-hud" mode="hud"
+                note={`${planSummary.done}/${planSummary.total}`}
+                phases={[{ title: 'Tasks', items: activePlan.entries.map((item, index) => ({
+                  id: String(index), text: item.content,
+                  status: item.status === 'in_progress' ? 'active' : item.status === 'completed' ? 'done' : 'pending',
+                })) }]} />}
+            </row>
+            {!showComposerBar && contextUsage && <meter key="context" style="bar" size="sm"
               value={contextUsage.percent / 100}
               thresholds={{ warn: 0.75, bad: 0.9 }}
               label={contextUsage.summary}
               title={`Session context: ${metadata.usage?.used.toLocaleString()} / ${metadata.usage?.size.toLocaleString()} tokens (click for /usage)`}
-              hovercard={hoverKv([
-                { k: 'Context used', v: `${metadata.usage?.used.toLocaleString()} tokens` },
-                { k: 'Window', v: `${metadata.usage?.size.toLocaleString()} tokens` },
-                ...(metadata.usage?.cost ? [{ k: 'Session cost', v: `${metadata.usage.cost.amount} ${metadata.usage.cost.currency}` }] : []),
-                ...(metadata.tier ? [{ k: 'Subscription tier', v: metadata.tier.name }] : []),
-                { k: 'Action', v: 'Click to open /usage' },
-              ])}
+              hovercard={cachedHoverKv(
+                'hud-context',
+                `${metadata.usage?.used ?? ''}|${metadata.usage?.size ?? ''}|${metadata.usage?.cost?.amount ?? ''}|${metadata.usage?.cost?.currency ?? ''}|${metadata.tier?.name ?? ''}`,
+                () => [
+                  { k: 'Context used', v: `${metadata.usage?.used.toLocaleString()} tokens` },
+                  { k: 'Window', v: `${metadata.usage?.size.toLocaleString()} tokens` },
+                  ...(metadata.usage?.cost ? [{ k: 'Session cost', v: `${metadata.usage.cost.amount} ${metadata.usage.cost.currency}` }] : []),
+                  ...(metadata.tier ? [{ k: 'Subscription tier', v: metadata.tier.name }] : []),
+                  { k: 'Action', v: 'Click to open /usage' },
+                ],
+              )}
               onClick={() => { if (agent && !disconnected && !permission) openPanel({ kind: 'report', report: 'usage' }); }} />}
-          </row>
-        </row>}
-        <status key="bar">
-          <seg key="state" priority={10}
-            tone={busy || authBusy || agentConnecting || !!sessionOperation ? 'accent' : disconnected || phase.includes('failed') ? 'error' : agent ? 'success' : 'muted'}
-            text={authBusy ? 'Signing in' : sessionOperation ?? phase}
-            title={disconnected && !agentConnecting ? 'Click to reconnect agy ACP' : busy ? 'Click to inspect running task (/tasks)' : undefined}
-            onClick={() => {
-              if (disconnected && !agentConnecting && !authBusy) reconnectAgent();
-              else if (busy && !permission && !authBusy) openPanel({ kind: 'tasks' });
-            }} />
-          {st.historyIndex !== undefined && <seg key="history" priority={6} icon="history" tone="accent"
-            text={`History ${st.historyIndex + 1}/${promptHistory.length}`}
-            title="Up/Down cycles sent prompts; type to keep editing" />}
-          {!showComposerBar && <seg key="model" priority={9} icon="model"
-            tone={(!agent || disconnected || !!permission) ? 'muted' : undefined}
-            text={currentModel ? configLabel(currentModel) : 'Model'}
-            hovercard={hoverKv([
-              { k: 'Model', v: currentModel ? configLabel(currentModel) : 'Not reported' },
-              ...(currentModel ? [{ k: 'Option ID', v: String(currentModel.currentValue) }] : []),
-              { k: 'Shortcut', v: 'Click or type /model' },
-            ])}
-            onClick={() => {
-              if (agent && !disconnected && !permission) {
-                openPanel(currentModel ? { kind: 'config', id: currentModel.id } : { kind: 'settings' });
-              }
-            }} />}
-          {!showComposerBar && currentThinking && <seg key="thinking" priority={7} icon="thinking"
-            tone={(!agent || disconnected || !!permission) ? 'muted' : undefined}
-            text={configLabel(currentThinking)}
-            hovercard={hoverKv([
-              { k: 'Thinking level', v: configLabel(currentThinking) },
-              { k: 'Action', v: 'Click to change reasoning effort' },
-            ])}
-            onClick={() => {
-              if (agent && !disconnected && !permission) openPanel({ kind: 'config', id: currentThinking.id });
-            }} />}
-          {!showComposerBar && <seg key="mode" priority={6} icon="shield"
-            tone={(!agent || !!permission) ? 'muted' : undefined}
-            text={currentMode ? configLabel(currentMode) : 'Permissions'}
-            hovercard={hoverKv([
-              { k: 'Mode', v: currentMode ? configLabel(currentMode) : 'Not reported' },
-              { k: 'Sandbox', v: '--sandbox requested (unverified)' },
-              { k: 'Shortcut', v: 'Click or type /permissions' },
-            ])}
-            onClick={() => {
-              if (agent && !permission) openPanel({ kind: 'permissions' });
-            }} />}
-          <seg key="sessions" priority={4} icon="history"
-            tone={(!agent || disconnected || !!permission || busy || changingConfig || !!sessionOperation) ? 'muted' : undefined}
-            text={sid ? sessionTitle(sid) : 'Sessions'}
-            hovercard={hoverKv([
-              { k: 'Conversation', v: sid ? sessionTitle(sid) : 'No active session' },
-              ...(sid ? [{ k: 'Session ID', v: sid }] : []),
-              { k: 'Shortcut', v: 'Click or type /sessions' },
-            ])}
-            onClick={() => {
-              if (agent && !disconnected && !permission && !busy && !changingConfig && !sessionOperation) {
-                openPanel({ kind: 'sessions' });
-              }
-            }} />
-          <seg key="branch" priority={2} icon="branch"
-            text={gitBranch ? `${workspaceName} · ${gitBranch}` : workspaceName}
-            title={options.cwd} />
-          {(options.agentName || (options.additionalDirectories?.length ?? 0) > 0) && <seg key="scope" priority={5} icon="tern"
-            text={[
-              ...(options.agentName ? [options.agentName] : []),
-              ...(options.additionalDirectories?.length ? [`+${options.additionalDirectories.length} dir`] : []),
-            ].join(' · ')}
-            hovercard={hoverKv([
-              { k: 'Agent profile', v: options.agentName ?? 'Default' },
-              { k: 'Workspace roots', v: String(1 + (options.additionalDirectories?.length ?? 0)) },
-              { k: 'Shortcut', v: 'Click or type /agents' },
-            ])}
-            onClick={() => { if (!permission && !authBusy) openPanel({ kind: 'agents' }); }} />}
-          {sessionDiffCount > 0 && <seg key="changes" side="right" priority={8} icon="diff" tone="accent"
-            text={`Changes (${sessionDiffCount})`}
-            title={`Inspect ${sessionDiffCount} session edit${sessionDiffCount === 1 ? '' : 's'} (/changes)`}
-            onClick={() => { if (!permission && !authBusy) openPanel({ kind: 'changes' }); }} />}
-          <seg key="commands" side="right" priority={5} icon="slash" text="Commands"
-            tone={(!agent || disconnected || !!permission) ? 'muted' : undefined}
-            title="Commands (/)"
-            onClick={() => { if (agent && !disconnected && !permission) openPanel({ kind: 'commands' }); }} />
-          <seg key="settings" side="right" priority={6} icon="settings" text="Settings"
-            title="Settings & Preferences (/settings)"
-            onClick={() => { if (!permission && !authBusy) openPanel({ kind: 'settings' }); }} />
-          {!contextUsage && <seg key="usage" side="right" priority={5} icon="context" text="Usage"
-            tone={(!agent || disconnected || !!permission) ? 'muted' : undefined}
-            title="Usage & Quota (/usage)"
-            onClick={() => { if (agent && !disconnected && !permission) openPanel({ kind: 'report', report: 'usage' }); }} />}
-          <seg key="account" side="right" priority={8} icon="user"
-            text={metadata.tier && colsNow >= 96 ? metadata.tier.name : 'Account'}
-            hovercard={hoverKv([
-              { k: 'ACP', v: disconnected ? 'Disconnected' : agent ? 'Connected' : 'Connecting' },
-              { k: 'Subscription tier', v: metadata.tier ? metadata.tier.name : 'Not reported' },
-              { k: 'Shortcut', v: 'Click or type /account' },
-            ])}
-            onClick={() => { if (!permission && !authBusy) openPanel({ kind: 'account' }); }} />
-          <seg key="quit" side="right" priority={9} icon="power" text="Quit"
-            title="Quit frontend (Ctrl+Q)"
-            onClick={quit} />
-        </status>
-        {layout.showKeyLegend && <text key="keys" wrap="word">
-          <span s="key">Enter</span><span s="muted"> send  </span>
-          <span s="key">/</span><span s="muted"> commands  </span>
-          <span s="key">@</span><span s="muted"> files/dirs  </span>
-          <span s="key">Shift+Enter</span><span s="muted"> newline  </span>
-          <span s="key">Esc</span><span s="muted"> stop  </span>
-          <span s="key">PgUp/PgDn</span><span s="muted"> scroll  </span>
-          {permission && <><span s="key">Tab/Shift+Tab</span><span s="muted"> choice  </span>
-            <span s="key">Ctrl+Y</span><span s="muted"> allow  </span>
-            <span s="key">Ctrl+N</span><span s="muted"> deny  </span></>}
-          <span s="key">Ctrl+Q</span><span s="muted"> quit</span>
-        </text>}
+          </row>}
+          {permission && approvalCall && approvalSummary && <tool key={`approval-${permission.id}`}
+            title={approvalSummary.title}
+            name={approvalSummary.name}
+            target={approvalSummary.target}
+            targetKind={approvalSummary.targetKind}
+            status="pending" note="Approval required">
+            <text>Choose a one-time permission for this tool. Tab selects a choice; Ctrl+Y allows, Ctrl+N denies. Enter never approves.</text>
+            <scroll max={{ h: layout.approvalBodyMaxH }}>
+              <ToolBody call={approvalCall} cwd={options.cwd} showRawInput={approvalSummary.showRawInput}
+                fullCommand={approvalSummary.fullCommand} diffMode={userPrefs.diffMode}
+                pathExists={pathExists} getBlob={blobForImage} onInspect={openInspect}
+                onOpenSplit={openSplit} onCopy={entryCallbacks.onCopy} />
+            </scroll>
+            <buttons variant="toolbar" label="One-time permission choices">
+              {offered.map(option => <button key={option.optionId} on={option === selectedChoice}
+                variant={option === selectedChoice && option.kind === 'allow_once' ? 'primary' : 'default'}
+                keys={option === selectedChoice ? ['ctrl', option.kind === 'allow_once' ? 'y' : 'n'] : undefined}
+                onClick={() => answer(permission, option.optionId)}>{option.name}</button>)}
+              {!firstDeny && <button keys={['ctrl', 'n']} onClick={() => answer(permission, null)}>Cancel request</button>}
+            </buttons>
+            {permissions.length > 1 && <text wrap="char"><span s="muted">Queued: {permissions.slice(1).map(next =>
+              next.request.toolCall.title ?? next.request.toolCall.toolCallId).join('; ')}</span></text>}
+          </tool>}
+          {suggestions.length > 0 && <list key="commands" selected={`dock.shell.commands.row-${selectedCommand}`} max={{ lines: layout.dockPopupMaxLines }}>
+            {suggestions.map((command, index) => <item key={`row-${index}`} label={`/${command.name}`}
+              detail={command.description} value={command.hint ? 'Arguments' : command.local ? 'Panel' : 'agy'}
+              title={`/${command.name}: ${command.description}${command.hint ? ` · ${command.hint}` : ''}`}
+              onClick={() => chooseCommand(command)} />)}
+          </list>}
+          {atMatches.length > 0 && <list key="files" selected={`dock.shell.files.row-${selectedFile}`} max={{ lines: layout.dockPopupMaxLines }}>
+            {atMatches.map((entry, index) => {
+              const isDir = entry.kind === 'dir';
+              const cleanPath = isDir ? entry.path.replace(/\/+$/, '') : entry.path;
+              const isImg = !isDir && !!imageMimeType(entry.path);
+              const icon = isDir ? 'folder' : isImg ? 'file-image' : 'file';
+              const label = isDir ? `${basename(cleanPath) || cleanPath}/` : basename(entry.path);
+              const detail = entry.ignored ? `${entry.path} [gitignored]` : entry.path;
+              const value = isDir
+                ? (entry.ignored ? 'Dir · gitignored' : 'Directory')
+                : isImg
+                  ? (entry.ignored ? 'Image · gitignored' : 'Image')
+                  : (entry.ignored ? 'gitignored' : 'Attach');
+              return <item key={`row-${index}`} icon={icon} label={label}
+                detail={detail} value={value} title={`Attach ${detail}`}
+                onClick={() => attachFile(entry)} />;
+            })}
+          </list>}
+          {st.queuedPrompts.length > 0 && <col key="queue" role="omp.queue" gap="xs">
+            {st.queuedPrompts.map((item, idx) => {
+              const label = item.text.trim().replace(/\s+/g, ' ');
+              const preview = label.length > 64 ? `${label.slice(0, 61)}...` : (label || `${item.images.length} image(s)`);
+              const metaParts = [
+                ...(item.files.length ? [`${item.files.length} file${item.files.length === 1 ? '' : 's'}`] : []),
+                ...(item.dirs.length ? [`${item.dirs.length} dir${item.dirs.length === 1 ? '' : 's'}`] : []),
+                ...(item.images.length ? [`${item.images.length} image${item.images.length === 1 ? '' : 's'}`] : []),
+              ];
+              return <row key={item.id} role="omp.queue.item" justify="between" align="center" gap="sm">
+                <text wrap="char">
+                  <span s="accent">Queued #{idx + 1}</span>
+                  <span>: {preview}</span>
+                  {metaParts.length > 0 && <span s="muted"> ({metaParts.join(', ')})</span>}
+                </text>
+                <row gap="xs">
+                  {idx === 0 && canSendQueueHead && <button size="sm" variant="primary" onClick={() => {
+                    const next = stateManager.pullQueuedAt(0);
+                    if (!next) return;
+                    submitPrompt(formatPromptWithAttachments(next.text, next.files, next.dirs), next.images, next.files, next.dirs);
+                  }}>Send</button>}
+                  <button size="sm" variant="quiet" onClick={() => {
+                    const pulled = stateManager.pullQueuedAt(idx);
+                    if (!pulled) return;
+                    const currentSt = stateManager.getActive();
+                    currentSt.draft = { text: pulled.text, cursor: pulled.text.length };
+                    currentSt.attachedFiles = [...pulled.files];
+                    currentSt.attachedDirs = [...pulled.dirs];
+                    currentSt.attachedImages = [...pulled.images];
+                    render();
+                    surface?.focus(DOCK_DRAFT_ID);
+                  }}>Edit</button>
+                  <button size="sm" variant="quiet" onClick={() => {
+                    stateManager.dropQueuedAt(idx);
+                    render();
+                  }}>Drop</button>
+                </row>
+              </row>;
+            })}
+          </col>}
+          <col key="composer" role="omp.editor" tone={busy ? 'pending' : undefined} gap="xs">
+            {hasAttachments && <row key="attachments" role="omp.composer.chips" gap="xs" wrap>
+              {st.attachedImages.map(image => <attachment key={`img:${image.path}`} variant="tile"
+                name={basename(image.path)} mime={image.mimeType} size={image.size} path={image.path}
+                blob={blobForImage(`att:${image.path}`, image.data, image.mimeType)}
+                actions={[{ act: 'preview', icon: 'expand', title: 'Center preview' }]}
+                removable
+                onAction={{
+                  preview: () => {
+                    const blob = blobForImage(`att:${image.path}`, image.data, image.mimeType);
+                    if (blob) openInspect(basename(image.path), { type: 'image-blob', blob, mimeType: image.mimeType, name: basename(image.path) }, image.path);
+                  },
+                  remove: () => removeImageAttachment(image.path),
+                }} />)}
+              {st.attachedDirs.map(dir => {
+                const clean = dir.replace(/\/+$/, '');
+                const isIgnored = ignoredPathsSet.has(dir);
+                return <attachment key={`dir:${dir}`} variant="chip" ext="DIR" mime="inode/directory"
+                  name={`${basename(clean) || clean}/`}
+                  path={dir} meta={isIgnored ? `${dir} · gitignored` : `${dir} · directory`}
+                  actions={[{ act: 'preview', icon: 'expand', title: 'Inspect directory' }]}
+                  removable
+                  onAction={{
+                    preview: () => {
+                      void listDirectoryEntriesPreview(options.cwd, dir).then(pv => {
+                        if (!quitting) openInspect(pv.path, { type: 'dir', preview: pv }, pv.path);
+                      }).catch(() => {});
+                    },
+                    remove: () => removeDirAttachment(dir),
+                  }} />;
+              })}
+              {st.attachedFiles.map(file => {
+                const isIgnored = ignoredPathsSet.has(file);
+                return <attachment key={file} variant="chip" name={basename(file)}
+                  path={file} meta={isIgnored ? `${file} · gitignored` : file}
+                  actions={[{ act: 'preview', icon: 'expand', title: 'Inspect file' }]}
+                  removable
+                  onAction={{
+                    preview: () => {
+                      void readWorkspaceTextPreview(options.cwd, file).then(pv => {
+                        if (!quitting) openInspect(basename(file), { type: 'file', path: pv.path, content: pv.text, truncated: pv.truncated }, file);
+                      }).catch(() => {});
+                    },
+                    remove: () => removeAttachment(file),
+                  }} />;
+              })}
+            </row>}
+            <row key="line" role="omp.composer.line" align="start" gap="sm">
+              <editor key="draft" grow={1} aria="Message to Antigravity" text={st.draft.text} cursor={st.draft.cursor} anchor={st.draft.anchor}
+                placeholder={disconnected ? 'Use /account to sign in, or draft a message' : busy ? 'Draft your next message' : 'Message Antigravity, / for commands, @ for files & dirs'}
+                readonly={authBusy} maxLines={layout.composerMaxLines} variant="well"
+                onFocus={() => surface?.focus(DOCK_DRAFT_ID)}
+                onEdit={event => {
+                  if (!authBusy) {
+                    const currentSt = stateManager.getActive();
+                    const next = editDraft(currentSt.draft, event);
+                    recordUndo(currentSt.draft, next);
+                    currentSt.draft = next;
+                    autocompleteDismissed = false;
+                    commandSelection = 0;
+                    fileSelection = 0;
+                    scheduleRender();
+                  }
+                }}
+                onUndo={() => { if (!authBusy) applyUndo(); }}
+                onSend={send}
+                onAction={{ send, stop }} />
+            </row>
+            <row key="composer-bar" role="omp.composer.bar" justify="between" align="center" gap="sm">
+              <row gap="xs" align="center">
+                {showComposerBar && currentModel && <button size="sm" variant="quiet" icon="model"
+                  disabled={(!agent || disconnected || !!permission) && 'Wait until connected'}
+                  title="Change model (/model)"
+                  onClick={() => openPanel({ kind: 'config', id: currentModel.id })}>
+                  {configLabel(currentModel)}
+                </button>}
+                {showComposerBar && currentThinking && <row gap="xs" align="center">
+                  <effort level={thinkingToEffort(String(currentThinking.currentValue))} />
+                  <button size="sm" variant="quiet"
+                    disabled={(!agent || disconnected || !!permission) && 'Wait until connected'}
+                    title="Change thinking effort"
+                    onClick={() => openPanel({ kind: 'config', id: currentThinking.id })}>
+                    {configLabel(currentThinking)}
+                  </button>
+                </row>}
+                {showComposerBar && currentMode && <button size="sm" variant="quiet" icon="shield"
+                  disabled={(!agent || !!permission) && 'Wait until connected'}
+                  title="Session mode (/permissions)"
+                  onClick={() => openPanel({ kind: 'config', id: currentMode.id })}>
+                  {configLabel(currentMode)}
+                </button>}
+              </row>
+              <row gap="sm" align="center">
+                {showComposerBar && metadata.usage?.cost && <text><span s="muted">{`${metadata.usage.cost.amount.toFixed(4)} ${metadata.usage.cost.currency}`}</span></text>}
+                {showComposerBar && contextUsage && <meter key="context" style="bar" size="sm"
+                  value={contextUsage.percent / 100}
+                  thresholds={{ warn: 0.75, bad: 0.9 }}
+                  label={contextUsage.summary}
+                  title={`Session context: ${metadata.usage?.used.toLocaleString()} / ${metadata.usage?.size.toLocaleString()} tokens (click for /usage)`}
+                  hovercard={cachedHoverKv(
+                    'bar-context',
+                    `${metadata.usage?.used ?? ''}|${metadata.usage?.size ?? ''}|${metadata.usage?.cost?.amount ?? ''}|${metadata.usage?.cost?.currency ?? ''}|${metadata.tier?.name ?? ''}`,
+                    () => [
+                      { k: 'Context used', v: `${metadata.usage?.used.toLocaleString()} tokens` },
+                      { k: 'Window', v: `${metadata.usage?.size.toLocaleString()} tokens` },
+                      ...(metadata.usage?.cost ? [{ k: 'Session cost', v: `${metadata.usage.cost.amount} ${metadata.usage.cost.currency}` }] : []),
+                      ...(metadata.tier ? [{ k: 'Subscription tier', v: metadata.tier.name }] : []),
+                      { k: 'Action', v: 'Click to open /usage' },
+                    ],
+                  )}
+                  onClick={() => { if (agent && !disconnected && !permission) openPanel({ kind: 'report', report: 'usage' }); }} />}
+                {busy ? <>
+                  {hasDraftContent && <button size="sm" variant="default" icon="plus"
+                    disabled={(!canQueue) && 'Wait until ready'}
+                    onClick={send}>Queue</button>}
+                  <button size="sm" variant="danger" icon="stop" keys={['esc']}
+                    disabled={cancelling && 'Cancellation requested'}
+                    onClick={stop}>{cancelling ? 'Stopping...' : 'Stop'}</button>
+                </> : <button size="sm" variant={permission ? 'default' : 'primary'} icon="send" keys={['enter']}
+                  disabled={(!canSend) && (permission ? 'Resolve approval first' : 'Type a message')}
+                  onClick={send}>Send</button>}
+              </row>
+            </row>
+          </col>
+          <status key="bar" role="agy.dock.status" transparent>
+            <seg key="state" priority={10}
+              tone={busy || authBusy || agentConnecting || !!sessionOperation ? 'accent' : disconnected || phase.includes('failed') ? 'error' : agent ? 'success' : 'muted'}
+              text={authBusy ? 'Signing in' : sessionOperation ?? phase}
+              title={disconnected && !agentConnecting ? 'Click to reconnect agy ACP' : busy ? 'Click to inspect running task (/tasks)' : undefined}
+              onClick={() => {
+                if (disconnected && !agentConnecting && !authBusy) reconnectAgent();
+                else if (busy && !permission && !authBusy) openPanel({ kind: 'tasks' });
+              }} />
+            {st.historyIndex !== undefined && <seg key="history" priority={6} icon="history" tone="accent"
+              text={`History ${st.historyIndex + 1}/${promptHistory.length}`}
+              title="Up/Down cycles sent prompts; type to keep editing" />}
+            {!showComposerBar && <seg key="model" priority={9} icon="model"
+              tone={(!agent || disconnected || !!permission) ? 'muted' : undefined}
+              text={currentModel ? configLabel(currentModel) : 'Model'}
+              hovercard={cachedHoverKv(
+                'seg-model',
+                `${currentModel ? configLabel(currentModel) : ''}|${currentModel?.currentValue ?? ''}`,
+                () => [
+                  { k: 'Model', v: currentModel ? configLabel(currentModel) : 'Not reported' },
+                  ...(currentModel ? [{ k: 'Option ID', v: String(currentModel.currentValue) }] : []),
+                  { k: 'Shortcut', v: 'Click or type /model' },
+                ],
+              )}
+              onClick={() => {
+                if (agent && !disconnected && !permission) {
+                  openPanel(currentModel ? { kind: 'config', id: currentModel.id } : { kind: 'settings' });
+                }
+              }} />}
+            {!showComposerBar && currentThinking && <seg key="thinking" priority={7} icon="thinking"
+              tone={(!agent || disconnected || !!permission) ? 'muted' : undefined}
+              text={configLabel(currentThinking)}
+              hovercard={cachedHoverKv(
+                'seg-thinking',
+                configLabel(currentThinking),
+                () => [
+                  { k: 'Thinking level', v: configLabel(currentThinking) },
+                  { k: 'Action', v: 'Click to change reasoning effort' },
+                ],
+              )}
+              onClick={() => {
+                if (agent && !disconnected && !permission) openPanel({ kind: 'config', id: currentThinking.id });
+              }} />}
+            {!showComposerBar && <seg key="mode" priority={6} icon="shield"
+              tone={(!agent || !!permission) ? 'muted' : undefined}
+              text={currentMode ? configLabel(currentMode) : 'Permissions'}
+              hovercard={cachedHoverKv(
+                'seg-mode',
+                currentMode ? configLabel(currentMode) : '',
+                () => [
+                  { k: 'Mode', v: currentMode ? configLabel(currentMode) : 'Not reported' },
+                  { k: 'Sandbox', v: '--sandbox requested (unverified)' },
+                  { k: 'Shortcut', v: 'Click or type /permissions' },
+                ],
+              )}
+              onClick={() => {
+                if (agent && !permission) openPanel({ kind: 'permissions' });
+              }} />}
+            <seg key="sessions" priority={4} icon="history"
+              tone={(!agent || disconnected || !!permission || busy || changingConfig || !!sessionOperation) ? 'muted' : undefined}
+              text={sid ? sessionTitle(sid) : 'Sessions'}
+              hovercard={cachedHoverKv(
+                'seg-sessions',
+                `${sid}|${sid ? sessionTitle(sid) : ''}`,
+                () => [
+                  { k: 'Conversation', v: sid ? sessionTitle(sid) : 'No active session' },
+                  ...(sid ? [{ k: 'Session ID', v: sid }] : []),
+                  { k: 'Shortcut', v: 'Click or type /sessions' },
+                ],
+              )}
+              onClick={() => {
+                if (agent && !disconnected && !permission && !busy && !changingConfig && !sessionOperation) {
+                  openPanel({ kind: 'sessions' });
+                }
+              }} />
+            <seg key="branch" priority={2} icon="branch"
+              text={gitBranch ? `${workspaceName} · ${gitBranch}` : workspaceName}
+              title={options.cwd} />
+            {(options.agentName || (options.additionalDirectories?.length ?? 0) > 0) && <seg key="scope" priority={5} icon="tern"
+              text={[
+                ...(options.agentName ? [options.agentName] : []),
+                ...(options.additionalDirectories?.length ? [`+${options.additionalDirectories.length} dir`] : []),
+              ].join(' · ')}
+              hovercard={cachedHoverKv(
+                'seg-scope',
+                `${options.agentName ?? ''}|${options.additionalDirectories?.length ?? 0}`,
+                () => [
+                  { k: 'Agent profile', v: options.agentName ?? 'Default' },
+                  { k: 'Workspace roots', v: String(1 + (options.additionalDirectories?.length ?? 0)) },
+                  { k: 'Shortcut', v: 'Click or type /agents' },
+                ],
+              )}
+              onClick={() => { if (!permission && !authBusy) openPanel({ kind: 'agents' }); }} />}
+            {sessionDiffCount > 0 && <seg key="changes" side="right" priority={8} icon="diff" tone="accent"
+              text={`Changes (${sessionDiffCount})`}
+              title={`Inspect ${sessionDiffCount} session edit${sessionDiffCount === 1 ? '' : 's'} (/changes)`}
+              onClick={() => { if (!permission && !authBusy) openPanel({ kind: 'changes' }); }} />}
+            <seg key="commands" side="right" priority={5} icon="slash" text="Commands"
+              tone={(!agent || disconnected || !!permission) ? 'muted' : undefined}
+              title="Commands (/)"
+              onClick={() => { if (agent && !disconnected && !permission) openPanel({ kind: 'commands' }); }} />
+            <seg key="settings" side="right" priority={6} icon="settings" text="Settings"
+              title="Settings & Preferences (/settings)"
+              onClick={() => { if (!permission && !authBusy) openPanel({ kind: 'settings' }); }} />
+            {!contextUsage && <seg key="usage" side="right" priority={5} icon="context" text="Usage"
+              tone={(!agent || disconnected || !!permission) ? 'muted' : undefined}
+              title="Usage & Quota (/usage)"
+              onClick={() => { if (agent && !disconnected && !permission) openPanel({ kind: 'report', report: 'usage' }); }} />}
+            <seg key="account" side="right" priority={8} icon="user"
+              text={metadata.tier && colsNow >= 96 ? metadata.tier.name : 'Account'}
+              hovercard={cachedHoverKv(
+                'seg-account',
+                `${disconnected ? 1 : agent ? 2 : 0}|${metadata.tier?.name ?? ''}`,
+                () => [
+                  { k: 'ACP', v: disconnected ? 'Disconnected' : agent ? 'Connected' : 'Connecting' },
+                  { k: 'Subscription tier', v: metadata.tier ? metadata.tier.name : 'Not reported' },
+                  { k: 'Shortcut', v: 'Click or type /account' },
+                ],
+              )}
+              onClick={() => { if (!permission && !authBusy) openPanel({ kind: 'account' }); }} />
+            <seg key="quit" side="right" priority={9} icon="power" text="Quit"
+              title="Quit frontend (Ctrl+Q)"
+              onClick={quit} />
+          </status>
+          {layout.showKeyLegend && <text key="keys" role="agy.dock.keys" wrap="word">
+            <span s="key">Enter</span><span s="muted"> send  </span>
+            <span s="key">/</span><span s="muted"> commands  </span>
+            <span s="key">@</span><span s="muted"> files/dirs  </span>
+            <span s="key">Shift+Enter</span><span s="muted"> newline  </span>
+            <span s="key">Esc</span><span s="muted"> stop  </span>
+            <span s="key">PgUp/PgDn</span><span s="muted"> scroll  </span>
+            {permission && <><span s="key">Tab/Shift+Tab</span><span s="muted"> choice  </span>
+              <span s="key">Ctrl+Y</span><span s="muted"> allow  </span>
+              <span s="key">Ctrl+N</span><span s="muted"> deny  </span></>}
+            <span s="key">Ctrl+Q</span><span s="muted"> quit</span>
+          </text>}
+        </col>
       </col>,
       layer: <col>
         {toastMessage && <toast key="toast" text={toastMessage.text} sub={toastMessage.sub} />}
@@ -2462,6 +2556,9 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     if (!session) return quitting ? outcome : { kind: 'unavailable' };
     if (signal.aborted || quitting) return outcome;
     surface = session.open({ mode: 'screen', title: 'Antigravity · agy-tern', font: 'sans' });
+    if (session.caps.features.includes('styles')) {
+      surface.stylesheet('agy-composer', COMPOSER_LAYOUT_CSS);
+    }
     renderController = new TernRenderController({
       session,
       surface,
@@ -2488,7 +2585,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       panelError = launch.notice?.text ?? '';
     }
     render();
-    surface.focus(launch?.openAccount ? null : 'dock.draft');
+    surface.focus(launch?.openAccount ? null : DOCK_DRAFT_ID);
 
     const startAgentConnection = (resumeId?: string): Promise<void> => {
       if (quitting || agentConnecting) return Promise.resolve();
@@ -2834,7 +2931,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
               closePanel();
               stateManager.getActive().draft = { text: tpl.text, cursor: tpl.text.length };
               render();
-              surface?.focus('dock.draft');
+              surface?.focus(DOCK_DRAFT_ID);
             };
           } else if (current.kind === 'find') {
             tabIds = ['all', 'message', 'tool', 'thought'];
