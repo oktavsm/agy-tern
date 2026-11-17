@@ -5,6 +5,14 @@
   "type": "module",
   "license": "MIT",
   "author": "oktavsm",
+  "homepage": "https://github.com/oktavsm/agy-tern#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/oktavsm/agy-tern.git"
+  },
+  "bugs": {
+    "url": "https://github.com/oktavsm/agy-tern/issues"
+  },
   "keywords": [
     "antigravity",
     "agy",

@@ -1,10 +1,32 @@
 # agy-tern
 
+[![CI](https://github.com/oktavsm/agy-tern/actions/workflows/ci.yml/badge.svg)](https://github.com/oktavsm/agy-tern/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/oktavsm/agy-tern?include_prereleases&sort=semver)](https://github.com/oktavsm/agy-tern/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Bun >= 1.2.22](https://img.shields.io/badge/Bun-%3E%3D1.2.22-black)](https://bun.sh/)
+
 Native [Tern](https://docs.stencil.so/tern/protocol/index.md) terminal frontend for the official Antigravity CLI (`agy`) over the [Agent Client Protocol (ACP)](https://agentclientprotocol.com/).
 
-`agy-tern` spawns `agy acp --sandbox` as a subprocess and renders streaming conversations, agent reasoning, tool executions, diffs, centered media inspection, and explicit one-time approvals natively through the Tern Surface Protocol (TSP).
+`agy-tern` spawns `agy acp --sandbox` as a subprocess and renders streaming conversations, agent reasoning, tool executions, diffs, centered media inspection, interactive follow-up modals, and explicit one-time approvals natively through the Tern Surface Protocol (TSP).
 
 > **Third-party notice**: `agy-tern` is an independent open-source frontend, not an official Google or Stencil product. Authentication, credentials, model routing, tool execution, and Google API communication remain inside the official `agy` binary. Using the official CLI does not bypass account limits or quotas.
+
+## Preview
+
+![Conversation transcript, clickable tasks, inline diffs, and centered rounded composer](assets/preview-conversation.png)
+
+<details>
+<summary>More screenshots: Interactive follow-up modal & ready screen with chatbox Usage bar</summary>
+
+**ACP Follow-Up Question Modal (`elicitation/create`)**
+
+![Interactive follow-up question modal](assets/preview-followup-modal.png)
+
+**Ready View & Clickable Usage Control Bar**
+
+![Ready view with centered rounded chatbox and clickable Usage button](assets/preview-ready.png)
+
+</details>
 
 ---
 
@@ -198,6 +220,6 @@ Additional documentation:
 
 ## Contributing & License
 
-Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md), [AGENTS.md](AGENTS.md), and [SECURITY.md](SECURITY.md) before opening a pull request or reporting security issues.
+Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md), [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md), [AGENTS.md](AGENTS.md), and [SECURITY.md](SECURITY.md) before opening a pull request or reporting security issues. See [CHANGELOG.md](CHANGELOG.md) for release notes.
 
 Licensed under the [MIT License](LICENSE).

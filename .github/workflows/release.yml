@@ -46,7 +46,7 @@ jobs:
           VERSION="${GITHUB_REF_NAME}"
           PKG_DIR="agy-tern-${VERSION}"
           mkdir -p "release-out/${PKG_DIR}/scripts"
-          cp -r dist package.json README.md LICENSE SECURITY.md CONTRIBUTING.md "release-out/${PKG_DIR}/"
+          cp -r dist package.json README.md LICENSE SECURITY.md CONTRIBUTING.md CODE_OF_CONDUCT.md CHANGELOG.md "release-out/${PKG_DIR}/"
           cp scripts/install.sh "release-out/${PKG_DIR}/scripts/"
           (cd release-out && tar -czf "agy-tern-${VERSION}.tar.gz" "${PKG_DIR}")
           (cd release-out && sha256sum "agy-tern-${VERSION}.tar.gz" > SHA256SUMS.txt)
