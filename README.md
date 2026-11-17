@@ -10,7 +10,7 @@ Native [Tern](https://docs.stencil.so/tern/protocol/index.md) terminal frontend 
 
 ## Features
 
-- **Native Tern Surface UI**: Renders conversations, collapsible `Thought` traces, multi-step `Plan` HUD, inline/card tool output, unified/split code diffs, and real-time context meters (`used/size` tokens) using Tern native elements and theme tokens.
+- **Native Tern Surface UI**: Renders conversations, collapsible `Thought` traces, multi-step `Plan` HUD, `starburst` working indicator, composer control bar (model, `<effort>` thinking level, mode, cost, and context `<meter>`), inline/card tool output, unified/split code diffs, and clickable multi-locations using Tern native elements and theme tokens.
 - **Full Keyboard Parity**: Shell-style composer editing (`Ctrl+A`/`E`, word jumps `Ctrl+Left`/`Right` or `Alt+B`/`F`, `Up`/`Down` line movement and prompt history with `History i/N`, `Ctrl+W`/`U`/`K`, `Ctrl+Z` undo), `Esc` cancellation, and explicit one-time approvals (`Tab`, `Ctrl+Y`, `Ctrl+N`; `Enter` never approves a tool).
 - **Rich Inspection & Side-by-Side Splits**: Inline clickable screenshots and images inside tool cards and agent Markdown responses (click any image or **Open modal** for centered `InspectOverlay`; optional `autoPreviewMedia` toggle in `/settings`); centered inspector for files, directories, and diffs; per-block `Copy`, `Fullscreen`, and confirmed `Run in split` (`tern split`) actions on fenced Markdown code/command blocks; `Copy output` / `Copy diff` inside tool cards; and direct `tern open --split right` launch.
 - **Model Defaults & Local Memory**: New ACP sessions default to `gemini-4-hydrogen` + `high` thinking when advertised by `agy`, while remembering your last selected model and thinking level in local `prefs.json` (`rememberModel`, configurable in `/settings`).
@@ -54,7 +54,7 @@ agy-tern
   ```sh
   export PATH="$HOME/.local/bin:$PATH"
   ```
-- **Updates**: Because `~/.local/bin/agy-tern` links straight to `src/cli.tsx`, pulling changes takes effect immediately on next launch with no separate build step.
+- **Updates**: Because `./scripts/install.sh` builds `dist/cli.js` and links `~/.local/bin/agy-tern -> dist/cli.js`, run `bun run build` (or re-run `./scripts/install.sh`) after pulling updates so the pre-bundled launcher reflects your changes. For live unbundled development, run `bun run start`.
 - **Not authenticated**: Run `agy acp --login` in your shell or open `/account` inside `agy-tern`.
 - **Linux clipboard copy/paste**: Install `wl-clipboard` (`wl-copy` / `wl-paste`) on Wayland or `xclip` on X11. If your window manager intercepts `Alt+V`, use `/paste-image` (`/clip`).
 
@@ -81,6 +81,13 @@ agy-tern --agy /abs/path/to/agy --doctor
 
 ### Supported CLI Flags
 
+```sh
+agy-tern [--cwd DIRECTORY] [--add-dir DIRECTORY]... [--agy EXECUTABLE]
+         [--agent NAME] [--model MODEL] [--mode MODE] [--thinking LEVEL]
+         [--append-system-prompt TEXT] [--max-fps N] [--motion MODE]
+         [-c | --continue | --conversation SESSION_ID] [-i PROMPT | PROMPT]
+```
+
 | Flag | Description |
 | --- | --- |
 | `--cwd <dir>` | Set primary workspace directory |
@@ -89,6 +96,9 @@ agy-tern --agy /abs/path/to/agy --doctor
 | `--model <id\|name>` | Apply initial ACP `model` session option once connected |
 | `--mode <id\|name>` | Apply initial ACP `mode` session option once connected |
 | `--thinking`, `--effort <level>` | Apply initial ACP reasoning effort option |
+| `--append-system-prompt <text>` | Append instructions via ACP session metadata when advertised |
+| `--max-fps <5-60>` | Cap streaming frame rate (default `25`; lower values like `15` save CPU/battery on mid-low laptops) |
+| `--motion <auto\|full\|reduced>` | Override animation preference (`reduced` limits cadence to <=12 FPS) |
 | `-c`, `--continue` | Resume the most recent ACP session |
 | `--conversation <id>` | Load a specific saved ACP session ID |
 | `-i`, `--prompt-interactive`, `[PROMPT]` | Start interactively with an initial prompt |
@@ -105,8 +115,8 @@ agy-tern --agy /abs/path/to/agy --doctor
 - **Composer Navigation**: `Ctrl+A` / `Ctrl+E` (line start/end), `Ctrl+Left`/`Right` or `Alt+B`/`F` (word jump), `Up`/`Down` (crosses wrapped lines or cycles prompt history when empty), `Ctrl+W`/`U`/`K` (delete word / to start / to end), `Ctrl+Z` (undo).
 - **Modals & Turns**: `Esc` steps back from nested confirmation/input overlays to their parent picker or closes modals without cancelling a running turn; in an active conversation, `Esc` cancels the turn.
 - **Disconnect Recovery**: Clicking **Reconnect ACP** on a connection-failure card or the `Disconnected` status segment re-establishes the official ACP subprocess while keeping your draft.
-- **Transcript**: `PgUp` / `PgDn` scroll conversation history.
-- **Approvals**: `Tab` / `Shift+Tab` cycle options; `Ctrl+Y` approves once; `Ctrl+N` denies. `Enter` never approves a tool call.
+- **Transcript & Inspector**: `PgUp` / `PgDn` scroll conversation history; inside `InspectOverlay`, use `Up`/`Down`/`PgUp`/`PgDn`/`Home`/`End` to scroll, `c` to copy, `l` to toggle diff layout, `a` to attach, `s` to open in Tern split, and `u`/`Backspace` to go up a directory.
+- **Approvals**: `Tab` / `Shift+Tab` cycle options; `Ctrl+Y` approves once; `Ctrl+N` denies. `Enter` never approves a tool call. Review diffs inline (`Inspect`, `Copy diff`, `Tern split`) inside the approval prompt.
 - **Quit**: `Ctrl+Q` (or `Quit` status segment) cleanly shuts down pending approvals, the ACP subprocess, and the Tern surface.
 
 ---
@@ -155,16 +165,20 @@ Unknown slash commands are rejected locally instead of silently becoming model p
 ```sh
 bun run typecheck
 bun test
-bun run src/cli.tsx --doctor
+bun run build
+bun run bench
+bun run dist/cli.js --doctor
 ```
 
 Core module map:
 - `src/contracts.ts`, `src/agent.ts`, `src/auth.ts`, `src/reports.ts`: Official ACP stdio boundary, login lifecycle, and CLI reports.
-- `src/model.ts`, `src/history.ts`, `src/draft.ts`, `src/files.ts`, `src/prefs.ts`, `src/session-names.ts`, `src/templates.ts`: Transcript projection/snapshot hydration, composer input state, workspace files, and XDG local persistence.
-- `src/cli-args.ts`, `src/cli.tsx`, `src/commands.ts`, `src/extensions.ts`, `src/tern-window.ts`: CLI flag parsing, extension management (`mcp`/`plugin`/`agent`), `tern open` splits, and OSC 9 notifications.
-- `src/ui-format.ts`, `src/picker-nav.ts`, `src/transcript-view.tsx`, `src/panels.tsx`, `src/ui.tsx`: Tern JSX surface rendering, modular modal pickers/prefs/overlays, centered inspector, and keyboard/event orchestration.
+- `src/model.ts`, `src/history.ts`, `src/session-state.ts`, `src/draft.ts`, `src/files.ts`, `src/prefs.ts`, `src/session-names.ts`, `src/templates.ts`: Transcript projection/snapshot hydration, per-session LRU state & replay coordination, composer input state, workspace files, and XDG local persistence.
+- `src/cli-args.ts`, `src/cli.tsx`, `src/commands.ts`, `src/extensions.ts`, `src/tern-window.ts`: CLI flag parsing, lazy command dispatch, extension management (`mcp`/`plugin`/`agent`), `tern open` splits, and OSC 9 notifications.
+- `src/tern-render.ts`, `src/ui-format.ts`, `src/picker-nav.ts`, `src/transcript-view.tsx`, `src/panels.tsx`, `src/ui.tsx`: Adaptive Tern frame/settle controller, non-blocking async path cache, modular modal pickers/prefs/overlays, centered inspector, composer control bar, and keyboard/event orchestration.
 
 Additional documentation:
+- [System Audit & omp Comparison (Indonesian)](docs/audit-sistem-dan-omp.md)
+- [Performance Benchmarks: Before vs After vs omp (Indonesian)](docs/benchmark-performa.md)
 - [Project Overview & Architecture Notes (Indonesian)](docs/project-overview.md)
 - [Native UI & Visual Verification Log (Indonesian)](docs/ui-revamp.md)
 - [Manager Integration Boundary Notes (Indonesian)](docs/manager-integration.md)
