@@ -118,6 +118,7 @@ agy-tern --agy /abs/path/to/agy --doctor
 | `/rename [name]` | Set a private local display label for the current session (does not mutate server title) |
 | `/export [file.md\|json]` | Export the active transcript as Markdown or structured JSON inside the workspace |
 | `/expand`, `/collapse` | Expand or collapse all thought and tool cards in the active transcript |
+| `/paste-image`, `/clip` | Attach a PNG, JPEG, or WebP screenshot directly from the system clipboard (`Alt+V`) |
 | `/usage`, `/quota` | Display official CLI `/usage` account quotas alongside ACP `usage_update` context telemetry |
 | `/credits`, `/changelog` | View official CLI account credits and release notes |
 | `/account`, `/login`, `/switch-account`, `/reauth` | Official terminal login, tier inspection (`_meta`), and manual account switch confirmation |
@@ -150,7 +151,7 @@ Core module map:
 - `src/contracts.ts`, `src/agent.ts`, `src/auth.ts`, `src/reports.ts`: Official ACP stdio boundary, login lifecycle, and CLI reports.
 - `src/model.ts`, `src/history.ts`, `src/draft.ts`, `src/files.ts`, `src/prefs.ts`, `src/session-names.ts`, `src/templates.ts`: Transcript projection/snapshot hydration, composer input state, workspace files, and XDG local persistence.
 - `src/cli-args.ts`, `src/cli.tsx`, `src/commands.ts`, `src/extensions.ts`, `src/tern-window.ts`: CLI flag parsing, extension management (`mcp`/`plugin`/`agent`), `tern open` splits, and OSC 9 notifications.
-- `src/ui-format.ts`, `src/picker-nav.ts`, `src/transcript-view.tsx`, `src/ui.tsx`: Tern JSX surface rendering, pickers, centered inspector overlay, and keyboard/event orchestration.
+- `src/ui-format.ts`, `src/picker-nav.ts`, `src/transcript-view.tsx`, `src/panels.tsx`, `src/ui.tsx`: Tern JSX surface rendering, modular modal pickers/prefs/overlays, centered inspector, and keyboard/event orchestration.
 
 Additional documentation:
 - [Project Overview & Architecture Notes (Indonesian)](docs/project-overview.md)
