@@ -1,10 +1,10 @@
 /** @jsxImportSource @stencil-hq/tern */
 import { statSync } from 'node:fs';
 import { basename, resolve } from 'node:path';
-import { connect, type DiffHunk, type EditEvent, type JSX, type Session, type Surface, type Tone } from '@stencil-hq/tern';
+import { connect, type DiffHunk, type EditEvent, type JSX, type Renderable, type Session, type Surface, type Tone } from '@stencil-hq/tern';
 import type { AuthMethodTerminal, SessionConfigOption, SessionInfo } from '@agentclientprotocol/sdk';
 import { connectAgent } from './agent';
-import type { AgentAuthentication, AgentMetadata, AgentOptions, AgentSession, PermissionPrompt, ResourceAttachment } from './contracts';
+import { terminalLoginProblem, type AgentAuthentication, type AgentMetadata, type AgentOptions, type AgentSession, type PermissionPrompt, type ResourceAttachment } from './contracts';
 import { draftKey, editDraft, isCursorOnFirstRow, isCursorOnLastRow, type Draft } from './draft';
 import { Conversation, type ToolStep, type TranscriptEntry } from './model';
 import { commandCatalog, commandQuery, configLabel, configValues, filterCommands, modelOption, resolveCommand, type Command } from './commands';
@@ -30,12 +30,13 @@ import { PromptHistoryStore, readOfficialBrainTranscript, readSessionPreview, se
 import { SessionNames } from './session-names';
 import { PromptTemplatesStore, type PromptTemplate } from './templates';
 import { openInTernSplit, runCommandInTernSplit, sendTerminalAttention } from './tern-window';
-import { terminalLoginProblem } from './auth';
 import {
   DEFAULT_MODEL_ID,
   DEFAULT_PREFS,
   DEFAULT_THINKING_ID,
   PrefsStore,
+  type DiffMode,
+  type MotionPref,
   type UserPrefs,
 } from './prefs';
 import {
@@ -61,6 +62,7 @@ import {
   type WorkspaceEntry,
 } from './files';
 import {
+  buildTaskDetailText,
   buildUnifiedDiffHunks,
   collectSessionDiffs,
   compactToolHeaderText,
@@ -76,6 +78,7 @@ import {
   formatTranscriptMarkdown,
   parseUnifiedGitDiff,
   searchTranscript,
+  searchTranscriptCached,
   summarizeToolCall,
   thinkingOption,
   type ResponsiveLayout,
@@ -93,7 +96,6 @@ import {
   stepPickerKey,
 } from './picker-nav';
 import {
-  cachedPathExists,
   clockTime,
   copyToClipboard,
   Entry,
@@ -102,6 +104,18 @@ import {
   type EntryCallbacks,
   type InspectTarget,
 } from './transcript-view';
+import {
+  hasRichConversationHistory,
+  HistoryReplayCoordinator,
+  SessionStateManager,
+  type ReplaySettledInfo,
+} from './session-state';
+import {
+  AsyncPathPresenceCache,
+  isEntrySettled,
+  TernRenderController,
+  type RenderedEntryRecord,
+} from './tern-render';
 import {
   renderActivePanel,
   type Choice,
@@ -116,38 +130,55 @@ export interface ChatLaunchState {
   continueLast?: boolean;
   conversationId?: string;
   initialPrompt?: string;
+  maxFps?: number;
+  motion?: MotionPref;
 }
 
 export type NativeChatResult = { kind: 'unavailable' } | { kind: 'quit' } |
   { kind: 'login'; method: AuthMethodTerminal; draft: Draft; previousSessionId?: string };
 
-interface QueuedPrompt {
-  id: string;
-  text: string;
-  files: string[];
-  dirs: string[];
-  images: LoadedImageAttachment[];
+function thinkingToEffort(value: string | undefined): 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' {
+  const normalized = (value ?? '').trim().toLowerCase();
+  if (normalized === 'off' || normalized === 'none' || normalized === '0') return 'off';
+  if (normalized === 'minimal' || normalized === 'min') return 'minimal';
+  if (normalized === 'low') return 'low';
+  if (normalized === 'xhigh' || normalized === 'very_high') return 'xhigh';
+  if (normalized === 'max') return 'max';
+  if (normalized === 'medium' || normalized === 'med') return 'medium';
+  return 'high';
 }
 
 export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchState): Promise<NativeChatResult> {
   const stopped = Promise.withResolvers<null>();
   const controller = new AbortController();
   const signal = options.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal;
-  let conversation = new Conversation();
-  if (launch?.notice && !launch.openAccount) conversation.notice(launch.notice.text, launch.notice.error);
   let outcome: NativeChatResult = { kind: 'quit' };
   let authentication: AgentAuthentication = { terminalMethods: [], logout: false };
   let authenticationKnown = false;
   let authBusy = false;
   let authTask: Promise<void> | undefined;
-  const conversations = new Map<string, Conversation>();
-  const drafts = new Map<string, Draft>();
   const names = new SessionNames(options.cwd);
   const transcriptStore = new TranscriptStore(options.cwd);
   const promptHistoryStore = new PromptHistoryStore(options.cwd);
   const localNames = new Map<string, string | undefined>();
   const sessionInfo = new Map<string, SessionInfo>();
-  let activeSessionId = '';
+  const sessionPreviewCache = new Map<string, SessionPreview | null>();
+  const sessionPreviewInFlight = new Set<string>();
+  const stateManager = new SessionStateManager({
+    maxInMemory: 3,
+    initialDraft: launch?.draft,
+    onEvictConversation: (evictedId, evictedConv) => {
+      if (!quitting && evictedConv.entries.some(entry => entry.type === 'message')) {
+        sessionPreviewCache.delete(evictedId);
+        void transcriptStore.save(evictedId, evictedConv.entries).catch(() => {});
+      }
+    },
+  });
+  if (launch?.notice && !launch.openAccount) {
+    stateManager.getConversation().notice(launch.notice.text, launch.notice.error);
+  }
+  const replayCoordinator = new HistoryReplayCoordinator();
+  const pathPresenceCache = new AsyncPathPresenceCache();
   let listedSessions: SessionInfo[] = [];
   let nextSessionsCursor: string | undefined;
   let sessionsLoading = false;
@@ -159,15 +190,15 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
   const permissions: PermissionPrompt[] = [];
   let session: Session | null = null;
   let surface: Surface | undefined;
+  let renderController: TernRenderController | undefined;
   let agent: AgentSession | undefined;
   let startup: Promise<void> | undefined;
   let connectRunner: ((resumeId?: string) => Promise<void>) | undefined;
   function reconnectAgent(): void {
     if (quitting || !disconnected || agentConnecting || authBusy || busy || permissions.length || !connectRunner) return;
-    startup = connectRunner(activeSessionId || undefined);
+    startup = connectRunner(stateManager.activeSessionId || undefined);
   }
   let turn: Promise<void> | undefined;
-  let draft: Draft = launch?.draft ?? { text: '', cursor: 0 };
   let phase = 'Connecting to Antigravity';
   let approvalChoice = 0;
   let busy = false;
@@ -197,35 +228,24 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
   let cachedAtResult: WorkspaceEntry[] = [];
   const prefixSearchCache = new Map<string, WorkspaceEntry[]>();
   const prefixSearchInFlight = new Set<string>();
-  const sessionPreviewCache = new Map<string, SessionPreview | null>();
-  const sessionPreviewInFlight = new Set<string>();
-  let focusedTurnIndex: number | undefined;
-  const thoughtFoldOverrides = new Map<string, boolean>();
-  const toolFoldOverrides = new Map<string, boolean>();
-  let lastPrompt = '';
-  let lastImages: LoadedImageAttachment[] = [];
-  let lastFiles: string[] = [];
-  let lastDirs: string[] = [];
-  const undoStack: Draft[] = [];
   const promptHistory: string[] = [];
-  let historyIndex: number | undefined;
-  let historyStash: Draft | undefined;
   let gitBranch: string | undefined;
   const workspaceName = basename(options.cwd) || options.cwd;
   const prefsStore = new PrefsStore();
-  let prefsReady: Promise<void> = Promise.resolve();
   const templatesStore = new PromptTemplatesStore(options.cwd);
   let templatesList: PromptTemplate[] = [];
-  let userPrefs: UserPrefs = { ...DEFAULT_PREFS };
+  const loadedPrefs = prefsStore.loadSync();
+  let userPrefs: UserPrefs = {
+    ...loadedPrefs,
+    ...(launch?.maxFps !== undefined ? { maxFps: launch.maxFps } : {}),
+    ...(launch?.motion !== undefined ? { motion: launch.motion } : {}),
+  };
   let prefsPage = 'appearance';
   let pickerTab = 'all';
   let pickerSelected = '';
   let usageTab = 'overview';
   let workspaceEntries: WorkspaceEntry[] = [];
   let ignoredPathsSet = new Set<string>();
-  let attachedFiles: string[] = [];
-  let attachedDirs: string[] = [];
-  let attachedImages: LoadedImageAttachment[] = [];
   let gitChanges: GitStatusEntry[] = [];
   const gitDiffCache = new Map<string, { status: 'loading' | 'ready'; hunks: DiffHunk[]; error?: string }>();
   let mcpServers: McpServerEntry[] = [];
@@ -236,49 +256,38 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
   let fileSelection = 0;
   let toastMessage: { text: string; sub?: string } | undefined;
   let toastTimer: NodeJS.Timeout | undefined;
-  let liveTickTimer: NodeJS.Timeout | undefined;
-  let renderTimer: NodeJS.Timeout | undefined;
-  let lastRenderAt = 0;
-  let replaySettleTimer: NodeJS.Timeout | undefined;
-  let replayingHistory = false;
   let replayPlaceholderId: string | undefined;
-  let replayCachedFallback: Conversation | undefined;
-  let replayNoticeMode: 'load' | 'resume' = 'load';
-  const DEFAULT_HISTORY_VISIBLE = 30;
-  let historyVisibleCount = DEFAULT_HISTORY_VISIBLE;
   let cachedDiffCountConversation: Conversation | undefined;
   let cachedDiffCountRev = -1;
   let cachedDiffCount = 0;
   let cachedDiffsConversation: Conversation | undefined;
   let cachedDiffsRev = -1;
   let cachedSessionDiffs: SessionDiffItem[] = [];
-  const entryRenderCache = new WeakMap<TranscriptEntry, { key: string; node: JSX.Element }>();
 
   function getSessionDiffs(): SessionDiffItem[] {
-    if (cachedDiffsConversation !== conversation || cachedDiffsRev !== conversation.revision) {
-      cachedDiffsConversation = conversation;
-      cachedDiffsRev = conversation.revision;
-      cachedSessionDiffs = collectSessionDiffs(conversation.entries, options.cwd);
+    const activeConv = stateManager.getConversation();
+    if (cachedDiffsConversation !== activeConv || cachedDiffsRev !== activeConv.revision) {
+      cachedDiffsConversation = activeConv;
+      cachedDiffsRev = activeConv.revision;
+      cachedSessionDiffs = collectSessionDiffs(activeConv.entries, options.cwd);
     }
     return cachedSessionDiffs;
   }
   let turnStartedAt: number | undefined;
-  const queuedPrompts: QueuedPrompt[] = [];
-  let queueSequence = 0;
   const blobCache = new Map<string, string>();
-  const previewedMedia = new Set<string>();
   const previousSessionId = launch?.previousSessionId;
   let inspectReturnPanel: Panel | undefined;
-  let viewportCols = process.stdout.columns || 120;
-  let viewportRows = process.stdout.rows || 40;
+  const viewportCols = (): number => renderController?.cols ?? (process.stdout.columns || 120);
+  const viewportRows = (): number => renderController?.rows ?? (process.stdout.rows || 40);
+  const pathExists = (targetPath: string): boolean => pathPresenceCache.peek(targetPath, scheduleRender);
   const onStdoutResize = (): void => {
-    viewportCols = process.stdout.columns || viewportCols;
-    viewportRows = process.stdout.rows || viewportRows;
-    render();
+    const nextCols = process.stdout.columns || viewportCols();
+    const nextRows = process.stdout.rows || viewportRows();
+    if (renderController) renderController.scheduleResize(nextCols, nextRows, render);
   };
 
   function editorWrapWidth(): number {
-    return Math.max(24, viewportCols - 14);
+    return Math.max(24, viewportCols() - 14);
   }
 
   function currentResponsiveLayout(extra?: {
@@ -287,94 +296,52 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     hasAttachments?: boolean;
     hasHud?: boolean;
   }): ResponsiveLayout {
-    return computeResponsiveLayout(viewportCols, viewportRows, {
+    const st = stateManager.getActive();
+    return computeResponsiveLayout(viewportCols(), viewportRows(), {
       userComposerLines: userPrefs.composerLines,
       userShowKeyLegend: userPrefs.showKeyLegend,
       hasPermission: extra?.hasPermission ?? permissions.length > 0,
       hasSuggestionsOrAt: extra?.hasSuggestionsOrAt ?? false,
-      queuedCount: queuedPrompts.length,
-      hasAttachments: extra?.hasAttachments ?? (attachedFiles.length > 0 || attachedDirs.length > 0 || attachedImages.length > 0),
-      hasImageAttachments: attachedImages.length > 0,
+      queuedCount: st.queuedPrompts.length,
+      hasAttachments: extra?.hasAttachments ?? (st.attachedFiles.length > 0 || st.attachedDirs.length > 0 || st.attachedImages.length > 0),
+      hasImageAttachments: st.attachedImages.length > 0,
       hasHud: extra?.hasHud ?? false,
     });
   }
 
   function recordUndo(prev: Draft, next: Draft): void {
-    if (prev.text === next.text) return;
-    undoStack.push(prev);
-    if (undoStack.length > 50) undoStack.shift();
-    historyIndex = undefined;
-    historyStash = undefined;
+    stateManager.recordUndo(prev, next);
   }
 
   function applyUndo(): void {
-    const previous = undoStack.pop();
-    if (!previous) return;
-    draft = previous;
-    historyIndex = undefined;
-    historyStash = undefined;
+    if (!stateManager.applyUndo()) return;
     autocompleteDismissed = false;
     render();
   }
 
   function stepPromptHistory(direction: -1 | 1): boolean {
-    if (!promptHistory.length) return false;
-    if (direction === -1) {
-      if (historyIndex === undefined) {
-        if (draft.text !== '') return false;
-        historyStash = draft;
-        historyIndex = promptHistory.length - 1;
-      } else if (historyIndex > 0) {
-        historyIndex--;
-      } else {
-        return true;
-      }
-      const value = promptHistory[historyIndex]!;
-      draft = { text: value, cursor: value.length };
-      return true;
-    }
-    if (historyIndex === undefined) return false;
-    if (historyIndex < promptHistory.length - 1) {
-      historyIndex++;
-      const value = promptHistory[historyIndex]!;
-      draft = { text: value, cursor: value.length };
-      return true;
-    }
-    draft = historyStash ?? { text: '', cursor: 0 };
-    historyIndex = undefined;
-    historyStash = undefined;
-    return true;
+    return stateManager.stepPromptHistory(promptHistory, direction);
   }
 
   function exportCurrentTranscript(requestedName?: string): void {
+    const sid = stateManager.activeSessionId;
+    const conv = stateManager.getConversation();
     const meta = {
-      title: activeSessionId ? sessionTitle(activeSessionId) : undefined,
-      sessionId: activeSessionId || undefined,
+      title: sid ? sessionTitle(sid) : undefined,
+      sessionId: sid || undefined,
     };
     const isJson = requestedName?.trim().toLowerCase().endsWith('.json') ?? false;
     const payload = isJson
-      ? formatTranscriptJson(conversation.entries, options.cwd, meta)
-      : formatTranscriptMarkdown(conversation.entries, options.cwd, meta);
+      ? formatTranscriptJson(conv.entries, options.cwd, meta)
+      : formatTranscriptMarkdown(conv.entries, options.cwd, meta);
     void writeTranscriptExport(options.cwd, payload, requestedName).then(rel => {
       if (!quitting) showToast('Exported transcript', rel);
     }).catch(error => {
       if (!quitting) {
-        conversation.notice(error instanceof Error ? error.message : String(error), true);
+        stateManager.getConversation().notice(error instanceof Error ? error.message : String(error), true);
         render();
       }
     });
-  }
-
-  function syncLiveTick(active: boolean): void {
-    if (active && !liveTickTimer && !quitting) {
-      liveTickTimer = setInterval(() => {
-        if (quitting || !busy) { syncLiveTick(false); return; }
-        render();
-      }, 1_000);
-    } else if (!active && liveTickTimer) {
-      clearInterval(liveTickTimer);
-      liveTickTimer = undefined;
-    }
   }
 
   function showToast(text: string, sub?: string): void {
@@ -389,6 +356,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
 
   function updatePrefs(patch: Partial<UserPrefs>): void {
     userPrefs = { ...userPrefs, ...patch };
+    renderController?.updatePreferences({ maxFps: userPrefs.maxFps, motion: userPrefs.motion });
     render();
     void prefsStore.update(patch).catch(error => {
       if (!quitting) showToast('Could not save preferences', error instanceof Error ? error.message : String(error));
@@ -397,6 +365,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
 
   function resetPrefs(): void {
     userPrefs = { ...DEFAULT_PREFS };
+    renderController?.updatePreferences({ maxFps: userPrefs.maxFps, motion: userPrefs.motion });
     render();
     void prefsStore.reset().then(() => {
       if (!quitting) showToast('Local UI preferences reset');
@@ -414,30 +383,21 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     outcome = { kind: 'quit' };
     if (quitting) return;
     quitting = true;
-    clearTimeout(renderTimer);
-    renderTimer = undefined;
     clearTimeout(toastTimer);
     toastTimer = undefined;
-    clearTimeout(replaySettleTimer);
-    replaySettleTimer = undefined;
+    replayCoordinator.dispose();
+    renderController?.dispose();
+    pathPresenceCache.clear();
     reportAbort?.abort();
     extAbort?.abort();
-    syncLiveTick(false);
     clearPermissions();
     controller.abort();
     stopped.resolve(null);
   }
 
   function clearReplayState(): void {
-    clearTimeout(replaySettleTimer);
-    replaySettleTimer = undefined;
-    replayingHistory = false;
+    replayCoordinator.disarmLateReplay();
     replayPlaceholderId = undefined;
-    replayCachedFallback = undefined;
-  }
-
-  function hasRichHistory(conv: Conversation | undefined): boolean {
-    return !!conv?.entries.some(entry => entry.type === 'message' && entry.role === 'agent');
   }
 
   function requestSessionPreview(id: string): void {
@@ -454,30 +414,32 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
   }
 
   function jumpUserTurn(direction: -1 | 1): void {
-    const userEntries = conversation.entries.filter(
+    const st = stateManager.getActive();
+    const conv = stateManager.getConversation();
+    const userEntries = conv.entries.filter(
       (entry): entry is Extract<TranscriptEntry, { type: 'message' }> => entry.type === 'message' && entry.role === 'user',
     );
     if (!userEntries.length || !surface) return;
     let nextIdx: number;
-    if (focusedTurnIndex === undefined) {
+    if (st.focusedTurnIndex === undefined) {
       nextIdx = direction === -1 ? userEntries.length - 1 : userEntries.length;
     } else {
-      nextIdx = focusedTurnIndex + direction;
+      nextIdx = st.focusedTurnIndex + direction;
     }
     if (nextIdx >= userEntries.length) {
-      focusedTurnIndex = undefined;
+      st.focusedTurnIndex = undefined;
       surface.scroll('main.conversation', 'end');
       showToast('Jumped to latest');
       return;
     }
     nextIdx = Math.max(0, nextIdx);
-    focusedTurnIndex = nextIdx;
+    st.focusedTurnIndex = nextIdx;
     const target = userEntries[nextIdx]!;
-    const globalIdx = conversation.entries.indexOf(target);
+    const globalIdx = conv.entries.indexOf(target);
     if (globalIdx >= 0) {
-      const needed = conversation.entries.length - globalIdx;
-      if (needed > historyVisibleCount) {
-        historyVisibleCount = needed + 20;
+      const needed = conv.entries.length - globalIdx;
+      if (needed > st.historyVisibleCount) {
+        st.historyVisibleCount = needed + 20;
         render();
       }
     }
@@ -486,15 +448,16 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
   }
 
   async function loadDeeperBrainHistory(): Promise<void> {
-    if (!activeSessionId || quitting || busy) return;
-    const targetId = activeSessionId;
+    const targetId = stateManager.activeSessionId;
+    if (!targetId || quitting || busy) return;
     const brain = await readOfficialBrainTranscript(targetId, { maxEntries: 400, maxReadBytes: 8_000_000 });
-    if (quitting || activeSessionId !== targetId) return;
+    if (quitting || stateManager.activeSessionId !== targetId) return;
     if (!brain || !brain.entries.length) {
       showToast('No older brain log entries found');
       return;
     }
-    conversation.restoreEntries([
+    const conv = stateManager.getConversation();
+    conv.restoreEntries([
       ...brain.entries,
       {
         type: 'notice',
@@ -505,38 +468,47 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         error: false,
       },
     ]);
-    historyVisibleCount = Math.max(historyVisibleCount, brain.entries.length + 10);
+    const st = stateManager.getActive();
+    st.historyVisibleCount = Math.max(st.historyVisibleCount, brain.entries.length + 10);
     render();
     showToast(`Loaded ${brain.entries.length} history entries`);
   }
 
   function persistActiveTranscript(): Promise<void> {
-    if (!activeSessionId || !conversation.entries.some(entry => entry.type === 'message')) {
+    const sid = stateManager.activeSessionId;
+    const conv = stateManager.getConversation();
+    if (!sid || !conv.entries.some(entry => entry.type === 'message')) {
       return Promise.resolve();
     }
-    sessionPreviewCache.delete(activeSessionId);
-    return transcriptStore.save(activeSessionId, conversation.entries).catch(() => {});
+    sessionPreviewCache.delete(sid);
+    return transcriptStore.save(sid, conv.entries).catch(() => {});
   }
 
   async function hydrateSessionHistoryFallback(
+    token: number,
     targetSessionId: string,
     fallback: Conversation | undefined,
     mode: 'load' | 'resume',
   ): Promise<void> {
-    if (quitting || hasRichHistory(conversation)) return;
-    if (fallback && hasRichHistory(fallback)) {
-      conversation = fallback;
+    const currentConv = stateManager.getConversation();
+    if (quitting || stateManager.activeSessionId !== targetSessionId || hasRichConversationHistory(currentConv)) return;
+    if (fallback && hasRichConversationHistory(fallback)) {
+      stateManager.replaceActiveConversation(fallback);
+      render();
       return;
     }
     const [cache, brain] = await Promise.all([
       transcriptStore.load(targetSessionId),
       readOfficialBrainTranscript(targetSessionId),
     ]);
-    if (quitting) return;
+    if (quitting || stateManager.activeSessionId !== targetSessionId || replayCoordinator.currentToken !== token) return;
+    const liveConv = stateManager.getConversation();
+    if (hasRichConversationHistory(liveConv)) return;
     const disk = selectRicherTranscript(cache, brain);
-    const replayedNonNotice = conversation.entries.filter(entry => entry.type !== 'notice').length;
-    if (disk && disk.entries.length > replayedNonNotice) {
-      conversation.restoreEntries([
+    const preNoticeEntryCount = liveConv.entries.filter(entry => entry.type !== 'notice').length;
+    const hadDiskEntries = Boolean(disk && disk.entries.length > preNoticeEntryCount);
+    if (hadDiskEntries && disk) {
+      liveConv.restoreEntries([
         ...disk.entries,
         {
           type: 'notice',
@@ -548,59 +520,54 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
           ...(disk.truncated ? { action: 'load_deeper_history' as const } : {}),
         },
       ]);
-      return;
-    }
-    if (!replayedNonNotice) {
-      conversation.notice(mode === 'resume'
+    } else if (!preNoticeEntryCount) {
+      liveConv.notice(mode === 'resume'
         ? 'Resumed active ACP session context without replaying earlier history. Send a message to continue.'
         : 'Antigravity loaded this session context without replaying earlier history. Send a message to continue.');
     } else {
-      conversation.notice('Antigravity replayed partial user history; backend session context is active.');
+      liveConv.notice('Antigravity replayed partial user history; backend session context is active.');
     }
+    replayCoordinator.enterFallbackWatching(token, {
+      hadDiskEntries,
+      preNoticeEntryCount,
+      onLateRichReplay: entries => {
+        if (quitting || stateManager.activeSessionId !== targetSessionId) return;
+        stateManager.getConversation().restoreEntries(entries);
+        render();
+        if (!panel) surface?.scroll('main.conversation', 'end');
+      },
+    });
   }
 
-  function finishHistoryReplay(): void {
-    if (quitting) return;
-    clearTimeout(replaySettleTimer);
-    replaySettleTimer = undefined;
-    const placeholderId = replayPlaceholderId;
-    replayingHistory = false;
+  function settleHistoryReplay(
+    token: number,
+    targetSessionId: string,
+    fallback: Conversation | undefined,
+    mode: 'load' | 'resume',
+  ): void {
+    replayCoordinator.markRpcResolved(token, (info: ReplaySettledInfo) => {
+      void (async () => {
+        if (quitting || stateManager.activeSessionId !== targetSessionId) return;
+        const placeholderId = replayPlaceholderId;
+        replayPlaceholderId = undefined;
+        if (placeholderId) stateManager.getConversation().removeNotice(placeholderId);
+        await hydrateSessionHistoryFallback(info.token, info.sessionId, fallback, mode);
+        if (quitting || stateManager.activeSessionId !== targetSessionId) return;
+        if (!busy && !sessionOperation && !disconnected && !agentConnecting) phase = 'Ready';
+        render();
+        if (!panel) surface?.scroll('main.conversation', 'end');
+      })();
+    });
+  }
+
+  function beginHistoryReplay(targetSessionId: string, mode: 'load' | 'resume'): number {
     replayPlaceholderId = undefined;
-    replayCachedFallback = undefined;
-    if (placeholderId) conversation.removeNotice(placeholderId);
-    if (!busy && !sessionOperation && !disconnected && !agentConnecting) phase = 'Ready';
-    render();
-    if (!panel) surface?.scroll('main.conversation', 'end');
-  }
-
-  function beginHistoryReplay(mode: 'load' | 'resume', fallback?: Conversation): void {
-    clearReplayState();
-    replayingHistory = true;
-    replayNoticeMode = mode;
-    replayCachedFallback = fallback;
-  }
-
-  function markReplayActivity(): void {
-    if (!replayingHistory || quitting) return;
-    clearTimeout(replaySettleTimer);
-    replaySettleTimer = setTimeout(finishHistoryReplay, 40);
+    return replayCoordinator.begin(targetSessionId, mode);
   }
 
   function scheduleRender(): void {
-    if (quitting || !surface || surface.closed) return;
-    const intervalMs = busy ? 40 : 20;
-    const now = Date.now();
-    if (!surface.blocked && now - lastRenderAt >= intervalMs && !renderTimer) {
-      render();
-      return;
-    }
-    if (!renderTimer) {
-      const waitMs = Math.max(8, intervalMs - (now - lastRenderAt));
-      renderTimer = setTimeout(() => {
-        renderTimer = undefined;
-        if (!quitting) render();
-      }, waitMs);
-    }
+    if (quitting || !renderController) return;
+    renderController.scheduleRender(busy, render);
   }
 
   function terminate(): void {
@@ -625,7 +592,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     if (optionId !== null && option?.kind !== 'allow_once' && option?.kind !== 'reject_once') return;
     permissions.shift();
     approvalChoice = 0;
-    const step = conversation.getTool(permission.request.toolCall.toolCallId);
+    const step = stateManager.getConversation().getTool(permission.request.toolCall.toolCallId);
     if (step) step.approved = option?.kind === 'allow_once' ? 'once' : 'denied';
     permission.answer(optionId);
     render();
@@ -641,7 +608,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       if (quitting) return;
       cancelling = false;
       phase = 'Cancellation failed';
-      conversation.notice(error instanceof Error ? error.message : String(error), true);
+      stateManager.getConversation().notice(error instanceof Error ? error.message : String(error), true);
       render();
     });
   }
@@ -767,11 +734,11 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     authTask = (async () => {
       await reportTask;
       if (quitting) return;
-      const handoffSessionId = activeSessionId || undefined;
+      const handoffSessionId = stateManager.activeSessionId || undefined;
       if (changeAccount) await connected?.logout();
       if (quitting) return;
       quit();
-      outcome = { kind: 'login', method, draft, ...(handoffSessionId ? { previousSessionId: handoffSessionId } : {}) };
+      outcome = { kind: 'login', method, draft: stateManager.getActive().draft, ...(handoffSessionId ? { previousSessionId: handoffSessionId } : {}) };
     })().catch(error => {
       if (!quitting) panelError = error instanceof Error ? error.message : String(error);
     }).finally(() => {
@@ -795,7 +762,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       if (quitting) return;
       const message = error instanceof Error ? error.message : String(error);
       if (panel?.kind === 'sessions' || panel?.kind === 'rename') panelError = message;
-      else conversation.notice(message, true);
+      else stateManager.getConversation().notice(message, true);
       phase = 'Session action failed';
     }).finally(() => {
       sessionOperation = undefined;
@@ -1081,7 +1048,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       if (quitting || shouldCancel?.()) break;
       if (!item.opt) {
         if (item.explicit && allowExplicitWarnings) {
-          conversation.notice(`Requested --${item.label.replace(' level', '')} "${item.wanted}", but this ACP session did not advertise that option.`);
+          stateManager.getConversation().notice(`Requested --${item.label.replace(' level', '')} "${item.wanted}", but this ACP session did not advertise that option.`);
         }
         continue;
       }
@@ -1089,7 +1056,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         val.value === item.wanted || val.name.toLowerCase() === item.wanted.toLowerCase());
       if (!matched) {
         if (item.explicit && allowExplicitWarnings) {
-          conversation.notice(`Requested --${item.label.replace(' level', '')} "${item.wanted}" was not among session options.`, true);
+          stateManager.getConversation().notice(`Requested --${item.label.replace(' level', '')} "${item.wanted}" was not among session options.`, true);
         }
         continue;
       }
@@ -1099,7 +1066,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         metadata = connected.metadata;
       } catch (err) {
         if (item.explicit && allowExplicitWarnings) {
-          conversation.notice(`Failed to apply --${item.label.replace(' level', '')}: ${err instanceof Error ? err.message : String(err)}`, true);
+          stateManager.getConversation().notice(`Failed to apply --${item.label.replace(' level', '')}: ${err instanceof Error ? err.message : String(err)}`, true);
         }
       }
     }
@@ -1146,12 +1113,12 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
   }
 
   function openConversation(id: string, requestedMode?: 'load' | 'resume'): void {
-    if (id === activeSessionId) { closePanel(); return; }
-    const cached = conversations.get(id);
-    const mode: 'load' | 'resume' = requestedMode ?? (cached && hasRichHistory(cached) && agent?.capabilities.resumeSession ? 'resume' : 'load');
+    if (id === stateManager.activeSessionId) { closePanel(); return; }
+    const cached = stateManager.getCachedConversation(id);
+    const mode: 'load' | 'resume' = requestedMode ?? (cached && hasRichConversationHistory(cached) && agent?.capabilities.resumeSession ? 'resume' : 'load');
     runSessionAction(mode === 'resume' ? 'Resuming conversation' : 'Opening conversation', async connected => {
       await persistActiveTranscript();
-      beginHistoryReplay(mode, cached);
+      const token = beginHistoryReplay(id, mode);
       try {
         if (mode === 'resume' && connected.resumeSession) await connected.resumeSession(id);
         else await connected.loadSession(id);
@@ -1159,11 +1126,9 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         clearReplayState();
         throw err;
       }
-      if (mode === 'load') finishHistoryReplay();
-      else clearReplayState();
-      await hydrateSessionHistoryFallback(id, cached, mode);
+      settleHistoryReplay(token, id, cached, mode);
       void startConfigSync(connected, false, true);
-      phase = 'Ready';
+      phase = replayCoordinator.isReplaying ? 'Syncing history' : 'Ready';
       closePanel();
       surface?.scroll('main.conversation', 'end');
     });
@@ -1173,6 +1138,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     runSessionAction('Closing session', async connected => {
       if (!connected.closeSession) throw new Error('Antigravity ACP does not support closing sessions.');
       await connected.closeSession(id);
+      stateManager.deleteSession(id);
       listedSessions = listedSessions.filter(row => row.sessionId !== id);
       pickerSelected = listedSessions[0]?.sessionId ?? '';
       showToast('Session closed on agy', sessionTitle(id));
@@ -1182,6 +1148,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
 
   function newConversation(): void {
     runSessionAction('Starting conversation', async connected => {
+      await persistActiveTranscript();
       clearReplayState();
       await connected.newSession();
       void startConfigSync(connected, false);
@@ -1217,7 +1184,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       const option = metadata.configOptions.find(candidate => candidate.id === next.id);
       if (option && option.type === 'select') pickerSelected = option.currentValue;
     }
-    if (next.kind === 'sessions') pickerSelected = activeSessionId;
+    if (next.kind === 'sessions') pickerSelected = stateManager.activeSessionId;
     autocompleteDismissed = true;
     render();
     const needsCustomFocus = next.kind === 'rename' || next.kind === 'template-save' ||
@@ -1280,8 +1247,9 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     }
     void readClipboardImage().then(loaded => {
       if (quitting) return;
-      if (!attachedImages.some(item => item.path === loaded.path)) {
-        attachedImages = [...attachedImages, loaded];
+      const st = stateManager.getActive();
+      if (!st.attachedImages.some(item => item.path === loaded.path)) {
+        st.attachedImages = [...st.attachedImages, loaded];
       }
       showToast('Attached clipboard image', `${loaded.mimeType} (${Math.max(1, Math.round(loaded.size / 1024))} KB)`);
       render();
@@ -1293,19 +1261,20 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
 
   function chooseCommand(command: Command, args = '', completeOnly = false): void {
     if (permissions.length || authBusy || quitting) return;
+    const st = stateManager.getActive();
     if (completeOnly || (!command.local && command.hint && !args)) {
-      draft = { text: `/${command.name} ${args}`, cursor: command.name.length + 2 + args.length };
+      st.draft = { text: `/${command.name} ${args}`, cursor: command.name.length + 2 + args.length };
       closePanel();
       return;
     }
     if (command.local) {
       if (args && command.local !== 'model' && command.local !== 'sessions' && command.local !== 'rename' &&
         command.local !== 'export' && command.local !== 'find' && command.local !== 'templates') {
-        conversation.notice(`/${command.name} does not take arguments in this frontend.`, true);
+        stateManager.getConversation().notice(`/${command.name} does not take arguments in this frontend.`, true);
         render();
         return;
       }
-      if (draft.text.startsWith('/')) draft = { text: '', cursor: 0 };
+      if (st.draft.text.startsWith('/')) stateManager.resetDraft();
       switch (command.local) {
         case 'exit': quit(); return;
         case 'help': openPanel({ kind: 'commands' }); return;
@@ -1329,9 +1298,9 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         case 'expand':
         case 'collapse': {
           const expand = command.local === 'expand';
-          for (const entry of conversation.entries) {
-            if (entry.type === 'thought') thoughtFoldOverrides.set(entry.id, expand);
-            else if (entry.type === 'tool') toolFoldOverrides.set(entry.id, !expand);
+          for (const entry of stateManager.getConversation().entries) {
+            if (entry.type === 'thought') st.thoughtFoldOverrides.set(entry.id, expand);
+            else if (entry.type === 'tool') st.toolFoldOverrides.set(entry.id, !expand);
           }
           closePanel();
           showToast(expand ? 'Expanded all cards' : 'Collapsed all cards');
@@ -1343,7 +1312,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
           return;
         case 'new': newConversation(); return;
         case 'rename':
-          openPanel({ kind: 'rename', sessionId: activeSessionId });
+          openPanel({ kind: 'rename', sessionId: stateManager.activeSessionId });
           if (args) { panelDraft = { text: args, cursor: args.length }; render(); }
           return;
         case 'usage': openPanel({ kind: 'report', report: 'usage' }); return;
@@ -1371,7 +1340,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     }
     if (busy || changingConfig || sessionOperation || authBusy) return;
     closePanel();
-    draft = { text: '', cursor: 0 };
+    stateManager.resetDraft();
     submitPrompt(`/${command.name}${args ? ` ${args}` : ''}`);
   }
 
@@ -1382,12 +1351,11 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     attachedDirPaths: readonly string[] = [],
   ): void {
     if (!agent || busy || changingConfig || sessionOperation || authBusy || disconnected || permissions.length) return;
-    lastPrompt = text;
-    lastImages = [...images];
-    lastFiles = [...attachedFilePaths];
-    lastDirs = [...attachedDirPaths];
+    replayCoordinator.disarmLateReplay();
+    stateManager.setRetryPayload(text, images, attachedFilePaths, attachedDirPaths);
+    const activeConv = stateManager.getConversation();
     busy = true;
-    focusedTurnIndex = undefined;
+    stateManager.getActive().focusedTurnIndex = undefined;
     turnStartedAt = Date.now();
     cancelling = false;
     autocompleteDismissed = true;
@@ -1395,14 +1363,13 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     const transcriptText = images.length
       ? `${images.map(image => `[Image: ${image.path}]`).join(' ')}${text ? `\n\n${text}` : ''}`
       : text;
-    conversation.startPrompt(transcriptText, clockTime());
-    syncLiveTick(true);
+    activeConv.startPrompt(transcriptText, clockTime());
     render();
     surface?.scroll('main.conversation', 'end');
     const activeAgent = agent;
     const promptBody = text || 'Inspect the attached image.';
     let completedNormally = false;
-    const entryCountBeforePrompt = conversation.entries.length;
+    const entryCountBeforePrompt = activeConv.entries.length;
     turn = (async () => {
       const resources: ResourceAttachment[] = [];
       await configSyncPromise.catch(() => {});
@@ -1421,29 +1388,33 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     })().catch(error => {
       if (quitting) return;
       phase = 'Prompt failed';
-      conversation.notice(error instanceof Error ? error.message : String(error), true, true);
+      activeConv.notice(error instanceof Error ? error.message : String(error), true, true);
     }).finally(() => {
       const elapsed = turnStartedAt ? Date.now() - turnStartedAt : 0;
-      conversation.finishTurn(Date.now(), !completedNormally);
-      void persistActiveTranscript();
+      activeConv.finishTurn(Date.now(), !completedNormally);
+      if (activeConv === stateManager.getConversation()) {
+        void persistActiveTranscript();
+      }
       busy = false;
       turnStartedAt = undefined;
       cancelling = false;
-      syncLiveTick(false);
       clearPermissions();
       if (!quitting && userPrefs.notifyOnTurnComplete && elapsed >= 8_000) {
         sendTerminalAttention('agy-tern', completedNormally ? 'Turn complete' : phase);
       }
-      const touchedWorkspace = conversation.entries.slice(entryCountBeforePrompt).some(entry =>
+      const touchedWorkspace = activeConv.entries.slice(entryCountBeforePrompt).some(entry =>
         entry.type === 'tool' && (entry.call.kind === 'edit' || entry.call.kind === 'execute' ||
           entry.call.content?.some(item => item.type === 'diff')));
       if (!quitting && !disconnected && (touchedWorkspace || Date.now() - lastWorkspaceIndexAt > 30_000)) {
         refreshWorkspaceFiles();
       }
-      if (completedNormally && !quitting && !disconnected && !permissions.length && queuedPrompts.length > 0) {
-        const next = queuedPrompts.shift()!;
-        submitPrompt(formatPromptWithAttachments(next.text, next.files, next.dirs), next.images, next.files, next.dirs);
-        return;
+      const currentState = stateManager.getActive();
+      if (completedNormally && !quitting && !disconnected && !permissions.length && currentState.queuedPrompts.length > 0) {
+        const next = stateManager.drainNextQueued();
+        if (next) {
+          submitPrompt(formatPromptWithAttachments(next.text, next.files, next.dirs), next.images, next.files, next.dirs);
+          return;
+        }
       }
       render();
       surface?.scroll('main.conversation', 'end');
@@ -1452,9 +1423,10 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
 
   function send(): void {
     if (changingConfig || sessionOperation || authBusy || permissions.length) return;
-    if (!draft.text.trim() && !attachedFiles.length && !attachedDirs.length && !attachedImages.length) return;
-    const text = draft.text;
-    if (text.trimStart().startsWith('/') && !attachedFiles.length && !attachedDirs.length && !attachedImages.length) {
+    const st = stateManager.getActive();
+    if (!st.draft.text.trim() && !st.attachedFiles.length && !st.attachedDirs.length && !st.attachedImages.length) return;
+    const text = st.draft.text;
+    if (text.trimStart().startsWith('/') && !st.attachedFiles.length && !st.attachedDirs.length && !st.attachedImages.length) {
       const match = resolveCommand(text, availableCommands());
       if (match) {
         if (busy && !match.command.local) {
@@ -1464,7 +1436,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
           return;
         }
       } else {
-        conversation.notice('Command not available in this session. Use /help to see supported commands.', true);
+        stateManager.getConversation().notice('Command not available in this session. Use /help to see supported commands.', true);
         render();
         return;
       }
@@ -1476,18 +1448,12 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       if (promptHistory.length > 50) promptHistory.splice(0, promptHistory.length - 50);
       void promptHistoryStore.save(promptHistory).catch(() => {});
     }
-    const filesToSend = attachedFiles;
-    const dirsToSend = attachedDirs;
-    const imagesToSend = attachedImages;
-    draft = { text: '', cursor: 0 };
-    undoStack.length = 0;
-    historyIndex = undefined;
-    historyStash = undefined;
-    attachedFiles = [];
-    attachedDirs = [];
-    attachedImages = [];
+    const filesToSend = [...st.attachedFiles];
+    const dirsToSend = [...st.attachedDirs];
+    const imagesToSend = [...st.attachedImages];
+    stateManager.clearPendingDraftInputs();
     if (busy) {
-      queuedPrompts.push({ id: `q-${++queueSequence}`, text, files: filesToSend, dirs: dirsToSend, images: imagesToSend });
+      stateManager.enqueuePrompt({ text, files: filesToSend, dirs: dirsToSend, images: imagesToSend });
       showToast('Queued follow-up prompt', trimmedPrompt || `${imagesToSend.length} image(s)`);
       render();
       return;
@@ -1496,7 +1462,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
   }
 
   function autocomplete(): Command[] {
-    const query = commandQuery(draft.text);
+    const query = commandQuery(stateManager.getActive().draft.text);
     const active = !panel && !autocompleteDismissed && query !== undefined && !permissions.length && !sessionOperation && !authBusy;
     if (!active || query === undefined) return [];
     const cmds = availableCommands();
@@ -1508,9 +1474,10 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
   }
 
   function activeAtMention(): { start: number; end: number; query: string } | undefined {
+    const currentDraft = stateManager.getActive().draft;
     if (panel || autocompleteDismissed || permissions.length || sessionOperation || authBusy) return undefined;
-    if (commandQuery(draft.text) !== undefined) return undefined;
-    return atMentionQuery(draft.text, draft.cursor);
+    if (commandQuery(currentDraft.text) !== undefined) return undefined;
+    return atMentionQuery(currentDraft.text, currentDraft.cursor);
   }
 
   function triggerPrefixSearch(query: string): void {
@@ -1540,18 +1507,19 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
   function atFileMatches(): WorkspaceEntry[] {
     const mention = activeAtMention();
     if (!mention) return [];
+    const st = stateManager.getActive();
     const prefixExtra = prefixSearchCache.get(mention.query.trim()) ?? [];
-    const key = `${mention.query}|${workspaceEntriesVersion}|${attachedFiles.join(',')}|${attachedDirs.join(',')}|${attachedImages.map(i => i.path).join(',')}|${prefixExtra.length}`;
+    const key = `${mention.query}|${workspaceEntriesVersion}|${st.attachedFiles.join(',')}|${st.attachedDirs.join(',')}|${st.attachedImages.map(i => i.path).join(',')}|${prefixExtra.length}`;
     if (key === cachedAtKey) return cachedAtResult;
 
-    const imagePaths = new Set(attachedImages.map(image => image.path));
+    const imagePaths = new Set(st.attachedImages.map(image => image.path));
     const combined = prefixExtra.length ? [...workspaceEntries, ...prefixExtra] : workspaceEntries;
     const seen = new Set<string>();
     const available: WorkspaceEntry[] = [];
     for (const entry of combined) {
       if (seen.has(entry.path)) continue;
       seen.add(entry.path);
-      if (entry.kind === 'dir' ? attachedDirs.includes(entry.path) : (attachedFiles.includes(entry.path) || imagePaths.has(entry.path))) {
+      if (entry.kind === 'dir' ? st.attachedDirs.includes(entry.path) : (st.attachedFiles.includes(entry.path) || imagePaths.has(entry.path))) {
         continue;
       }
       available.push(entry);
@@ -1582,13 +1550,14 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         ignored: ignoredPathsSet.has(target) || ignoredPathsSet.has(`${target}/`),
       }
       : target;
+    const st = stateManager.getActive();
     const mention = activeAtMention();
-    if (mention) draft = stripAtMention(draft, mention);
+    if (mention) st.draft = stripAtMention(st.draft, mention);
     fileSelection = 0;
     autocompleteDismissed = true;
     if (entry.kind === 'dir') {
       const dirPath = entry.path.endsWith('/') ? entry.path : `${entry.path}/`;
-      if (!attachedDirs.includes(dirPath)) attachedDirs = [...attachedDirs, dirPath];
+      if (!st.attachedDirs.includes(dirPath)) st.attachedDirs = [...st.attachedDirs, dirPath];
       render();
       surface?.focus('dock.draft');
       return;
@@ -1603,8 +1572,9 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       }
       render();
       void readImageAttachment(options.cwd, filePath).then(loaded => {
-        if (!quitting && !attachedImages.some(item => item.path === loaded.path)) {
-          attachedImages = [...attachedImages, loaded];
+        const currentSt = stateManager.getActive();
+        if (!quitting && !currentSt.attachedImages.some(item => item.path === loaded.path)) {
+          currentSt.attachedImages = [...currentSt.attachedImages, loaded];
         }
         render();
         surface?.focus('dock.draft');
@@ -1613,25 +1583,28 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       });
       return;
     }
-    if (!attachedFiles.includes(filePath)) attachedFiles = [...attachedFiles, filePath];
+    if (!st.attachedFiles.includes(filePath)) st.attachedFiles = [...st.attachedFiles, filePath];
     render();
     surface?.focus('dock.draft');
   }
 
   function removeAttachment(filePath: string): void {
-    attachedFiles = attachedFiles.filter(item => item !== filePath);
+    const st = stateManager.getActive();
+    st.attachedFiles = st.attachedFiles.filter(item => item !== filePath);
     render();
     surface?.focus('dock.draft');
   }
 
   function removeDirAttachment(dirPath: string): void {
-    attachedDirs = attachedDirs.filter(item => item !== dirPath);
+    const st = stateManager.getActive();
+    st.attachedDirs = st.attachedDirs.filter(item => item !== dirPath);
     render();
     surface?.focus('dock.draft');
   }
 
   function removeImageAttachment(filePath: string): void {
-    attachedImages = attachedImages.filter(item => item.path !== filePath);
+    const st = stateManager.getActive();
+    st.attachedImages = st.attachedImages.filter(item => item.path !== filePath);
     render();
     surface?.focus('dock.draft');
   }
@@ -1639,7 +1612,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
   function panelChoices(): Choice[] {
     if (!panel || panel.kind === 'report' || panel.kind === 'changes' || panel.kind === 'find' || panel.kind === 'inspect' ||
       panel.kind === 'commands' || panel.kind === 'mcp' || panel.kind === 'plugins' || panel.kind === 'agents' ||
-      panel.kind === 'templates') return [];
+      panel.kind === 'templates' || panel.kind === 'sessions' || panel.kind === 'settings') return [];
     let choices: Choice[];
     if (panel.kind === 'account' || panel.kind === 'account-switch') {
       const method = loginMethod();
@@ -1676,11 +1649,11 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       ];
     }
     if (panel.kind === 'template-save') {
-      const trimmed = draft.text.trim();
+      const trimmed = stateManager.getActive().draft.text.trim();
       return [
         { label: 'Save current draft as template',
           detail: trimmed ? `Save "${trimmed.slice(0, 48)}${trimmed.length > 48 ? '...' : ''}"` : 'Type a prompt in the composer draft first.',
-          disabled: !trimmed || extLoading, choose: () => savePromptTemplate(panelDraft.text, draft.text) },
+          disabled: !trimmed || extLoading, choose: () => savePromptTemplate(panelDraft.text, stateManager.getActive().draft.text) },
         { label: 'Back to templates', detail: 'Return without saving.', choose: () => openPanel({ kind: 'templates' }) },
       ];
     }
@@ -1706,38 +1679,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
           choose: () => { if (confirmPanel.returnTo) openPanel(confirmPanel.returnTo); else closePanel(); } },
       ];
     }
-    if (panel.kind === 'sessions') {
-      const query = panelDraft.text.toLowerCase();
-      const rows = new Map(listedSessions.map(row => [row.sessionId, row]));
-      if (activeSessionId) rows.set(activeSessionId, sessionInfo.get(activeSessionId) ?? { sessionId: activeSessionId, cwd: options.cwd });
-      const matching = [...rows.values()].filter(row =>
-        `${sessionTitle(row.sessionId)} ${row.title ?? ''} ${row.sessionId}`.toLowerCase().includes(query));
-      matching.sort((a, b) => Number(b.sessionId === activeSessionId) - Number(a.sessionId === activeSessionId) ||
-        (Date.parse(b.updatedAt ?? '') || 0) - (Date.parse(a.updatedAt ?? '') || 0));
-      return [
-        { label: 'New conversation', detail: 'Start a separate official ACP session; keep this conversation available.',
-          choose: newConversation },
-        { label: 'Name current conversation', detail: 'Set a private, local label. Antigravity’s own title is unchanged.',
-          choose: () => openPanel({ kind: 'rename', sessionId: activeSessionId }) },
-        ...(agent?.capabilities.listSessions ? [{ label: 'Refresh conversations', detail: 'Read session metadata through official ACP.',
-          choose: () => loadSessions() }] : []),
-        ...matching.map(row => ({
-          label: sessionTitle(row.sessionId),
-          detail: `${row.updatedAt ?? 'No timestamp reported'} · ${row.sessionId}${localNames.get(row.sessionId) ? ' · Local name' : ''}`,
-          value: row.sessionId === activeSessionId ? 'Current' : 'Open',
-          disabled: row.sessionId !== activeSessionId && !agent?.capabilities.loadSession,
-          choose: () => openConversation(row.sessionId),
-        })),
-        ...(nextSessionsCursor ? [{ label: 'Load older conversations', detail: 'Read the next page from agy.',
-          choose: () => loadSessions(true) }] : []),
-      ];
-    }
-    if (panel.kind === 'settings') {
-      choices = metadata.configOptions.map(option => ({
-        label: option.name, detail: option.description ?? option.id, value: configLabel(option),
-        choose: () => openPanel({ kind: 'config', id: option.id }),
-      }));
-    } else if (panel.kind === 'config') {
+    if (panel.kind === 'config') {
       const id = panel.id;
       const option = metadata.configOptions.find(option => option.id === id);
       choices = option?.type === 'boolean' ? [true, false].map(value => ({
@@ -1757,7 +1699,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
   function inspectFindMatch(match: ReturnType<typeof searchTranscript>[number]): void {
     const entry = match.entry;
     if (entry.type === 'tool') {
-      const imgPath = extractToolImagePaths(entry.call, options.cwd).find(p => cachedPathExists(p));
+      const imgPath = extractToolImagePaths(entry.call, options.cwd).find(pathExists);
       if (imgPath) {
         const label = formatPathLabel(imgPath, options.cwd);
         openInspect(basename(label), { type: 'image-path', path: imgPath }, label);
@@ -1795,24 +1737,20 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
   }
 
   function activeToolSteps(): ToolStep[] {
-    return conversation.entries.filter((entry): entry is ToolStep =>
+    return stateManager.getConversation().entries.filter((entry): entry is ToolStep =>
       entry.type === 'tool' && (entry.call.status === 'in_progress' || entry.call.status === 'pending'));
   }
 
   function inspectTaskStep(step: ToolStep): void {
     const s = summarizeToolCall(step.call, options.cwd);
-    const detailText = [
-      `Tool: ${s.title}`,
-      ...(s.target ? [`Target: ${s.target}`] : []),
-      ...(s.fullCommand ? [`Command:\n${s.fullCommand}`] : []),
-      ...(step.call.rawInput !== undefined ? [`Input:\n${JSON.stringify(step.call.rawInput, null, 2)}`] : []),
-      ...(step.call.rawOutput !== undefined ? [`Output:\n${typeof step.call.rawOutput === 'string' ? step.call.rawOutput : JSON.stringify(step.call.rawOutput, null, 2)}`] : []),
-    ].join('\n\n');
+    const detailText = buildTaskDetailText(step, options.cwd);
     openInspect(s.title, { type: 'file', path: 'task.log', content: detailText }, s.target);
   }
 
   function renderPanel(): JSX.Element | null {
     if (!panel) return null;
+    const conv = stateManager.getConversation();
+    const st = stateManager.getActive();
     return renderActivePanel({
       panel,
       options,
@@ -1833,7 +1771,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       reportText,
       sessionsLoading,
       sessionOperation,
-      activeSessionId,
+      activeSessionId: stateManager.activeSessionId,
       previousSessionId,
       listedSessions,
       nextSessionsCursor,
@@ -1846,8 +1784,9 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       templatesList,
       gitChanges,
       gitDiffCache,
-      entries: conversation.entries,
-      draftText: draft.text,
+      entries: conv.entries,
+      entriesRevision: conv.revision,
+      draftText: st.draft.text,
       panelDraft,
       panelSelection,
       pickerTab,
@@ -1862,6 +1801,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       loginMethod: loginMethod(),
       modeOption: modeOption(),
       sessionTitle,
+      pathExists,
       blobForImage,
       onRender: render,
       onFocus: target => surface?.focus(target),
@@ -1907,7 +1847,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       onUninstallPlugin: runUninstallPlugin,
       onRemoveTemplate: removePromptTemplate,
       onSetDraft: next => {
-        draft = next;
+        stateManager.getActive().draft = next;
         render();
       },
       onRefreshGitChanges: () => {
@@ -1927,13 +1867,15 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       onAttachFile: attachFile,
       onInspectFindMatch: inspectFindMatch,
       onJumpToEntry: targetEntry => {
-        const idx = conversation.entries.indexOf(targetEntry);
+        const activeConv = stateManager.getConversation();
+        const activeSt = stateManager.getActive();
+        const idx = activeConv.entries.indexOf(targetEntry);
         if (idx >= 0) {
-          const needed = conversation.entries.length - idx;
-          if (needed > historyVisibleCount) historyVisibleCount = needed + 20;
+          const needed = activeConv.entries.length - idx;
+          if (needed > activeSt.historyVisibleCount) activeSt.historyVisibleCount = needed + 20;
         }
-        if (targetEntry.type === 'thought') thoughtFoldOverrides.set(targetEntry.id, true);
-        else if (targetEntry.type === 'tool') toolFoldOverrides.set(targetEntry.id, false);
+        if (targetEntry.type === 'thought') activeSt.thoughtFoldOverrides.set(targetEntry.id, true);
+        else if (targetEntry.type === 'tool') activeSt.toolFoldOverrides.set(targetEntry.id, false);
         closePanel();
         surface?.reveal(`main.conversation.${targetEntry.id}`, 'start');
       },
@@ -1953,15 +1895,15 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
   }
 
   function render(): void {
-    if (renderTimer) {
-      clearTimeout(renderTimer);
-      renderTimer = undefined;
-    }
-    if (!surface || surface.closed || quitting) return;
-    if (process.stdout.rows) viewportRows = process.stdout.rows;
-    lastRenderAt = Date.now();
+    const rc = renderController;
+    rc?.clearScheduledRender();
+    if (!rc || !surface || surface.closed || quitting) return;
+    if (process.stdout.rows) rc.rows = process.stdout.rows;
+    const conv = stateManager.getConversation();
+    const st = stateManager.getActive();
+    const sid = stateManager.activeSessionId;
     const permission = permissions[0];
-    const approvalCall = permission && (conversation.getTool(permission.request.toolCall.toolCallId)?.call ?? permission.request.toolCall);
+    const approvalCall = permission && (conv.getTool(permission.request.toolCall.toolCallId)?.call ?? permission.request.toolCall);
     const approvalSummary = approvalCall ? summarizeToolCall(approvalCall, options.cwd) : undefined;
     const offered = permission?.request.options.filter(option => option.kind === 'allow_once' || option.kind === 'reject_once') ?? [];
     const selectedChoice = offered[approvalChoice];
@@ -1973,35 +1915,39 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     const currentModel = modelOption(metadata.configOptions);
     const currentThinking = thinkingOption(metadata.configOptions);
     const currentMode = modeOption();
-    const draftCommand = resolveCommand(draft.text, availableCommands());
-    const hasAttachments = attachedFiles.length > 0 || attachedDirs.length > 0 || attachedImages.length > 0;
-    const hasDraftContent = !!(draft.text.trim() || hasAttachments);
+    const draftCommand = resolveCommand(st.draft.text, availableCommands());
+    const hasAttachments = st.attachedFiles.length > 0 || st.attachedDirs.length > 0 || st.attachedImages.length > 0;
+    const hasDraftContent = !!(st.draft.text.trim() || hasAttachments);
     const canSend = hasDraftContent && !busy && !changingConfig && !sessionOperation && !authBusy && !permission &&
       !!((agent && !disconnected) || (draftCommand && !hasAttachments));
     const canQueue = hasDraftContent && busy && !changingConfig && !sessionOperation && !authBusy && !permission &&
       !!agent && !disconnected;
-    const activePlan = conversation.currentPlan;
+    const activePlan = conv.currentPlan;
     const planSummary = formatPlanSummary(activePlan);
     const contextUsage = formatContextUsage(metadata.usage);
-    if (cachedDiffCountConversation !== conversation || cachedDiffCountRev !== conversation.revision) {
-      cachedDiffCountConversation = conversation;
-      cachedDiffCountRev = conversation.revision;
-      cachedDiffCount = countSessionDiffs(conversation.entries);
+    if (cachedDiffCountConversation !== conv || cachedDiffCountRev !== conv.revision) {
+      cachedDiffCountConversation = conv;
+      cachedDiffCountRev = conv.revision;
+      cachedDiffCount = countSessionDiffs(conv.entries);
     }
     const sessionDiffCount = cachedDiffCount;
     const loginAvailable = !!loginMethod() && !terminalLoginProblem(loginMethod()!) && !!agent && !disconnected && authentication.logout;
     const agentStatus: Tone = disconnected || phase.includes('failed') ? 'error' : busy ? 'warning' : agent ? 'success' : 'muted';
-    const renderNow = lastRenderAt || Date.now();
+    const renderNow = Date.now();
     const activeTools = activeToolSteps();
-    const showHud = !!(planSummary || contextUsage || busy || activeTools.length > 0);
+    const rowsNow = viewportRows();
+    const colsNow = viewportCols();
+    const showComposerBar = !!(currentModel || currentThinking || currentMode || contextUsage) && rowsNow >= 18;
+    const showHud = !!(busy || activeTools.length > 0 || (planSummary && activePlan) || (!showComposerBar && contextUsage));
     const activeToolTop = activeTools.at(-1);
     const activeToolSummary = activeToolTop ? summarizeToolCall(activeToolTop.call, options.cwd) : undefined;
     const liveTaskLabel = activeToolSummary
       ? `Running${activeTools.length > 1 ? ` (${activeTools.length})` : ''}: ${activeToolSummary.title}${activeToolSummary.target ? ` · ${compactToolHeaderText(activeToolSummary.target, 36)}` : ''}`
       : phase;
-    const activeAgeMs = activeToolTop?.startedAt !== undefined
-      ? Math.max(0, Date.now() - activeToolTop.startedAt)
-      : turnStartedAt ? Math.max(0, Date.now() - turnStartedAt) : 0;
+    const hudAgeMs = rc.stableAge(
+      activeToolTop ? `hud:${activeToolTop.id}` : 'hud:turn',
+      activeToolTop?.startedAt ?? turnStartedAt,
+    );
     const layout = currentResponsiveLayout({
       hasPermission: !!permission,
       hasSuggestionsOrAt: suggestions.length > 0 || atMatches.length > 0,
@@ -2015,23 +1961,26 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       agentStatus,
       prefs: userPrefs,
       proseMaxW: layout.proseMaxW,
-      thoughtFoldOverrides,
-      toolFoldOverrides,
-      canRetry: !!(lastPrompt || lastImages.length) && !busy && !!agent && !disconnected && !permission,
+      thoughtFoldOverrides: st.thoughtFoldOverrides,
+      toolFoldOverrides: st.toolFoldOverrides,
+      canRetry: !!(st.lastPrompt || st.lastImages.length) && !busy && !!agent && !disconnected && !permission,
       canReconnect: disconnected && !agentConnecting && !authBusy && !busy,
       canSwitchAccount: loginAvailable && !busy && !authBusy,
+      pathExists,
       getBlob: blobForImage,
       onInspect: openInspect,
       onToggleThought(id, open) {
-        thoughtFoldOverrides.set(id, open);
+        st.thoughtFoldOverrides.set(id, open);
         render();
       },
       onToggleTool(id, collapsed) {
-        toolFoldOverrides.set(id, collapsed);
+        st.toolFoldOverrides.set(id, collapsed);
         render();
       },
       onRetry() {
-        if (lastPrompt || lastImages.length || lastFiles.length || lastDirs.length) submitPrompt(lastPrompt, lastImages, lastFiles, lastDirs);
+        if (st.lastPrompt || st.lastImages.length || st.lastFiles.length || st.lastDirs.length) {
+          submitPrompt(st.lastPrompt, st.lastImages, st.lastFiles, st.lastDirs);
+        }
       },
       onReconnect() {
         reconnectAgent();
@@ -2066,7 +2015,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         });
       },
       onResend(text) {
-        draft = { text, cursor: text.length };
+        stateManager.getActive().draft = { text, cursor: text.length };
         render();
         surface?.focus('dock.draft');
       },
@@ -2084,17 +2033,16 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       : [{ act: 'send', text: 'Send', icon: 'send', variant: permission ? 'default' as const : 'primary' as const,
         disabled: !canSend }];
 
-    const dockLines = 0; // Replaced by layout.scrollMaxH
-    void dockLines;
-    const allEntries = conversation.entries;
+    const allEntries = conv.entries;
     const totalEntries = allEntries.length;
-    const hiddenCount = Math.max(0, totalEntries - historyVisibleCount);
+    const hiddenCount = Math.max(0, totalEntries - st.historyVisibleCount);
     const visibleEntries = hiddenCount > 0 ? allEntries.slice(hiddenCount) : allEntries;
     let turnCounter = 0;
     for (let i = 0; i < hiddenCount; i++) {
       const earlier = allEntries[i]!;
       if (earlier.type === 'message' && earlier.role === 'user') turnCounter++;
     }
+    const renderedEntries: RenderedEntryRecord[] = [];
     const renderEntryNode = (entry: TranscriptEntry, idxInVisible: number): JSX.Element => {
       const globalIdx = hiddenCount + idxInVisible;
       const prev = globalIdx > 0 ? allEntries[globalIdx - 1] : undefined;
@@ -2102,30 +2050,35 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       const streaming = busy && globalIdx === totalEntries - 1 && entry.type === 'message' && entry.role === 'agent';
       const recent = globalIdx >= Math.max(0, totalEntries - 8);
       const turnNumber = entry.type === 'message' && entry.role === 'user' ? ++turnCounter : undefined;
-      const isRunning = streaming ||
-        (entry.type === 'thought' && entry.endedAt === undefined && busy) ||
-        (entry.type === 'tool' && (entry.call.status === 'in_progress' || entry.call.status === 'pending')) ||
-        (entry.type === 'compaction' && (entry.status === 'in_progress' || entry.status === 'queued'));
+      const settled = isEntrySettled(entry, globalIdx, totalEntries, busy, replayCoordinator.isReplaying, activePlan);
       const foldKey = entry.type === 'thought' || entry.type === 'compaction'
-        ? String(thoughtFoldOverrides.get(entry.id) ?? '')
-        : entry.type === 'tool' ? String(toolFoldOverrides.get(entry.id) ?? '') : '';
+        ? String(st.thoughtFoldOverrides.get(entry.id) ?? '')
+        : entry.type === 'tool' ? String(st.toolFoldOverrides.get(entry.id) ?? '') : '';
       const errorKey = entry.type === 'notice' && entry.error
         ? `${Number(entryCallbacks.canRetry)}${Number(entryCallbacks.canReconnect)}${Number(entryCallbacks.canSwitchAccount)}` : '';
-      const sig = `${conversation.revisionOf(entry)}|${continued ? 1 : 0}|${streaming ? 1 : 0}|${recent ? 1 : 0}|${turnNumber ?? ''}|${isRunning ? Math.floor(renderNow / 1000) : 0}|${foldKey}|${errorKey}|${agentStatus}|${userPrefs.diffMode}|${userPrefs.toolDisplay}|${Number(userPrefs.thoughtExpanded)}|${userPrefs.transcriptDensity}|${Number(userPrefs.showTimestamps)}|${layout.proseMaxW}`;
-      const cached = entryRenderCache.get(entry);
-      if (cached && cached.key === sig) return cached.node;
-      const node = <Entry key={entry.id} entry={entry} continued={continued} streaming={streaming} recent={recent} turnNumber={turnNumber} callbacks={entryCallbacks} />;
-      entryRenderCache.set(entry, { key: sig, node });
-      return node;
+      const stableAgeMs = entry.type === 'thought' || entry.type === 'tool'
+        ? rc.stableAge(entry.id, entry.startedAt)
+        : 0;
+      const entryNow = entry.type === 'thought' || entry.type === 'tool'
+        ? ((entry.startedAt ?? renderNow) + stableAgeMs)
+        : renderNow;
+      const sig = `${conv.revisionOf(entry)}|${continued ? 1 : 0}|${streaming ? 1 : 0}|${recent ? 1 : 0}|${turnNumber ?? ''}|${settled ? 1 : 0}|${foldKey}|${errorKey}|${agentStatus}|${userPrefs.diffMode}|${userPrefs.toolDisplay}|${Number(userPrefs.thoughtExpanded)}|${userPrefs.transcriptDensity}|${Number(userPrefs.showTimestamps)}|${layout.proseMaxW}|${pathPresenceCache.version}`;
+      const record = rc.renderEntryMemoized(entry, { sig, settled }, () => (
+        <Entry key={entry.id} entry={entry} continued={continued} streaming={streaming} recent={recent} turnNumber={turnNumber}
+          callbacks={entryNow === renderNow ? entryCallbacks : { ...entryCallbacks, now: entryNow }} />
+      ));
+      renderedEntries.push(record);
+      return record.node;
     };
-    surface.render({
+    const canSendQueueHead = !busy && !permission && !changingConfig && !sessionOperation && !authBusy && !!agent && !disconnected;
+    const view: Renderable = {
       main: <col>
         <scroll key="conversation" stick={visibleEntries.length ? 'end' : undefined} max={{ h: layout.scrollMaxH }} gap="md" aria="Conversation">
           {hiddenCount > 0 && <row key="older-history" justify="between" align="center" gap="sm" wrap>
             <text><span s="muted">{hiddenCount} earlier {hiddenCount === 1 ? 'entry' : 'entries'} hidden for speed</span></text>
             <row gap="xs">
-              <button size="sm" variant="quiet" onClick={() => { historyVisibleCount += 50; render(); }}>Load 50 more</button>
-              <button size="sm" variant="quiet" onClick={() => { historyVisibleCount = totalEntries; render(); }}>Show all ({totalEntries})</button>
+              <button size="sm" variant="quiet" onClick={() => { st.historyVisibleCount += 50; render(); }}>Load 50 more</button>
+              <button size="sm" variant="quiet" onClick={() => { st.historyVisibleCount = totalEntries; render(); }}>Show all ({totalEntries})</button>
             </row>
           </row>}
           {visibleEntries.length ? visibleEntries.map(renderEntryNode) :
@@ -2133,7 +2086,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
               <empty icon={layout.compactEmpty ? undefined : 'tern'} title={agent ? 'Ask Antigravity about this project' : disconnected ? 'Antigravity is unavailable' : 'Opening an ACP session'}
                 text={layout.compactEmpty ? (agent ? 'Use / for commands or @ for files & dirs.' : disconnected ? 'Open /account to sign in.' : 'Opening ACP session...') : (agent ? 'Type / for commands or @ to attach files, directories, and images (including gitignored entries). Thoughts, diffs, and one-time approvals appear here.' :
                   disconnected ? 'Open /account to sign in, or Quit to return to your shell.' : 'The official agy process handles authentication and tools.')} />
-              {agent && !disconnected && !permission && viewportRows >= 20 && <suggestions variant="chips"
+              {agent && !disconnected && !permission && rowsNow >= 20 && <suggestions variant="chips"
                 items={[
                   { id: 'explain', text: 'Summarize this project structure', icon: 'compass' },
                   { id: 'changes', text: 'Review /changes', icon: 'diff' },
@@ -2153,9 +2106,9 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         {showHud && <row key="hud" justify="between" align="center" gap="sm" wrap>
           <row gap="sm" align="center" wrap>
             {(busy || activeTools.length > 0) && <row key="live-turn" gap="sm" align="center">
-              <spinner style="braille" />
+              <spinner style="starburst" />
               <shimmer text={liveTaskLabel} />
-              <elapsed age={activeAgeMs} />
+              <elapsed age={hudAgeMs} />
               <button size="sm" variant="quiet" onClick={() => openPanel({ kind: 'tasks' })}>Tasks</button>
               <button size="sm" variant="danger" disabled={cancelling && 'Cancellation requested'} onClick={stop}>
                 {cancelling ? 'Stopping...' : 'Stop'}
@@ -2168,7 +2121,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
                 status: item.status === 'in_progress' ? 'active' : item.status === 'completed' ? 'done' : 'pending',
               })) }]} />}
           </row>
-          {contextUsage && <meter key="context" style="bar" size="sm"
+          {!showComposerBar && contextUsage && <meter key="context" style="bar" size="sm"
             value={contextUsage.percent / 100}
             thresholds={{ warn: 0.75, bad: 0.9 }}
             label={contextUsage.summary}
@@ -2176,6 +2129,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
             hovercard={hoverKv([
               { k: 'Context used', v: `${metadata.usage?.used.toLocaleString()} tokens` },
               { k: 'Window', v: `${metadata.usage?.size.toLocaleString()} tokens` },
+              ...(metadata.usage?.cost ? [{ k: 'Session cost', v: `${metadata.usage.cost.amount} ${metadata.usage.cost.currency}` }] : []),
               ...(metadata.tier ? [{ k: 'Subscription tier', v: metadata.tier.name }] : []),
               { k: 'Action', v: 'Click to open /usage' },
             ])}
@@ -2188,7 +2142,12 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
           targetKind={approvalSummary.targetKind}
           status="pending" note="Approval required">
           <text>Choose a one-time permission for this tool. Tab selects a choice; Ctrl+Y allows, Ctrl+N denies. Enter never approves.</text>
-          <scroll max={{ h: layout.approvalBodyMaxH }}><ToolBody call={approvalCall} cwd={options.cwd} showRawInput={approvalSummary.showRawInput} diffMode={userPrefs.diffMode} /></scroll>
+          <scroll max={{ h: layout.approvalBodyMaxH }}>
+            <ToolBody call={approvalCall} cwd={options.cwd} showRawInput={approvalSummary.showRawInput}
+              fullCommand={approvalSummary.fullCommand} diffMode={userPrefs.diffMode}
+              pathExists={pathExists} getBlob={blobForImage} onInspect={openInspect}
+              onOpenSplit={openSplit} onCopy={entryCallbacks.onCopy} />
+          </scroll>
           <buttons variant="toolbar" label="One-time permission choices">
             {offered.map(option => <button key={option.optionId} on={option === selectedChoice}
               variant={option === selectedChoice && option.kind === 'allow_once' ? 'primary' : 'default'}
@@ -2223,8 +2182,8 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
               onClick={() => attachFile(entry)} />;
           })}
         </list>}
-        {queuedPrompts.length > 0 && <col key="queue" gap="xs">
-          {queuedPrompts.map((item, idx) => {
+        {st.queuedPrompts.length > 0 && <col key="queue" gap="xs">
+          {st.queuedPrompts.map((item, idx) => {
             const label = item.text.trim().replace(/\s+/g, ' ');
             const preview = label.length > 64 ? `${label.slice(0, 61)}...` : (label || `${item.images.length} image(s)`);
             const metaParts = [
@@ -2239,18 +2198,24 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
                 {metaParts.length > 0 && <span s="muted"> ({metaParts.join(', ')})</span>}
               </text>
               <row gap="xs">
+                {idx === 0 && canSendQueueHead && <button size="sm" variant="primary" onClick={() => {
+                  const next = stateManager.pullQueuedAt(0);
+                  if (!next) return;
+                  submitPrompt(formatPromptWithAttachments(next.text, next.files, next.dirs), next.images, next.files, next.dirs);
+                }}>Send</button>}
                 <button size="sm" variant="quiet" onClick={() => {
-                  const pulled = queuedPrompts.splice(idx, 1)[0];
+                  const pulled = stateManager.pullQueuedAt(idx);
                   if (!pulled) return;
-                  draft = { text: pulled.text, cursor: pulled.text.length };
-                  attachedFiles = [...pulled.files];
-                  attachedDirs = [...pulled.dirs];
-                  attachedImages = [...pulled.images];
+                  const currentSt = stateManager.getActive();
+                  currentSt.draft = { text: pulled.text, cursor: pulled.text.length };
+                  currentSt.attachedFiles = [...pulled.files];
+                  currentSt.attachedDirs = [...pulled.dirs];
+                  currentSt.attachedImages = [...pulled.images];
                   render();
                   surface?.focus('dock.draft');
                 }}>Edit</button>
                 <button size="sm" variant="quiet" onClick={() => {
-                  queuedPrompts.splice(idx, 1);
+                  stateManager.dropQueuedAt(idx);
                   render();
                 }}>Drop</button>
               </row>
@@ -2258,7 +2223,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
           })}
         </col>}
         {hasAttachments && <row key="attachments" gap="xs" wrap>
-          {attachedImages.map(image => <attachment key={`img:${image.path}`} variant="tile"
+          {st.attachedImages.map(image => <attachment key={`img:${image.path}`} variant="tile"
             name={basename(image.path)} mime={image.mimeType} size={image.size} path={image.path}
             blob={blobForImage(`att:${image.path}`, image.data, image.mimeType)}
             actions={[{ act: 'preview', icon: 'expand', title: 'Center preview' }]}
@@ -2270,7 +2235,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
               },
               remove: () => removeImageAttachment(image.path),
             }} />)}
-          {attachedDirs.map(dir => {
+          {st.attachedDirs.map(dir => {
             const clean = dir.replace(/\/+$/, '');
             const isIgnored = ignoredPathsSet.has(dir);
             return <attachment key={`dir:${dir}`} variant="chip" ext="DIR" mime="inode/directory"
@@ -2287,7 +2252,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
                 remove: () => removeDirAttachment(dir),
               }} />;
           })}
-          {attachedFiles.map(file => {
+          {st.attachedFiles.map(file => {
             const isIgnored = ignoredPathsSet.has(file);
             return <attachment key={file} variant="chip" name={basename(file)}
               path={file} meta={isIgnored ? `${file} · gitignored` : file}
@@ -2303,14 +2268,66 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
               }} />;
           })}
         </row>}
-        <editor key="draft" aria="Message to Antigravity" text={draft.text} cursor={draft.cursor} anchor={draft.anchor}
+        <editor key="draft" aria="Message to Antigravity" text={st.draft.text} cursor={st.draft.cursor} anchor={st.draft.anchor}
           placeholder={disconnected ? 'Use /account to sign in, or draft a message' : busy ? 'Draft your next message' : 'Message Antigravity, / for commands, @ for files & dirs'}
           readonly={authBusy} maxLines={layout.composerMaxLines} variant="field"
           buttons={editorButtons}
           onFocus={() => surface?.focus('dock.draft')}
-          onEdit={event => { if (!authBusy) { const next = editDraft(draft, event); recordUndo(draft, next); draft = next; autocompleteDismissed = false; commandSelection = 0; fileSelection = 0; scheduleRender(); } }}
+          onEdit={event => {
+            if (!authBusy) {
+              const currentSt = stateManager.getActive();
+              const next = editDraft(currentSt.draft, event);
+              recordUndo(currentSt.draft, next);
+              currentSt.draft = next;
+              autocompleteDismissed = false;
+              commandSelection = 0;
+              fileSelection = 0;
+              scheduleRender();
+            }
+          }}
           onUndo={() => { if (!authBusy) applyUndo(); }}
           onAction={{ send, stop }} />
+        {showComposerBar && <row key="composer-bar" justify="between" align="center" gap="sm" wrap>
+          <row gap="sm" align="center" wrap>
+            {currentModel && <button size="sm" variant="quiet" icon="model"
+              disabled={(!agent || disconnected || !!permission) && 'Wait until connected'}
+              title="Change model (/model)"
+              onClick={() => openPanel({ kind: 'config', id: currentModel.id })}>
+              {configLabel(currentModel)}
+            </button>}
+            {currentThinking && <row gap="xs" align="center">
+              <effort level={thinkingToEffort(String(currentThinking.currentValue))} />
+              <button size="sm" variant="quiet"
+                disabled={(!agent || disconnected || !!permission) && 'Wait until connected'}
+                title="Change thinking effort"
+                onClick={() => openPanel({ kind: 'config', id: currentThinking.id })}>
+                {configLabel(currentThinking)}
+              </button>
+            </row>}
+            {currentMode && <button size="sm" variant="quiet" icon="shield"
+              disabled={(!agent || !!permission) && 'Wait until connected'}
+              title="Session mode (/permissions)"
+              onClick={() => openPanel({ kind: 'config', id: currentMode.id })}>
+              {configLabel(currentMode)}
+            </button>}
+          </row>
+          <row gap="sm" align="center" wrap>
+            {metadata.usage?.cost && <text><span s="muted">{`${metadata.usage.cost.amount.toFixed(4)} ${metadata.usage.cost.currency}`}</span></text>}
+            {contextUsage && <meter key="context" style="bar" size="sm"
+              value={contextUsage.percent / 100}
+              thresholds={{ warn: 0.75, bad: 0.9 }}
+              label={contextUsage.summary}
+              title={`Session context: ${metadata.usage?.used.toLocaleString()} / ${metadata.usage?.size.toLocaleString()} tokens (click for /usage)`}
+              hovercard={hoverKv([
+                { k: 'Context used', v: `${metadata.usage?.used.toLocaleString()} tokens` },
+                { k: 'Window', v: `${metadata.usage?.size.toLocaleString()} tokens` },
+                ...(metadata.usage?.cost ? [{ k: 'Session cost', v: `${metadata.usage.cost.amount} ${metadata.usage.cost.currency}` }] : []),
+                ...(metadata.tier ? [{ k: 'Subscription tier', v: metadata.tier.name }] : []),
+                { k: 'Action', v: 'Click to open /usage' },
+              ])}
+              onClick={() => { if (agent && !disconnected && !permission) openPanel({ kind: 'report', report: 'usage' }); }} />}
+          </row>
+        </row>}
         <status key="bar">
           <seg key="state" priority={10}
             tone={busy || authBusy || agentConnecting || !!sessionOperation ? 'accent' : disconnected || phase.includes('failed') ? 'error' : agent ? 'success' : 'muted'}
@@ -2320,10 +2337,10 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
               if (disconnected && !agentConnecting && !authBusy) reconnectAgent();
               else if (busy && !permission && !authBusy) openPanel({ kind: 'tasks' });
             }} />
-          {historyIndex !== undefined && <seg key="history" priority={6} icon="history" tone="accent"
-            text={`History ${historyIndex + 1}/${promptHistory.length}`}
+          {st.historyIndex !== undefined && <seg key="history" priority={6} icon="history" tone="accent"
+            text={`History ${st.historyIndex + 1}/${promptHistory.length}`}
             title="Up/Down cycles sent prompts; type to keep editing" />}
-          <seg key="model" priority={9} icon="model"
+          {!showComposerBar && <seg key="model" priority={9} icon="model"
             tone={(!agent || disconnected || !!permission) ? 'muted' : undefined}
             text={currentModel ? configLabel(currentModel) : 'Model'}
             hovercard={hoverKv([
@@ -2335,8 +2352,8 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
               if (agent && !disconnected && !permission) {
                 openPanel(currentModel ? { kind: 'config', id: currentModel.id } : { kind: 'settings' });
               }
-            }} />
-          {currentThinking && <seg key="thinking" priority={7} icon="thinking"
+            }} />}
+          {!showComposerBar && currentThinking && <seg key="thinking" priority={7} icon="thinking"
             tone={(!agent || disconnected || !!permission) ? 'muted' : undefined}
             text={configLabel(currentThinking)}
             hovercard={hoverKv([
@@ -2346,7 +2363,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
             onClick={() => {
               if (agent && !disconnected && !permission) openPanel({ kind: 'config', id: currentThinking.id });
             }} />}
-          <seg key="mode" priority={6} icon="shield"
+          {!showComposerBar && <seg key="mode" priority={6} icon="shield"
             tone={(!agent || !!permission) ? 'muted' : undefined}
             text={currentMode ? configLabel(currentMode) : 'Permissions'}
             hovercard={hoverKv([
@@ -2356,13 +2373,13 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
             ])}
             onClick={() => {
               if (agent && !permission) openPanel({ kind: 'permissions' });
-            }} />
+            }} />}
           <seg key="sessions" priority={4} icon="history"
             tone={(!agent || disconnected || !!permission || busy || changingConfig || !!sessionOperation) ? 'muted' : undefined}
-            text={activeSessionId ? sessionTitle(activeSessionId) : 'Sessions'}
+            text={sid ? sessionTitle(sid) : 'Sessions'}
             hovercard={hoverKv([
-              { k: 'Conversation', v: activeSessionId ? sessionTitle(activeSessionId) : 'No active session' },
-              ...(activeSessionId ? [{ k: 'Session ID', v: activeSessionId }] : []),
+              { k: 'Conversation', v: sid ? sessionTitle(sid) : 'No active session' },
+              ...(sid ? [{ k: 'Session ID', v: sid }] : []),
               { k: 'Shortcut', v: 'Click or type /sessions' },
             ])}
             onClick={() => {
@@ -2400,7 +2417,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
             title="Usage & Quota (/usage)"
             onClick={() => { if (agent && !disconnected && !permission) openPanel({ kind: 'report', report: 'usage' }); }} />}
           <seg key="account" side="right" priority={8} icon="user"
-            text={metadata.tier && viewportCols >= 96 ? metadata.tier.name : 'Account'}
+            text={metadata.tier && colsNow >= 96 ? metadata.tier.name : 'Account'}
             hovercard={hoverKv([
               { k: 'ACP', v: disconnected ? 'Disconnected' : agent ? 'Connected' : 'Connecting' },
               { k: 'Subscription tier', v: metadata.tier ? metadata.tier.name : 'Not reported' },
@@ -2428,7 +2445,8 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         {toastMessage && <toast key="toast" text={toastMessage.text} sub={toastMessage.sub} />}
         {renderPanel()}
       </col>,
-    });
+    };
+    rc.commitFrame(view, renderedEntries, replayCoordinator.isReplaying);
   }
 
   process.on('SIGTERM', terminate);
@@ -2444,9 +2462,15 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     if (!session) return quitting ? outcome : { kind: 'unavailable' };
     if (signal.aborted || quitting) return outcome;
     surface = session.open({ mode: 'screen', title: 'Antigravity · agy-tern', font: 'sans' });
-    prefsReady = prefsStore.load().then(loaded => {
-      if (!quitting) { userPrefs = loaded; render(); }
-    }).catch(() => {});
+    renderController = new TernRenderController({
+      session,
+      surface,
+      title: 'Antigravity · agy-tern',
+      maxFps: userPrefs.maxFps,
+      motion: userPrefs.motion,
+      initialCols: process.stdout.columns || 120,
+      initialRows: process.stdout.rows || 40,
+    });
     void promptHistoryStore.load().then(saved => {
       if (quitting || !saved.length) return;
       const merged = [...saved];
@@ -2480,27 +2504,20 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
           if (!quitting) { metadata = next; commandSelection = 0; render(); }
         },
         sessionChanged(id) {
-          if (activeSessionId) {
+          const prevId = stateManager.activeSessionId;
+          if (prevId && prevId !== id) {
             void persistActiveTranscript();
-            conversations.set(activeSessionId, conversation);
-            if (conversations.size > 12) {
-              const oldest = conversations.keys().next().value;
-              if (oldest !== undefined && oldest !== id) conversations.delete(oldest);
-            }
-            drafts.set(activeSessionId, draft);
-            conversation = new Conversation();
-            draft = drafts.get(id) ?? { text: '', cursor: 0 };
-            focusedTurnIndex = undefined;
-            thoughtFoldOverrides.clear();
-            toolFoldOverrides.clear();
-            previewedMedia.clear();
+          }
+          const switched = stateManager.switchSession(id, {
+            freshConversation: prevId !== id && replayCoordinator.isReplaying && replayCoordinator.currentPhase !== 'idle',
+          });
+          if (prevId && prevId !== id && switched) {
             gitDiffCache.clear();
-            historyVisibleCount = DEFAULT_HISTORY_VISIBLE;
             cachedDiffCountConversation = undefined;
             cachedDiffsConversation = undefined;
             cachedSessionDiffs = [];
+            renderController?.resetSessionTracking();
           }
-          activeSessionId = id;
           clearPermissions();
           render();
         },
@@ -2513,24 +2530,26 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
             if (update.updatedAt !== undefined) info.updatedAt = update.updatedAt;
             sessionInfo.set(notification.sessionId, info);
           }
+          const route = replayCoordinator.onUpdate(notification.sessionId, update);
+          if (route === 'shadow') {
+            return;
+          }
+          const conv = stateManager.getConversation();
           if (!busy || update.sessionUpdate !== 'user_message_chunk') {
-            conversation.update(update, Date.now(), busy ? clockTime() : undefined);
+            conv.update(update, Date.now(), busy ? clockTime() : undefined);
           }
-          if (replayingHistory && update.sessionUpdate !== 'session_info_update' &&
-            update.sessionUpdate !== 'available_commands_update' && update.sessionUpdate !== 'usage_update') {
-            if (replayPlaceholderId) {
-              conversation.removeNotice(replayPlaceholderId);
-              replayPlaceholderId = undefined;
-            }
-            markReplayActivity();
+          if (route === 'replaying' && replayPlaceholderId) {
+            conv.removeNotice(replayPlaceholderId);
+            replayPlaceholderId = undefined;
           }
-          if (busy && !replayingHistory && userPrefs.autoPreviewMedia && !panel && !permissions.length) {
+          const st = stateManager.getActive();
+          if (busy && !replayCoordinator.isReplaying && userPrefs.autoPreviewMedia && !panel && !permissions.length) {
             if (update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update') {
-              const call = conversation.getTool(update.toolCallId)?.call;
+              const call = conv.getTool(update.toolCallId)?.call;
               if (call) {
-                const imgPath = extractToolImagePaths(call, options.cwd).find(p => cachedPathExists(p) && !previewedMedia.has(`path:${p}`));
+                const imgPath = extractToolImagePaths(call, options.cwd).find(p => pathExists(p) && !st.previewedMedia.has(`path:${p}`));
                 if (imgPath) {
-                  previewedMedia.add(`path:${imgPath}`);
+                  st.previewedMedia.add(`path:${imgPath}`);
                   const label = formatPathLabel(imgPath, options.cwd);
                   openInspect(basename(label), { type: 'image-path', path: imgPath }, label);
                   return;
@@ -2538,8 +2557,8 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
                 const inlineImg = extractToolInlineImages(call)[0];
                 if (inlineImg) {
                   const imgKey = `tool-inline:${call.toolCallId}:${inlineImg.data.slice(0, 48)}`;
-                  if (!previewedMedia.has(imgKey)) {
-                    previewedMedia.add(imgKey);
+                  if (!st.previewedMedia.has(imgKey)) {
+                    st.previewedMedia.add(imgKey);
                     const blob = blobForImage(imgKey, inlineImg.data, inlineImg.mimeType);
                     if (blob) {
                       openInspect(call.title ?? 'Live image preview', { type: 'image-blob', blob, mimeType: inlineImg.mimeType }, inlineImg.mimeType);
@@ -2550,8 +2569,8 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
               }
             } else if (update.sessionUpdate === 'agent_message_chunk' && update.content.type === 'image') {
               const imgKey = `msg-inline:${notification.sessionId}:${update.content.data.slice(0, 48)}`;
-              if (!previewedMedia.has(imgKey)) {
-                previewedMedia.add(imgKey);
+              if (!st.previewedMedia.has(imgKey)) {
+                st.previewedMedia.add(imgKey);
                 const blob = blobForImage(imgKey, update.content.data, update.content.mimeType);
                 if (blob) {
                   openInspect('Live image preview', { type: 'image-blob', blob, mimeType: update.content.mimeType }, update.content.mimeType);
@@ -2565,11 +2584,12 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         permission(prompt) {
           if (quitting || authBusy || cancelling || disconnected) { prompt.answer(null); return; }
           closePanel();
-          conversation.tool(prompt.request.toolCall);
+          const conv = stateManager.getConversation();
+          conv.tool(prompt.request.toolCall);
           if (!prompt.request.options.some(option => option.kind === 'allow_once')) {
             const deny = prompt.request.options.find(option => option.kind === 'reject_once');
-            conversation.tool(prompt.request.toolCall).approved = 'denied';
-            conversation.notice(`${prompt.request.toolCall.title ?? prompt.request.toolCall.toolCallId}: no one-time allowance offered; request denied.`);
+            conv.tool(prompt.request.toolCall).approved = 'denied';
+            conv.notice(`${prompt.request.toolCall.title ?? prompt.request.toolCall.toolCallId}: no one-time allowance offered; request denied.`);
             prompt.answer(deny?.optionId ?? null);
           } else {
             permissions.push(prompt);
@@ -2580,7 +2600,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
           render();
         },
         diagnostic(text) {
-          if (!quitting) { conversation.notice(text); render(); }
+          if (!quitting) { stateManager.getConversation().notice(text); render(); }
         },
         disconnected(message) {
           if (quitting) return;
@@ -2589,19 +2609,19 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
           disconnected = true;
           phase = 'Disconnected';
           clearPermissions();
-          conversation.notice(message, true);
+          stateManager.getConversation().notice(message, true);
           process.exitCode = 1;
           render();
         },
       }).then(async connected => {
         if (quitting) { await connected.close(); return; }
-        await prefsReady;
-        if (quitting) { await connected.close(); return; }
         agent = connected;
         agentConnecting = false;
         process.exitCode = undefined;
         metadata = connected.metadata;
-        activeSessionId = connected.sessionId;
+        if (stateManager.activeSessionId !== connected.sessionId) {
+          stateManager.switchSession(connected.sessionId);
+        }
         const targetId = resumeId ?? launch?.conversationId;
         const loadingExisting = Boolean((targetId && targetId !== connected.sessionId) || (!resumeId && launch?.continueLast));
         if (!resumeId && !loadingExisting) {
@@ -2611,19 +2631,19 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         if (targetId && targetId !== connected.sessionId) {
           try {
             if (connected.capabilities.loadSession) {
-              beginHistoryReplay('load');
+              const token = beginHistoryReplay(targetId, 'load');
               await connected.loadSession(targetId);
-              finishHistoryReplay();
-              await hydrateSessionHistoryFallback(targetId, undefined, 'load');
+              settleHistoryReplay(token, targetId, undefined, 'load');
             } else if (connected.capabilities.resumeSession && connected.resumeSession) {
+              const token = beginHistoryReplay(targetId, 'resume');
               await connected.resumeSession(targetId);
-              await hydrateSessionHistoryFallback(targetId, undefined, 'resume');
+              settleHistoryReplay(token, targetId, undefined, 'resume');
             } else if (!resumeId) {
-              conversation.notice(`Cannot open --conversation ${targetId}: session load/resume not advertised.`, true);
+              stateManager.getConversation().notice(`Cannot open --conversation ${targetId}: session load/resume not advertised.`, true);
             }
           } catch (err) {
             clearReplayState();
-            conversation.notice(`Failed to open conversation ${targetId}: ${err instanceof Error ? err.message : String(err)}`, true);
+            stateManager.getConversation().notice(`Failed to open conversation ${targetId}: ${err instanceof Error ? err.message : String(err)}`, true);
           }
           void startConfigSync(connected, !resumeId, true);
         } else if (!resumeId && launch?.continueLast && connected.capabilities.listSessions) {
@@ -2633,27 +2653,27 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
             const latest = sorted[0];
             if (latest && latest.sessionId !== connected.sessionId) {
               if (connected.capabilities.loadSession) {
-                beginHistoryReplay('load');
+                const token = beginHistoryReplay(latest.sessionId, 'load');
                 await connected.loadSession(latest.sessionId);
-                finishHistoryReplay();
-                await hydrateSessionHistoryFallback(latest.sessionId, undefined, 'load');
+                settleHistoryReplay(token, latest.sessionId, undefined, 'load');
               } else if (connected.capabilities.resumeSession && connected.resumeSession) {
+                const token = beginHistoryReplay(latest.sessionId, 'resume');
                 await connected.resumeSession(latest.sessionId);
-                await hydrateSessionHistoryFallback(latest.sessionId, undefined, 'resume');
+                settleHistoryReplay(token, latest.sessionId, undefined, 'resume');
               }
               void startConfigSync(connected, true, true);
             } else if (!latest) {
-              conversation.notice('No previous conversation found in this workspace for --continue; started a new session.');
+              stateManager.getConversation().notice('No previous conversation found in this workspace for --continue; started a new session.');
             }
           } catch (err) {
             clearReplayState();
-            conversation.notice(`Failed to continue latest conversation: ${err instanceof Error ? err.message : String(err)}`, true);
+            stateManager.getConversation().notice(`Failed to continue latest conversation: ${err instanceof Error ? err.message : String(err)}`, true);
           }
         }
         if (quitting) return;
-        phase = replayingHistory ? 'Syncing history' : 'Ready';
+        phase = replayCoordinator.isReplaying ? 'Syncing history' : 'Ready';
         render();
-        if (!replayingHistory) surface?.scroll('main.conversation', 'end');
+        if (!replayCoordinator.isReplaying) surface?.scroll('main.conversation', 'end');
         if (!resumeId && connected.capabilities.listSessions && !listedSessions.length) {
           loadSessions(false, true);
         }
@@ -2666,7 +2686,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         disconnected = true;
         phase = 'Connection failed';
         clearPermissions();
-        conversation.notice(error instanceof Error ? error.message : String(error), true);
+        stateManager.getConversation().notice(error instanceof Error ? error.message : String(error), true);
         process.exitCode = 1;
         render();
       });
@@ -2678,14 +2698,11 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       const input = await Promise.race([session.next(), stopped.promise]);
       if (!input || surface.closed) break;
       if (input.type === 'event') {
-        if (input.event.ev === 'resize') {
-          viewportCols = input.event.cols || process.stdout.columns || viewportCols;
-          viewportRows = process.stdout.rows || viewportRows;
+        if (input.event.ev === 'error') {
+          stateManager.getConversation().notice(`Tern: ${input.event.msg}`, true);
           render();
-          scheduleRender();
-        } else if (input.event.ev === 'error') {
-          conversation.notice(`Tern: ${input.event.msg}`, true);
-          render();
+        } else {
+          renderController.handleSessionEvent(input.event, render, process.stdout.rows || undefined);
         }
         continue;
       }
@@ -2700,6 +2717,63 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       if (panel && !permissions.length) {
         const current = panel;
         if (current.kind === 'inspect') {
+          const item = current.item;
+          if (key.name === 'up') {
+            surface.scroll('layer.panel.inspect-scroll', 'line-up');
+          } else if (key.name === 'down') {
+            surface.scroll('layer.panel.inspect-scroll', 'line-down');
+          } else if (key.name === 'page_up') {
+            surface.scroll('layer.panel.inspect-scroll', 'page-up');
+          } else if (key.name === 'page_down') {
+            surface.scroll('layer.panel.inspect-scroll', 'page-down');
+          } else if (key.name === 'home') {
+            surface.scroll('layer.panel.inspect-scroll', 'start');
+          } else if (key.name === 'end') {
+            surface.scroll('layer.panel.inspect-scroll', 'end');
+          } else if (!key.ctrl && !key.meta && !key.alt && key.name === 'c') {
+            const copyText = item.type === 'file' ? item.content
+              : item.type === 'diff' ? item.hunks.flatMap(h => h.lines).join('\n')
+              : item.type === 'dir' ? item.preview.entries.map(e => `${e.kind === 'dir' ? `${e.name}/` : e.name}${e.ignored ? ' [gitignored]' : ''}`).join('\n')
+              : undefined;
+            if (copyText !== undefined) {
+              void copyToClipboard(copyText).then(copied => {
+                if (!quitting) showToast(copied ? 'Copied to clipboard' : 'Clipboard utility unavailable', copied ? undefined : 'Install wl-copy or xclip to copy');
+              });
+            }
+          } else if (!key.ctrl && !key.meta && !key.alt && key.name === 'l' && item.type === 'diff') {
+            const next: DiffMode = userPrefs.diffMode === 'auto' ? 'unified' : userPrefs.diffMode === 'unified' ? 'split' : 'auto';
+            updatePrefs({ diffMode: next });
+          } else if (!key.ctrl && !key.meta && !key.alt && key.name === 'a') {
+            const attachTarget = item.type === 'file' || item.type === 'diff' ? item.path : item.type === 'dir' ? item.preview.path : undefined;
+            if (attachTarget && pathExists(resolve(options.cwd, attachTarget.replace(/\/+$/, '')))) {
+              closePanel();
+              attachFile(attachTarget);
+            }
+          } else if (!key.ctrl && !key.meta && !key.alt && key.name === 's' && (item.type === 'file' || item.type === 'diff')) {
+            if (pathExists(resolve(options.cwd, item.path.replace(/\/+$/, '')))) {
+              openSplit(item.path);
+            }
+          } else if (!key.ctrl && !key.meta && !key.alt && (key.name === 'u' || key.name === 'backspace') && item.type === 'dir') {
+            const cleanDir = item.preview.path.replace(/\/+$/, '');
+            const parentDir = cleanDir.includes('/')
+              ? `${cleanDir.slice(0, cleanDir.lastIndexOf('/'))}/`
+              : cleanDir && cleanDir !== '.'
+                ? '.'
+                : undefined;
+            if (parentDir) {
+              void listDirectoryEntriesPreview(options.cwd, parentDir).then(pv => {
+                if (!quitting) openInspect(pv.path, { type: 'dir', preview: pv }, pv.path);
+              }).catch(() => {});
+            }
+          }
+          continue;
+        }
+        if ((current.kind === 'report' || current.kind === 'account' || current.kind === 'account-switch' || current.kind === 'permissions') &&
+          (key.name === 'page_up' || key.name === 'page_down' || key.name === 'home' || key.name === 'end')) {
+          surface.scroll('layer.panel.overlay-scroll',
+            key.name === 'page_up' ? 'page-up'
+              : key.name === 'page_down' ? 'page-down'
+              : key.name === 'home' ? 'start' : 'end');
           continue;
         }
         if (current.kind === 'settings') {
@@ -2758,13 +2832,14 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
               const tpl = matches.find(t => t.name === chosenId);
               if (!tpl) return;
               closePanel();
-              draft = { text: tpl.text, cursor: tpl.text.length };
+              stateManager.getActive().draft = { text: tpl.text, cursor: tpl.text.length };
               render();
               surface?.focus('dock.draft');
             };
           } else if (current.kind === 'find') {
             tabIds = ['all', 'message', 'tool', 'thought'];
-            const matches = filterFindMatches(searchTranscript(conversation.entries, options.cwd, panelDraft.text), pickerTab);
+            const activeConv = stateManager.getConversation();
+            const matches = filterFindMatches(searchTranscriptCached(activeConv.entries, activeConv.revision, options.cwd, panelDraft.text), pickerTab);
             visibleIds = matches.map(m => m.id);
             activate = chosenId => {
               const match = matches.find(m => m.id === chosenId);
@@ -2772,7 +2847,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
             };
           } else if (current.kind === 'tasks') {
             const needle = panelDraft.text.trim().toLowerCase();
-            const allTools = conversation.entries
+            const allTools = stateManager.getConversation().entries
               .filter((entry): entry is ToolStep => entry.type === 'tool')
               .slice()
               .reverse()
@@ -2806,13 +2881,14 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
             };
           } else if (current.kind === 'sessions') {
             const rows = new Map(listedSessions.map(row => [row.sessionId, row]));
-            if (activeSessionId) rows.set(activeSessionId, sessionInfo.get(activeSessionId) ?? { sessionId: activeSessionId, cwd: options.cwd });
+            const sid = stateManager.activeSessionId;
+            if (sid) rows.set(sid, sessionInfo.get(sid) ?? { sessionId: sid, cwd: options.cwd });
             tabIds = ['all', 'named'];
-            visibleIds = filterSessionRows([...rows.values()], localNames, activeSessionId, sessionTitle, pickerTab, panelDraft.text)
+            visibleIds = filterSessionRows([...rows.values()], localNames, sid, sessionTitle, pickerTab, panelDraft.text)
               .map(row => row.sessionId);
             activate = chosenId => {
               if (!changingConfig && !sessionOperation && !busy && !disconnected &&
-                (chosenId === activeSessionId || agent?.capabilities.loadSession)) {
+                (chosenId === sid || agent?.capabilities.loadSession)) {
                 openConversation(chosenId);
               }
             };
@@ -2929,11 +3005,12 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         }
       }
       const wrapWidth = editorWrapWidth();
+      const activeSt = stateManager.getActive();
       if (!key.ctrl && !key.alt && !key.meta && !key.shift && (key.name === 'up' || key.name === 'down')) {
         const dir = key.name === 'up' ? -1 : 1;
         const canStepHistory = dir === -1
-          ? (draft.text === '' || (historyIndex !== undefined && isCursorOnFirstRow(draft.text, draft.cursor, wrapWidth)))
-          : (historyIndex !== undefined && isCursorOnLastRow(draft.text, draft.cursor, wrapWidth));
+          ? (activeSt.draft.text === '' || (activeSt.historyIndex !== undefined && isCursorOnFirstRow(activeSt.draft.text, activeSt.draft.cursor, wrapWidth)))
+          : (activeSt.historyIndex !== undefined && isCursorOnLastRow(activeSt.draft.text, activeSt.draft.cursor, wrapWidth));
         if (canStepHistory && stepPromptHistory(dir)) {
           autocompleteDismissed = true;
           commandSelection = 0;
@@ -2942,9 +3019,9 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
           continue;
         }
       }
-      const result = draftKey(draft, key, { wrapWidth });
-      recordUndo(draft, result.draft);
-      draft = result.draft;
+      const result = draftKey(activeSt.draft, key, { wrapWidth });
+      recordUndo(activeSt.draft, result.draft);
+      activeSt.draft = result.draft;
       autocompleteDismissed = false;
       commandSelection = 0;
       fileSelection = 0;
@@ -2958,7 +3035,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     busy = false;
     phase = 'Frontend failed';
     clearPermissions();
-    conversation.notice(error instanceof Error ? error.message : String(error), true);
+    stateManager.getConversation().notice(error instanceof Error ? error.message : String(error), true);
     render();
     while (!quitting && !session.closed && surface && !surface.closed) {
       const input = await Promise.race([session.next(), stopped.promise]);
@@ -2988,7 +3065,9 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         process.stdin.off('error', inputError);
         signal.removeEventListener('abort', quit);
         clearTimeout(toastTimer);
-        syncLiveTick(false);
+        replayCoordinator.dispose();
+        renderController?.dispose();
+        pathPresenceCache.clear();
       }
     }
   }

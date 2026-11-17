@@ -2,7 +2,7 @@
 import { basename, resolve } from 'node:path';
 import type { DiffHunk, EditEvent, JSX, PickerGroup, PickerItem, PrefsRow } from '@stencil-hq/tern';
 import type { AuthMethodTerminal, SessionConfigOption, SessionInfo } from '@agentclientprotocol/sdk';
-import type { AgentAuthentication, AgentMetadata, AgentOptions, AgentSession } from './contracts';
+import { terminalLoginProblem, type AgentAuthentication, type AgentMetadata, type AgentOptions, type AgentSession } from './contracts';
 import type { ToolStep, TranscriptEntry } from './model';
 import type { Draft } from './draft';
 import { configLabel, configValues, commandCategory, filterCommands, type Command } from './commands';
@@ -11,13 +11,13 @@ import type { OfficialReport } from './reports';
 import { parseQuotaReport } from './reports';
 import type { SessionPreview } from './history';
 import type { PromptTemplate } from './templates';
-import { terminalLoginProblem } from './auth';
 import {
   DEFAULT_MODEL_ID,
   DEFAULT_PREFS,
   DEFAULT_THINKING_ID,
   type ComposerLines,
   type DiffMode,
+  type MotionPref,
   type ToolDisplay,
   type TranscriptDensity,
   type UserPrefs,
@@ -30,6 +30,7 @@ import {
   formatContextUsage,
   formatPathLabel,
   searchTranscript,
+  searchTranscriptCached,
   summarizeQuotaRows,
   summarizeToolCall,
   type ResponsiveLayout,
@@ -116,6 +117,7 @@ export interface PanelRenderContext {
   gitChanges: readonly GitStatusEntry[];
   gitDiffCache: ReadonlyMap<string, { status: 'loading' | 'ready'; hunks: DiffHunk[]; error?: string }>;
   entries: readonly TranscriptEntry[];
+  entriesRevision?: number;
   draftText: string;
   panelDraft: Draft;
   panelSelection: number;
@@ -131,6 +133,7 @@ export interface PanelRenderContext {
   loginMethod: AuthMethodTerminal | undefined;
   modeOption: SessionConfigOption | undefined;
   sessionTitle(id: string): string;
+  pathExists?(targetPath: string): boolean;
   blobForImage(key: string, data: string, mimeType: string): string | undefined;
   onRender(): void;
   onFocus(target: string | null): void;
@@ -319,6 +322,41 @@ function renderPrefsPanel(ctx: PanelRenderContext): JSX.Element {
             },
           },
           {
+            id: 'maxFps',
+            label: 'Streaming frame cap',
+            hint: 'Lower FPS saves CPU and battery on mid-low laptops during long agent streams',
+            changed: userPrefs.maxFps !== DEFAULT_PREFS.maxFps,
+            defaultLabel: `${DEFAULT_PREFS.maxFps} FPS`,
+            control: {
+              k: 'choice',
+              value: String(userPrefs.maxFps),
+              style: 'segmented',
+              options: [
+                { value: '15', label: '15 FPS' },
+                { value: '25', label: '25 FPS' },
+                { value: '40', label: '40 FPS' },
+                { value: '60', label: '60 FPS' },
+              ],
+            },
+          },
+          {
+            id: 'motion',
+            label: 'Animation & shimmer motion',
+            hint: 'Auto follows terminal reduced-motion signals; Reduced freezes shimmer/spinner cadence',
+            changed: userPrefs.motion !== DEFAULT_PREFS.motion,
+            defaultLabel: DEFAULT_PREFS.motion,
+            control: {
+              k: 'choice',
+              value: userPrefs.motion,
+              style: 'segmented',
+              options: [
+                { value: 'auto', label: 'Auto' },
+                { value: 'full', label: 'Full' },
+                { value: 'reduced', label: 'Reduced' },
+              ],
+            },
+          },
+          {
             id: 'showKeyLegend',
             label: 'Show shortcut legend below dock',
             hint: 'Approval shortcuts still appear automatically while a permission prompt is active',
@@ -415,6 +453,7 @@ function renderPrefsPanel(ctx: PanelRenderContext): JSX.Element {
           { id: 'k-paste-img', label: 'Attach screenshot from system clipboard', control: { k: 'keys', keys: [['alt', 'v']] } },
           { id: 'k-stop', label: 'Stop turn / Close modal', control: { k: 'keys', keys: [['esc']] } },
           { id: 'k-scroll', label: 'Scroll conversation', control: { k: 'keys', keys: [['page_up'], ['page_down']] } },
+          { id: 'k-inspect', label: 'Inspect modal scroll & actions', control: { k: 'keys', keys: [['page_up'], ['page_down'], ['c'], ['s'], ['a']] } },
           { id: 'k-allow', label: 'Allow / Deny tool once', control: { k: 'keys', keys: [['ctrl', 'y'], ['ctrl', 'n']] } },
           { id: 'k-quit', label: 'Quit frontend', control: { k: 'keys', keys: [['ctrl', 'q']] } },
         ],
@@ -457,6 +496,11 @@ function renderPrefsPanel(ctx: PanelRenderContext): JSX.Element {
       } else if (key === 'composerLines') {
         const n = Number(event.value);
         if (n === 4 || n === 6 || n === 10) ctx.onUpdatePrefs({ composerLines: n as ComposerLines });
+      } else if (key === 'maxFps') {
+        const fps = Number(event.value);
+        if (Number.isFinite(fps) && fps >= 5 && fps <= 60) ctx.onUpdatePrefs({ maxFps: fps });
+      } else if (key === 'motion' && (event.value === 'auto' || event.value === 'full' || event.value === 'reduced')) {
+        ctx.onUpdatePrefs({ motion: event.value as MotionPref });
       } else if (key.startsWith('cfg:')) {
         const configId = key.slice(4);
         const option = metadata.configOptions.find(candidate => candidate.id === configId);
@@ -555,7 +599,8 @@ function renderSessionsPicker(ctx: PanelRenderContext): JSX.Element {
   const highlighted = filtered.find(row => row.sessionId === selectedId);
   const highlightedPreview = highlighted ? ctx.sessionPreviews.get(highlighted.sessionId) : undefined;
   if (highlighted && highlightedPreview === undefined) {
-    ctx.onRequestSessionPreview(highlighted.sessionId);
+    const idToLoad = highlighted.sessionId;
+    queueMicrotask(() => ctx.onRequestSessionPreview(idToLoad));
   }
   const items: PickerItem[] = filtered.map(row => {
     const badges = [
@@ -658,7 +703,8 @@ function renderChangesPicker(ctx: PanelRenderContext): JSX.Element {
     ? [...ctx.sessionDiffs].reverse().find(item => item.path === highlightedGit.path)
     : undefined;
   if (highlightedGit && !highlightedGitDiff) {
-    ctx.onLoadGitDiffPreview(highlightedGit);
+    const entryToLoad = highlightedGit;
+    queueMicrotask(() => ctx.onLoadGitDiffPreview(entryToLoad));
   }
   const cachedGitDiff = highlightedGit ? ctx.gitDiffCache.get(highlightedGit.path) : undefined;
   const highlightedPath = highlightedEdit?.path ?? highlightedGit?.path;
@@ -702,7 +748,7 @@ function renderChangesPicker(ctx: PanelRenderContext): JSX.Element {
       { id: 'refresh', label: 'Refresh git' },
       { id: 'inspect', label: 'Fullscreen', disabled: !highlightedPath ? (true as const) : undefined },
       { id: 'split', label: 'Tern split',
-        disabled: !highlightedPath || !cachedPathExists(resolve(ctx.options.cwd, highlightedPath)) ? (true as const) : undefined },
+        disabled: !highlightedPath || !(ctx.pathExists ?? cachedPathExists)(resolve(ctx.options.cwd, highlightedPath)) ? (true as const) : undefined },
       { id: 'close', label: 'Close', keys: ['esc'] },
       { id: 'attach', label: 'Attach to draft', primary: true, keys: ['enter'],
         disabled: !highlightedPath ? (true as const) : undefined },
@@ -761,7 +807,8 @@ function renderChangesPicker(ctx: PanelRenderContext): JSX.Element {
 }
 
 function renderFindPicker(ctx: PanelRenderContext): JSX.Element {
-  const matches = searchTranscript(ctx.entries, ctx.options.cwd, ctx.panelDraft.text);
+  const checkPathExists = ctx.pathExists ?? cachedPathExists;
+  const matches = searchTranscriptCached(ctx.entries, ctx.entriesRevision ?? ctx.entries.length, ctx.options.cwd, ctx.panelDraft.text);
   const tabs = [
     { id: 'all', label: 'All', count: matches.length },
     { id: 'message', label: 'Messages', count: matches.filter(m => m.kind === 'message').length },
@@ -780,7 +827,7 @@ function renderFindPicker(ctx: PanelRenderContext): JSX.Element {
     node: 'pv',
   }));
   const hlImgPath = highlighted?.entry.type === 'tool'
-    ? extractToolImagePaths(highlighted.entry.call, ctx.options.cwd).find(p => cachedPathExists(p))
+    ? extractToolImagePaths(highlighted.entry.call, ctx.options.cwd).find(checkPathExists)
     : undefined;
 
   return <picker key="picker" size={ctx.rLayout.panelSize} title="Find" icon="slash"
@@ -850,7 +897,7 @@ function renderInspectOverlay(ctx: PanelRenderContext, p: Extract<Panel, { kind:
     end={<button keys={['esc']} variant="quiet" onClick={ctx.onClosePanel}>Close</button>}
     foot={<row gap="xs" justify="between" align="center" wrap>
       <text><span s="muted">{item.type === 'file' && item.truncated ? 'Preview truncated at 64 KB · '
-        : isDir && item.preview.truncated ? `Showing ${item.preview.entries.length} of ${item.preview.totalCount} entries · ` : ''}Esc closes without cancelling</span></text>
+        : isDir && item.preview.truncated ? `Showing ${item.preview.entries.length} of ${item.preview.totalCount} entries · ` : ''}Up/Down/PgUp/PgDn scroll · c copy · s split · a attach · Esc close</span></text>
       <row gap="xs">
         {parentInspectDir && <button size="sm" icon="back" onClick={() => ctx.onInspectDirPath(parentInspectDir)}>Up</button>}
         {item.type === 'diff' && <button size="sm" onClick={() => {
@@ -858,7 +905,7 @@ function renderInspectOverlay(ctx: PanelRenderContext, p: Extract<Panel, { kind:
           ctx.onUpdatePrefs({ diffMode: next });
         }}>Layout: {ctx.userPrefs.diffMode}</button>}
         {copyText !== undefined && <button size="sm" icon="copy" onClick={() => ctx.onCopy(copyText)}>Copy</button>}
-        {attachablePath && !isMedia && cachedPathExists(resolve(ctx.options.cwd, attachablePath.replace(/\/+$/, ''))) && <>
+        {attachablePath && !isMedia && (ctx.pathExists ?? cachedPathExists)(resolve(ctx.options.cwd, attachablePath.replace(/\/+$/, ''))) && <>
           {!isDir && <button size="sm" icon="split" onClick={() => ctx.onOpenSplit(attachablePath)}>Tern split</button>}
           <button size="sm" variant="primary" onClick={() => {
             ctx.onClosePanel();
@@ -874,12 +921,12 @@ function renderInspectOverlay(ctx: PanelRenderContext, p: Extract<Panel, { kind:
       <image blob={item.blob} alt={item.name ?? item.mimeType} />
     </col>}
     {item.type === 'diff' && (item.hunks.length
-      ? <scroll max={{ h: bodyMaxH }}><diff mode={ctx.userPrefs.diffMode} path={item.path} hunks={item.hunks} /></scroll>
+      ? <scroll key="inspect-scroll" max={{ h: bodyMaxH }}><diff mode={ctx.userPrefs.diffMode} path={item.path} hunks={item.hunks} /></scroll>
       : <text><span s="muted">No diff hunks recorded.</span></text>)}
-    {item.type === 'file' && <scroll max={{ h: bodyMaxH }}>
+    {item.type === 'file' && <scroll key="inspect-scroll" max={{ h: bodyMaxH }}>
       <code numbers path={item.path}>{item.content}</code>
     </scroll>}
-    {isDir && <scroll max={{ h: bodyMaxH }}>
+    {isDir && <scroll key="inspect-scroll" max={{ h: bodyMaxH }}>
       <col gap="xs">
         <kv items={[
           { k: 'Directory', v: item.preview.path },
@@ -1310,7 +1357,7 @@ function renderTasksPicker(ctx: PanelRenderContext): JSX.Element {
     }}>
     {highlighted && highlightedSummary && <ToolBody call={highlighted.call} cwd={ctx.options.cwd} showRawInput={highlightedSummary.showRawInput}
       fullCommand={highlightedSummary.fullCommand} diffMode={ctx.userPrefs.diffMode}
-      getBlob={ctx.blobForImage} onInspect={ctx.onOpenInspect} onOpenSplit={ctx.onOpenSplit}
+      pathExists={ctx.pathExists} getBlob={ctx.blobForImage} onInspect={ctx.onOpenInspect} onOpenSplit={ctx.onOpenSplit}
       onCopy={ctx.onCopy} />}
   </picker>;
 }
@@ -1355,132 +1402,140 @@ export function renderActivePanel(ctx: PanelRenderContext): JSX.Element {
       currentPanel.kind === 'account' || currentPanel.kind === 'account-switch' ? 'user' : 'slash'}
     end={<button keys={['esc']} variant="quiet" disabled={ctx.authBusy} onClick={ctx.onClosePanel}>Close</button>}>
     {currentPanel.kind === 'report' ? <>
-      {currentPanel.report === 'usage' ? <col gap="md">
-        <tabs variant="segmented" active={ctx.usageTab}
-          items={[
-            { id: 'overview', label: 'Overview' },
-            { id: 'details', label: 'Details' },
-            { id: 'raw', label: 'Raw report' },
-          ]}
-          onChange={event => ctx.onSetUsageTab(String(event.value ?? 'overview'))} />
-        {ctx.reportLoading && <spinner label="Reading official /usage report" />}
-        {ctx.usageTab === 'overview' && <>
-          <stats items={[
-            {
-              label: 'Tightest quota',
-              value: quotaSummary ? quotaSummary.tightest.remaining : (ctx.reportLoading ? 'Loading' : 'Unavailable'),
-              sub: quotaSummary
-                ? `${quotaSummary.tightest.group} · ${quotaSummary.tightest.limit}${ctx.metadata.tier ? ` · ${ctx.metadata.tier.name}` : ''}`
-                : (ctx.metadata.tier ? `${ctx.metadata.tier.name} · Official CLI /usage` : 'From official CLI /usage'),
-              tone: quotaSummary
-                ? (quotaSummary.tightest.fraction <= 0.15 ? 'error' : quotaSummary.tightest.fraction <= 0.35 ? 'warning' : 'success')
-                : 'muted',
-            },
-            {
-              label: 'Model groups',
-              value: quotaSummary ? String(quotaSummary.groupCount) : '0',
-              sub: quotaSummary ? `${quotaSummary.rows.length} tracked limits` : 'Parsed from /usage',
-              tone: 'neutral',
-            },
-            {
-              label: 'Session context',
-              value: contextUsage ? `${contextUsage.percent}%` : 'Not reported',
-              sub: contextUsage ? `${contextUsage.usedLabel} / ${contextUsage.sizeLabel} tokens` : 'Waiting for ACP usage_update',
-              tone: contextUsage ? 'info' : 'muted',
-            },
-          ]} />
-          {quotaSummary ? <table cols={[
-            { id: 'group', head: 'Model group', grow: 1, priority: 4 },
-            { id: 'limit', head: 'Limit', priority: 2 },
-            { id: 'meter', head: 'Quota bar', priority: 3 },
-            { id: 'remaining', head: 'Left', align: 'end', mono: true, priority: 4 },
-            { id: 'reset', head: 'Reset', mono: true, priority: 1 },
-          ]} rows={quotaSummary.rows.map((row, index) => ({
-            id: `quota-${index}`,
-            cells: {
-              group: row.group,
-              limit: row.limit,
-              meter: { meter: {
-                value: row.fraction,
-                tone: row.fraction <= 0.15 ? 'error' : row.fraction <= 0.35 ? 'warning' : 'success',
-              } },
-              remaining: row.remaining,
-              reset: row.reset,
-            },
-            title: `${row.group}: ${row.limit}, ${row.remaining} remaining, reset ${row.reset}`,
-          }))} /> : ctx.reportText && <md>{ctx.reportText}</md>}
-        </>}
-        {ctx.usageTab === 'details' && <>
-          {(ctx.metadata.tier || ctx.metadata.usage) ? <kv items={[
-            ...(ctx.metadata.tier ? [{ k: 'Subscription tier', v: ctx.metadata.tier.name }] : []),
-            ...(ctx.metadata.usage ? [
-              { k: 'Session context tokens', v: ctx.metadata.usage.used.toLocaleString() },
-              { k: 'Context window', v: ctx.metadata.usage.size.toLocaleString() },
-              ...(ctx.metadata.usage.cost ? [{ k: 'Session cost', v: `${ctx.metadata.usage.cost.amount} ${ctx.metadata.usage.cost.currency}` }] : []),
-            ] : []),
-          ]} /> : <text>No session-context usage or plan tier has been reported by ACP yet.</text>}
-          {quotas ? <table cols={[
-            { id: 'group', head: 'Model group', grow: 1, priority: 4 },
-            { id: 'limit', head: 'Limit', priority: 2 },
-            { id: 'remaining', head: 'Remaining', align: 'end', mono: true, priority: 3 },
-            { id: 'reset', head: 'Reset', mono: true, priority: 1 },
-          ]} rows={quotas.map((row, index) => ({
-            id: `detail-${index}`,
-            cells: { group: row.group, limit: row.limit, remaining: row.remaining, reset: row.reset },
-          }))} /> : ctx.reportText && <md>{ctx.reportText}</md>}
-        </>}
-        {ctx.usageTab === 'raw' && (ctx.reportText
-          ? <code wrap>{ctx.reportText}</code>
-          : <text><span s="muted">No raw report output captured yet.</span></text>)}
-      </col> : <>
-        {ctx.reportLoading && <spinner label={`Reading official /${currentPanel.report} report`} />}
-        {ctx.reportText && <md>{ctx.reportText}</md>}
-      </>}
+      <scroll key="overlay-scroll" max={{ h: ctx.rLayout.inspectBodyMaxH }}>
+        {currentPanel.report === 'usage' ? <col gap="md">
+          <tabs variant="segmented" active={ctx.usageTab}
+            items={[
+              { id: 'overview', label: 'Overview' },
+              { id: 'details', label: 'Details' },
+              { id: 'raw', label: 'Raw report' },
+            ]}
+            onChange={event => ctx.onSetUsageTab(String(event.value ?? 'overview'))} />
+          {ctx.reportLoading && <spinner label="Reading official /usage report" />}
+          {ctx.usageTab === 'overview' && <>
+            <stats items={[
+              {
+                label: 'Tightest quota',
+                value: quotaSummary ? quotaSummary.tightest.remaining : (ctx.reportLoading ? 'Loading' : 'Unavailable'),
+                sub: quotaSummary
+                  ? `${quotaSummary.tightest.group} · ${quotaSummary.tightest.limit}${ctx.metadata.tier ? ` · ${ctx.metadata.tier.name}` : ''}`
+                  : (ctx.metadata.tier ? `${ctx.metadata.tier.name} · Official CLI /usage` : 'From official CLI /usage'),
+                tone: quotaSummary
+                  ? (quotaSummary.tightest.fraction <= 0.15 ? 'error' : quotaSummary.tightest.fraction <= 0.35 ? 'warning' : 'success')
+                  : 'muted',
+              },
+              {
+                label: 'Model groups',
+                value: quotaSummary ? String(quotaSummary.groupCount) : '0',
+                sub: quotaSummary ? `${quotaSummary.rows.length} tracked limits` : 'Parsed from /usage',
+                tone: 'neutral',
+              },
+              {
+                label: 'Session context',
+                value: contextUsage ? `${contextUsage.percent}%` : 'Not reported',
+                sub: contextUsage ? `${contextUsage.usedLabel} / ${contextUsage.sizeLabel} tokens` : 'Waiting for ACP usage_update',
+                tone: contextUsage ? 'info' : 'muted',
+              },
+            ]} />
+            {quotaSummary ? <table cols={[
+              { id: 'group', head: 'Model group', grow: 1, priority: 4 },
+              { id: 'limit', head: 'Limit', priority: 2 },
+              { id: 'meter', head: 'Quota bar', priority: 3 },
+              { id: 'remaining', head: 'Left', align: 'end', mono: true, priority: 4 },
+              { id: 'reset', head: 'Reset', mono: true, priority: 1 },
+            ]} rows={quotaSummary.rows.map((row, index) => ({
+              id: `quota-${index}`,
+              cells: {
+                group: row.group,
+                limit: row.limit,
+                meter: { meter: {
+                  value: row.fraction,
+                  tone: row.fraction <= 0.15 ? 'error' : row.fraction <= 0.35 ? 'warning' : 'success',
+                } },
+                remaining: row.remaining,
+                reset: row.reset,
+              },
+              title: `${row.group}: ${row.limit}, ${row.remaining} remaining, reset ${row.reset}`,
+            }))} /> : ctx.reportText && <md>{ctx.reportText}</md>}
+          </>}
+          {ctx.usageTab === 'details' && <>
+            {(ctx.metadata.tier || ctx.metadata.usage) ? <kv items={[
+              ...(ctx.metadata.tier ? [{ k: 'Subscription tier', v: ctx.metadata.tier.name }] : []),
+              ...(ctx.metadata.usage ? [
+                { k: 'Session context tokens', v: ctx.metadata.usage.used.toLocaleString() },
+                { k: 'Context window', v: ctx.metadata.usage.size.toLocaleString() },
+                ...(ctx.metadata.usage.cost ? [{ k: 'Session cost', v: `${ctx.metadata.usage.cost.amount} ${ctx.metadata.usage.cost.currency}` }] : []),
+              ] : []),
+            ]} /> : <text>No session-context usage or plan tier has been reported by ACP yet.</text>}
+            {quotas ? <table cols={[
+              { id: 'group', head: 'Model group', grow: 1, priority: 4 },
+              { id: 'limit', head: 'Limit', priority: 2 },
+              { id: 'remaining', head: 'Remaining', align: 'end', mono: true, priority: 3 },
+              { id: 'reset', head: 'Reset', mono: true, priority: 1 },
+            ]} rows={quotas.map((row, index) => ({
+              id: `detail-${index}`,
+              cells: { group: row.group, limit: row.limit, remaining: row.remaining, reset: row.reset },
+            }))} /> : ctx.reportText && <md>{ctx.reportText}</md>}
+          </>}
+          {ctx.usageTab === 'raw' && (ctx.reportText
+            ? <code wrap>{ctx.reportText}</code>
+            : <text><span s="muted">No raw report output captured yet.</span></text>)}
+        </col> : <col gap="xs">
+          {ctx.reportLoading && <spinner label={`Reading official /${currentPanel.report} report`} />}
+          {ctx.reportText && <md>{ctx.reportText}</md>}
+        </col>}
+      </scroll>
       {ctx.panelError && <text wrap="word"><span s="error">{ctx.panelError}</span></text>}
       <button keys={['enter']} on={ctx.panelSelection % 2 === 0} disabled={ctx.reportLoading && 'Report is loading'}
         onClick={() => ctx.onLoadReport(currentPanel.report)}>Refresh report</button>
-      <text wrap="word">Tab selects Refresh or Close. Enter activates; Esc returns to the conversation.</text>
+      <text wrap="word">Up/Down/PgUp/PgDn scroll. Tab selects Refresh or Close. Enter activates; Esc returns to the conversation.</text>
     </> : <>
-      {currentPanel.kind === 'account' && <>
-        <kv items={[
-          { k: 'ACP connection', v: ctx.disconnected ? 'Disconnected' : ctx.agent ? 'Connected; model access not guaranteed' : 'Connecting' },
-          { k: 'Subscription tier', v: ctx.metadata.tier ? ctx.metadata.tier.name : 'Not reported by ACP' },
-          { k: 'Account identity', v: 'Not exposed by this ACP connection' },
-          { k: 'Credential owner', v: 'Official agy shared authentication' },
-        ]} />
-        <text wrap="word">Sign in through agy’s interactive flow. This frontend stores no accounts or tokens. Switching requires signing in again, not selecting a saved-account pool. Login reconnects a fresh session and keeps your unsent draft.</text>
-        {!ctx.authenticationKnown && <text wrap="word">{ctx.disconnected ? 'No login descriptor received. Use the official CLI terminal login from your shell.' : 'Waiting for agy to advertise sign-in options.'}</text>}
-        {ctx.authenticationKnown && !method && <text>agy did not advertise terminal sign-in support.</text>}
-        {loginProblem && <text wrap="word"><span s="error">{loginProblem}</span></text>}
-        {method && !loginProblem && <code wrap>{JSON.stringify([ctx.options.executable ?? 'agy', 'acp', '--sandbox', ...(method.args ?? [])])}</code>}
-        {(ctx.busy || ctx.changingConfig || ctx.sessionOperation) && <text>Wait for the active operation before signing in or changing accounts.</text>}
-      </>}
-      {currentPanel.kind === 'account-switch' && <>
-        <text wrap="word">This signs out first. Antigravity shares credentials across CLI, App and IDE extensions, so they may also lose their login. If login is cancelled, the old credentials are not restored.</text>
-        <text wrap="word">Choose your other account in the official login flow. Afterwards this frontend starts a fresh session and keeps only your unsent draft. It does not replay the failed prompt or automatically transfer the old conversation.</text>
-        {method && <code wrap>{JSON.stringify([ctx.options.executable ?? 'agy', 'acp', '--sandbox', ...(method.args ?? [])])}</code>}
-      </>}
-      {currentPanel.kind === 'permissions' && <>
-        <kv items={[
-          { k: 'Session mode', v: mode ? configLabel(mode) : 'Not reported by agy' },
-          { k: 'Agent profile', v: ctx.options.agentName ?? 'Default' },
-          { k: 'Workspace roots', v: ctx.options.additionalDirectories?.length ? `${ctx.options.cwd} (+${ctx.options.additionalDirectories.length} --add-dir)` : ctx.options.cwd },
-          { k: 'Sandbox flag', v: '--sandbox requested' },
-          { k: 'OS containment', v: 'Not reported through ACP; not verified' },
-          { k: 'ACP capabilities', v: [
-            ...(ctx.agent?.promptCapabilities?.image ? ['image'] : []),
-            ...(ctx.agent?.promptCapabilities?.embeddedContext ? ['embeddedContext'] : []),
-            ...(ctx.agent?.capabilities.loadSession ? ['load'] : []),
-            ...(ctx.agent?.capabilities.resumeSession ? ['resume'] : []),
-            ...(ctx.agent?.capabilities.closeSession ? ['close'] : []),
-            ...(ctx.agent?.capabilities.additionalDirectories ? ['add-dir'] : []),
-          ].join(', ') || 'Connecting...' },
-          { k: 'Effective allow/deny rules', v: 'Owned by agy; not reported through ACP' },
-          { k: 'Frontend approvals', v: 'One-time allow or deny only; never automatic' },
-        ]} />
-        <text wrap="word">Existing agy rules can run tools without another prompt. Plan mode does not prove read-only access.</text>
-        <text wrap="word">No permission bypass flag is enabled. This frontend does not provide filesystem or terminal RPC.</text>
-      </>}
+      {currentPanel.kind === 'account' && <scroll key="overlay-scroll" max={{ h: ctx.rLayout.inspectBodyMaxH }}>
+        <col gap="xs">
+          <kv items={[
+            { k: 'ACP connection', v: ctx.disconnected ? 'Disconnected' : ctx.agent ? 'Connected; model access not guaranteed' : 'Connecting' },
+            { k: 'Subscription tier', v: ctx.metadata.tier ? ctx.metadata.tier.name : 'Not reported by ACP' },
+            { k: 'Account identity', v: 'Not exposed by this ACP connection' },
+            { k: 'Credential owner', v: 'Official agy shared authentication' },
+          ]} />
+          <text wrap="word">Sign in through agy’s interactive flow. This frontend stores no accounts or tokens. Switching requires signing in again, not selecting a saved-account pool. Login reconnects a fresh session and keeps your unsent draft.</text>
+          {!ctx.authenticationKnown && <text wrap="word">{ctx.disconnected ? 'No login descriptor received. Use the official CLI terminal login from your shell.' : 'Waiting for agy to advertise sign-in options.'}</text>}
+          {ctx.authenticationKnown && !method && <text>agy did not advertise terminal sign-in support.</text>}
+          {loginProblem && <text wrap="word"><span s="error">{loginProblem}</span></text>}
+          {method && !loginProblem && <code wrap>{JSON.stringify([ctx.options.executable ?? 'agy', 'acp', '--sandbox', ...(method.args ?? [])])}</code>}
+          {(ctx.busy || ctx.changingConfig || ctx.sessionOperation) && <text>Wait for the active operation before signing in or changing accounts.</text>}
+        </col>
+      </scroll>}
+      {currentPanel.kind === 'account-switch' && <scroll key="overlay-scroll" max={{ h: ctx.rLayout.inspectBodyMaxH }}>
+        <col gap="xs">
+          <text wrap="word">This signs out first. Antigravity shares credentials across CLI, App and IDE extensions, so they may also lose their login. If login is cancelled, the old credentials are not restored.</text>
+          <text wrap="word">Choose your other account in the official login flow. Afterwards this frontend starts a fresh session and keeps only your unsent draft. It does not replay the failed prompt or automatically transfer the old conversation.</text>
+          {method && <code wrap>{JSON.stringify([ctx.options.executable ?? 'agy', 'acp', '--sandbox', ...(method.args ?? [])])}</code>}
+        </col>
+      </scroll>}
+      {currentPanel.kind === 'permissions' && <scroll key="overlay-scroll" max={{ h: ctx.rLayout.inspectBodyMaxH }}>
+        <col gap="xs">
+          <kv items={[
+            { k: 'Session mode', v: mode ? configLabel(mode) : 'Not reported by agy' },
+            { k: 'Agent profile', v: ctx.options.agentName ?? 'Default' },
+            { k: 'Workspace roots', v: ctx.options.additionalDirectories?.length ? `${ctx.options.cwd} (+${ctx.options.additionalDirectories.length} --add-dir)` : ctx.options.cwd },
+            { k: 'Sandbox flag', v: '--sandbox requested' },
+            { k: 'OS containment', v: 'Not reported through ACP; not verified' },
+            { k: 'ACP capabilities', v: [
+              ...(ctx.agent?.promptCapabilities?.image ? ['image'] : []),
+              ...(ctx.agent?.promptCapabilities?.embeddedContext ? ['embeddedContext'] : []),
+              ...(ctx.agent?.capabilities.loadSession ? ['load'] : []),
+              ...(ctx.agent?.capabilities.resumeSession ? ['resume'] : []),
+              ...(ctx.agent?.capabilities.closeSession ? ['close'] : []),
+              ...(ctx.agent?.capabilities.additionalDirectories ? ['add-dir'] : []),
+            ].join(', ') || 'Connecting...' },
+            { k: 'Effective allow/deny rules', v: 'Owned by agy; not reported through ACP' },
+            { k: 'Frontend approvals', v: 'One-time allow or deny only; never automatic' },
+          ]} />
+          <text wrap="word">Existing agy rules can run tools without another prompt. Plan mode does not prove read-only access.</text>
+          <text wrap="word">No permission bypass flag is enabled. This frontend does not provide filesystem or terminal RPC.</text>
+        </col>
+      </scroll>}
       {currentPanel.kind === 'rename' && <text wrap="word">Local to agy-tern; does not rename the conversation in Antigravity. Up to 160 characters. Leave empty to use agy’s title.</text>}
       {currentPanel.kind === 'template-save' && <text wrap="word">Enter a short template name (e.g. review-diff). Saved locally per workspace in your XDG state directory.</text>}
       {currentPanel.kind === 'mcp-add' && <text wrap="word">Syntax: [--type stdio|http] &lt;name&gt; &lt;commandOrUrl&gt; [args...]. Executed via `agy mcp add`.</text>}

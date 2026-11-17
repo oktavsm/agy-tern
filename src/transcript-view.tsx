@@ -43,6 +43,8 @@ export function cachedPathExists(targetPath: string): boolean {
   return exists;
 }
 
+const CLIPBOARD_TIMEOUT_MS = 2_000;
+
 export async function copyToClipboard(text: string): Promise<boolean> {
   const candidates: ReadonlyArray<readonly [string, string[]]> = process.platform === 'darwin'
     ? [['pbcopy', []]]
@@ -55,12 +57,37 @@ export async function copyToClipboard(text: string): Promise<boolean> {
     const bin = Bun.which(cmd);
     if (!bin) continue;
     const ok = await new Promise<boolean>(resolve => {
+      let settled = false;
+      const done = (result: boolean): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(result);
+      };
       const child = spawn(bin, args, { stdio: ['pipe', 'ignore', 'ignore'] });
-      child.once('error', () => resolve(false));
-      child.once('close', code => resolve(code === 0));
+      const timer = setTimeout(() => {
+        try {
+          child.kill('SIGTERM');
+        } catch {
+          // Ignore if process already exited.
+        }
+        done(false);
+      }, CLIPBOARD_TIMEOUT_MS);
+      child.once('error', () => done(false));
+      child.once('close', code => done(code === 0));
       child.stdin.end(text);
     });
     if (ok) return true;
+  }
+  // Fall back to OSC 52 when attached to an interactive terminal without local clipboard binaries.
+  if (process.stdout.isTTY && text.length > 0 && text.length <= 100_000) {
+    try {
+      const encoded = Buffer.from(text, 'utf8').toString('base64');
+      process.stdout.write(`\x1b]52;c;${encoded}\x07`);
+      return true;
+    } catch {
+      return false;
+    }
   }
   return false;
 }
@@ -137,24 +164,43 @@ export function ToolOutput({ rawOutput }: { rawOutput: unknown }): JSX.Element {
   </col>;
 }
 
-export function ToolBody({ call, cwd, showRawInput, fullCommand, diffMode, getBlob, onInspect, onOpenSplit, onCopy }: {
+export function ToolBody({ call, cwd, showRawInput, fullCommand, diffMode, pathExists, getBlob, onInspect, onOpenSplit, onCopy }: {
   call: ToolCallUpdate;
   cwd: string;
   showRawInput: boolean;
   fullCommand?: string;
   diffMode: DiffMode;
+  pathExists?(targetPath: string): boolean;
   getBlob?(key: string, data: string, mimeType: string): string | undefined;
   onInspect?(title: string, target: InspectTarget, subtitle?: string): void;
   onOpenSplit?(path: string, line?: number): void;
   onCopy?(text: string): void;
 }): JSX.Element {
-  const imagePaths = extractToolImagePaths(call, cwd).filter(path => cachedPathExists(path));
+  const checkPathExists = pathExists ?? cachedPathExists;
+  const imagePaths = extractToolImagePaths(call, cwd).filter(checkPathExists);
   const copyableOutput = extractToolOutputText(call.rawOutput);
   const commandClip = !showRawInput && fullCommand ? clipInlinePreview(fullCommand, 6, 450) : undefined;
   const rawInputClip = showRawInput && call.rawInput !== undefined
     ? clipInlinePreview(typeof call.rawInput === 'string' ? call.rawInput : JSON.stringify(call.rawInput, null, 2), 8, 600)
     : undefined;
+  const extraLocations = (call.locations ?? []).filter(loc => !!loc.path);
   return <col gap="sm">
+    {extraLocations.length > 1 && <row key="locations" gap="xs" align="center" wrap>
+      <text><span s="muted">Locations</span></text>
+      {extraLocations.slice(0, 6).map((loc, index) => {
+        const label = `${formatPathLabel(loc.path, cwd)}${loc.line ? `:${loc.line}` : ''}`;
+        const absLoc = isAbsolute(loc.path) ? loc.path : resolve(cwd, loc.path);
+        const canSplitLoc = !!onOpenSplit && checkPathExists(absLoc);
+        return <button key={`loc-${index}`} size="sm" variant="quiet" icon={canSplitLoc ? 'split' : 'file'}
+          onClick={() => {
+            if (canSplitLoc) onOpenSplit(absLoc, loc.line ?? undefined);
+            else onCopy?.(absLoc);
+          }}>
+          {label}
+        </button>;
+      })}
+      {extraLocations.length > 6 && <text><span s="muted">{`+${extraLocations.length - 6} more`}</span></text>}
+    </row>}
     {rawInputClip && <col key="input" gap="xs">
       <text><span s="muted">Input</span></text>
       <code wrap>{rawInputClip.text}</code>
@@ -182,6 +228,24 @@ export function ToolBody({ call, cwd, showRawInput, fullCommand, diffMode, getBl
               onOpen={onInspect ? () => onInspect('Live image preview', { type: 'image-blob', blob, mimeType: imageMime }, imageMime) : undefined} />;
           }
         }
+        if (content.content.type === 'resource_link') {
+          const link = content.content;
+          const linkLabel = link.title || link.name || link.uri;
+          const rawPath = link.uri.startsWith('file://') ? link.uri.slice(7) : link.uri;
+          const absLinkPath = rawPath && !rawPath.includes('://')
+            ? (isAbsolute(rawPath) ? rawPath : resolve(cwd, rawPath))
+            : undefined;
+          const canSplitLink = !!absLinkPath && !!onOpenSplit && checkPathExists(absLinkPath);
+          return <row key={`content-${index}`} gap="xs" align="center" wrap>
+            <text><span s="muted">{linkLabel}</span></text>
+            {canSplitLink && <button size="sm" variant="quiet" icon="split" onClick={() => onOpenSplit(absLinkPath)}>
+              Tern split
+            </button>}
+            {onCopy && <button size="sm" variant="quiet" icon="copy" onClick={() => onCopy(link.uri)}>
+              Copy URI
+            </button>}
+          </row>;
+        }
         return <md key={`content-${index}`}>{contentText(content.content)}</md>;
       }
       if (content.type === 'terminal') return <text key={`content-${index}`} wrap="char">
@@ -189,7 +253,7 @@ export function ToolBody({ call, cwd, showRawInput, fullCommand, diffMode, getBl
       </text>;
       const pathLabel = formatPathLabel(content.path, cwd);
       const absPath = isAbsolute(content.path) ? content.path : resolve(cwd, content.path);
-      const canSplit = !!onOpenSplit && cachedPathExists(absPath);
+      const canSplit = !!onOpenSplit && checkPathExists(absPath);
       if (content.oldText == null) {
         const clippedFile = clipInlinePreview(content.newText, 24, 3_000);
         return <col key={`content-${index}`} gap="xs">
@@ -265,6 +329,7 @@ export interface EntryCallbacks {
   canRetry: boolean;
   canReconnect: boolean;
   canSwitchAccount: boolean;
+  pathExists?(targetPath: string): boolean;
   getBlob(key: string, data: string, mimeType: string): string | undefined;
   onInspect(title: string, target: InspectTarget, subtitle?: string): void;
   onToggleThought(id: string, open: boolean): void;
@@ -293,12 +358,15 @@ export function Entry({ entry, continued, streaming, recent, turnNumber, callbac
   callbacks: EntryCallbacks;
 }): JSX.Element {
   const showAvatar = callbacks.prefs.transcriptDensity !== 'compact';
+  const checkPathExists = callbacks.pathExists ?? cachedPathExists;
   switch (entry.type) {
     case 'message': {
       const withDivider = entry.role === 'user' && !!turnNumber && turnNumber > 1 && showAvatar;
       const segments = entry.role === 'agent' && entry.text ? splitMarkdownSegments(entry.text) : undefined;
       const hasCodeBlocks = !!segments?.some(seg => seg.kind === 'code');
-      const mdImagePaths = entry.role === 'agent' && !streaming && entry.text ? extractMarkdownImagePaths(entry.text, callbacks.cwd) : [];
+      const mdImagePaths = entry.role === 'agent' && !streaming && entry.text
+        ? extractMarkdownImagePaths(entry.text, callbacks.cwd, checkPathExists)
+        : [];
       const msgNode = <message key={withDivider ? 'msg' : entry.id} variant="auto"
         side={entry.role === 'user' ? 'end' : 'start'} author={entry.role === 'user' ? 'You' : 'Antigravity'}
         continued={continued}
@@ -381,7 +449,7 @@ export function Entry({ entry, continued, streaming, recent, turnNumber, callbac
         age={running ? elapsed : undefined}
         took={running ? undefined : elapsed}
         open={open}
-        lines={[{ id: 'body', title: 'Reasoning', status: running ? 'running' : 'done' }]}
+        lines={open ? [{ id: 'body', title: 'Reasoning', status: running ? 'running' : 'done' }] : undefined}
         onToggle={event => callbacks.onToggleThought(entry.id, event.open ?? !open)}>
         {open ? <md key="body">{entry.text}</md> : <spacer key="body" size="none" />}
       </trace>;
@@ -389,7 +457,7 @@ export function Entry({ entry, continued, streaming, recent, turnNumber, callbac
     case 'tool': {
       const summary = summarizeToolCall(entry.call, callbacks.cwd);
       const hasMedia = extractToolInlineImages(entry.call).length > 0 ||
-        extractToolImagePaths(entry.call, callbacks.cwd).some(path => cachedPathExists(path));
+        extractToolImagePaths(entry.call, callbacks.cwd).some(checkPathExists);
       const running = entry.call.status === 'in_progress' || entry.call.status === 'pending';
       const defaultCollapsed = callbacks.prefs.toolDisplay === 'expanded'
         ? !recent && !running && entry.call.status !== 'failed'
@@ -425,7 +493,7 @@ export function Entry({ entry, continued, streaming, recent, turnNumber, callbac
         }}
         onToggle={event => callbacks.onToggleTool(entry.id, event.collapsed ?? !collapsed)}>
         {!collapsed ? <ToolBody call={entry.call} cwd={callbacks.cwd} showRawInput={summary.showRawInput} fullCommand={summary.fullCommand} diffMode={callbacks.prefs.diffMode}
-          getBlob={callbacks.getBlob} onInspect={callbacks.onInspect} onOpenSplit={callbacks.onOpenSplit} onCopy={callbacks.onCopy} />
+          pathExists={checkPathExists} getBlob={callbacks.getBlob} onInspect={callbacks.onInspect} onOpenSplit={callbacks.onOpenSplit} onCopy={callbacks.onCopy} />
           : <spacer key="lazy" size="none" />}
       </tool>;
     }
