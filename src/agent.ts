@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import { realpathSync } from 'node:fs';
 import { isAbsolute, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import type { Readable, Writable } from 'node:stream';
@@ -134,8 +135,17 @@ function processStream(input: Readable, output: Writable): Stream {
   };
 }
 
+function canonicalPath(target: string): string {
+  const abs = resolve(target);
+  try {
+    return realpathSync(abs);
+  } catch {
+    return abs;
+  }
+}
+
 export async function connectAgent(options: AgentOptions, events: AgentEvents): Promise<AgentSession> {
-  const cwd = resolve(options.cwd);
+  const cwd = canonicalPath(options.cwd);
   const extraDirs = (options.additionalDirectories ?? []).map(dir => resolve(cwd, dir));
   const executable = options.executable ?? 'agy';
   if (options.signal?.aborted) throw asError(options.signal.reason);
@@ -594,7 +604,7 @@ export async function connectAgent(options: AgentOptions, events: AgentEvents): 
         ...response,
         sessions: response.sessions.filter((session) => (
           typeof session.cwd === 'string' && !session.cwd.includes('\0') &&
-          isAbsolute(session.cwd) && resolve(session.cwd) === cwd
+          isAbsolute(session.cwd) && canonicalPath(session.cwd) === cwd
         )),
       };
     } catch (cause) {

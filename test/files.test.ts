@@ -205,6 +205,7 @@ describe('workspace @file mention helpers', () => {
   test('reads clipboard PNG image safely and enforces size and missing-type errors', async () => {
     const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 1, 2, 3]);
     const loaded = await readClipboardImage({
+      platform: 'linux',
       hasCommand: cmd => cmd === 'wl-paste',
       exec: async (_cmd, args) => {
         if (args.includes('--list-types')) return Buffer.from('text/plain\nimage/png\n');
@@ -218,6 +219,7 @@ describe('workspace @file mention helpers', () => {
     expect(loaded.path).toMatch(/^clipboard-.*\.png$/);
 
     await expect(readClipboardImage({
+      platform: 'linux',
       hasCommand: cmd => cmd === 'xclip',
       exec: async () => Buffer.from('UTF8_STRING\ntext/plain\n'),
     })).rejects.toThrow('Clipboard does not contain a PNG, JPEG, or WebP image.');

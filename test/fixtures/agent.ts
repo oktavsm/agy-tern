@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { existsSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
 import { rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
@@ -31,7 +31,7 @@ let logoutRequests = 0;
 const scenario = basename(process.cwd());
 const syntheticLogin = scenario.startsWith('agy-tern-SYNTHETIC-login-');
 const syntheticSwitch = scenario.startsWith('agy-tern-SYNTHETIC-switch-');
-const syntheticWorkspace = (syntheticLogin || syntheticSwitch) && dirname(process.cwd()) === resolve(tmpdir());
+const syntheticWorkspace = (syntheticLogin || syntheticSwitch) && dirname(process.cwd()) === realpathSync(tmpdir());
 const loginMarker = join(process.cwd(), '.SYNTHETIC-fixture-login');
 const logoutMarker = join(process.cwd(), '.SYNTHETIC-fixture-logout');
 let initialized: InitializeRequest | undefined;

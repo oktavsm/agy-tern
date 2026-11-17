@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync, fstatSync, watch } from 'node:fs';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, realpath, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -15,7 +15,7 @@ const logins: Array<{ controller: AbortController; result: Promise<TerminalLogin
 const drivers: Array<{ child: ChildProcess; closed: Promise<number | null> }> = [];
 
 async function workspace(scenario = 'success'): Promise<string> {
-  const cwd = await mkdtemp(join(tmpdir(), `agy-auth-${scenario}-`));
+  const cwd = await realpath(await mkdtemp(join(tmpdir(), `agy-auth-${scenario}-`)));
   workspaces.push(cwd);
   return cwd;
 }
