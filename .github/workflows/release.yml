@@ -46,7 +46,7 @@ jobs:
           VERSION="${GITHUB_REF_NAME}"
           PKG_DIR="agy-tern-${VERSION}"
           mkdir -p "release-out/${PKG_DIR}/scripts"
-          cp -r dist src package.json bun.lock tsconfig.json README.md LICENSE SECURITY.md CONTRIBUTING.md CODE_OF_CONDUCT.md CHANGELOG.md "release-out/${PKG_DIR}/"
+          cp -r dist src assets package.json bun.lock tsconfig.json README.md LICENSE SECURITY.md CONTRIBUTING.md CODE_OF_CONDUCT.md CHANGELOG.md "release-out/${PKG_DIR}/"
           cp scripts/install.sh "release-out/${PKG_DIR}/scripts/"
           (cd release-out && tar -czf "agy-tern-${VERSION}.tar.gz" "${PKG_DIR}")
           (cd release-out && sha256sum "agy-tern-${VERSION}.tar.gz" > SHA256SUMS.txt)
@@ -56,7 +56,7 @@ jobs:
           VERSION="${GITHUB_REF_NAME}"
           mkdir -p release-smoke
           tar -xzf "release-out/agy-tern-${VERSION}.tar.gz" -C release-smoke
-          (cd "release-smoke/agy-tern-${VERSION}" && bun install --frozen-lockfile && bun run build && bun run dist/cli.js --help >/dev/null)
+          (cd "release-smoke/agy-tern-${VERSION}" && bun run dist/cli.js --help >/dev/null && bun run dist/cli.js --version && bun install --frozen-lockfile && bun run build && bun run dist/cli.js --help >/dev/null)
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2

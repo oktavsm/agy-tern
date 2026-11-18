@@ -2,6 +2,19 @@
 
 All notable changes to `agy-tern` are documented in this file.
 
+## [0.2.0] - 2026-11-18
+
+### Added
+- Standalone `curl | bash` installer via [`scripts/install.sh`](scripts/install.sh) fetching SHA-256 verified GitHub Release archives into `~/.local/share/agy-tern` without requiring `git clone`.
+- Self-update command (`agy-tern update`, `agy-tern update --check`, `--version`, `--force`) and `-V` / `--version` flag, plus a non-blocking 24h passive update check notification.
+- Multi-stage startup connection indicator (`1/4` to `4/4`) with starburst spinner, shimmer status, and elapsed timer.
+- `All workspaces` tab in `/sessions` (`session/list` without `cwd` filtering) showing each session's origin directory, plus non-blocking background indexing so search filters across titles, local labels, folder names, IDs, and chat message content.
+
+### Fixed
+- Enabled clickable, draggable conversation and overlay scrollbars (`flex: 1 1 0` viewport sizing inside `.sf-main`, `bar="always"`, `user-select: none` on `.sf-scroll-bar`).
+- Fixed `/usage` segmented tab clicking (`onSelect` / `onActivate` + `onChange`) and enriched the `Details` tab with tier, auth boundary, sign-in method, runtime info, context breakdown, and quota table.
+- Fixed `/sessions` `<picker state="loading">` spinner suppression when an active session row was present and replaced N+1 session-name stat reads with a single-`readdir` batch lookup.
+
 ## [0.1.0] - 2026-11-18
 
 ### Added

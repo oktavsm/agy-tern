@@ -100,6 +100,16 @@ async function main(): Promise<void> {
     console.log(CLI_HELP);
     return;
   }
+  if (parsed.version) {
+    const { CURRENT_VERSION } = await import('./updater');
+    console.log(`agy-tern ${CURRENT_VERSION}`);
+    return;
+  }
+  if (parsed.update) {
+    const { runSelfUpdate } = await import('./updater');
+    await runSelfUpdate(parsed.update);
+    return;
+  }
 
   const executable = Bun.which(parsed.agy ?? 'agy');
   if (!executable) throw new Error('Official agy executable not found. Install Antigravity CLI or pass --agy /path/to/agy.');

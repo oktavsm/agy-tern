@@ -6,6 +6,6 @@ dist/
 *.log
 coverage/
 .tmp/
-docs/screenshots/
+/docs/
 __pycache__/
 *.pyc

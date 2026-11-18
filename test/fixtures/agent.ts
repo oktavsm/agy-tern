@@ -655,7 +655,7 @@ const connection = agent({ name: 'local-protocol-fixture' })
       });
       await text('Updated `src/ui.tsx` with native diff rendering and verified tests pass.');
     } else if (command.startsWith('demo-media')) {
-      const target = command.slice('demo-media'.length).trim() || 'docs/screenshots/serve/phase5-home-rich.png';
+      const target = command.slice('demo-media'.length).trim() || 'assets/preview-ready.png';
       const resolved = resolve(process.cwd(), target);
       const notify = (update: SessionNotification['update']) => client.notify(methods.client.session.update, { sessionId, update });
       await notify({

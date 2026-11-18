@@ -9,7 +9,9 @@ Usage: agy-tern [--cwd DIRECTORY] [--add-dir DIRECTORY]... [--agy EXECUTABLE]
                 [--agent NAME] [--model MODEL] [--mode MODE] [--thinking LEVEL]
                 [--append-system-prompt TEXT] [--max-fps N] [--motion MODE]
                 [-c | --continue | --conversation SESSION_ID] [-i PROMPT | PROMPT]
+       agy-tern update [--check] [--force] [--version TAG]
        agy-tern --doctor [--json]
+       agy-tern --version
 
   --cwd DIRECTORY          Agent workspace (defaults to current directory)
   --add-dir DIRECTORY      Add an extra workspace root (repeatable)
@@ -24,8 +26,10 @@ Usage: agy-tern [--cwd DIRECTORY] [--add-dir DIRECTORY]... [--agy EXECUTABLE]
   -c, --continue           Resume/load the most recent conversation in this workspace
   --conversation ID        Resume/load a specific conversation ID on startup
   -i, --prompt-interactive Submit an initial prompt automatically once ready (or pass [PROMPT])
+  update                   Check for or install the latest release (--check, --force, --version TAG)
   --doctor                 Check local prerequisites without login or model requests
   --json                   Output --doctor diagnostics as JSON
+  -V, --version            Show agy-tern version
   --help                   Show usage
 
 In Tern: native chat over ACP. Other terminals: original agy UI.
@@ -33,8 +37,16 @@ In native chat: /account or /login opens official terminal login.
 Official login outside native chat: agy acp --login
 `;
 
+export interface UpdateCommandArgs {
+  checkOnly: boolean;
+  force: boolean;
+  targetVersion?: string;
+}
+
 export interface ParsedCliArgs {
   help: boolean;
+  version?: boolean;
+  update?: UpdateCommandArgs;
   doctor: boolean;
   doctorJson: boolean;
   cwd: string;
@@ -75,6 +87,46 @@ function parseMotionPref(raw: string | undefined): MotionPref | undefined {
 
 /** Parse and validate agy-tern CLI flags matching official agy CLI conventions. */
 export function parseCliArgs(argv: readonly string[], baseCwd = process.cwd()): ParsedCliArgs {
+  if (argv[0] === 'update') {
+    const { values, positionals } = parseArgs({
+      args: [...argv.slice(1)],
+      options: {
+        check: { type: 'boolean' },
+        force: { type: 'boolean' },
+        version: { type: 'string' },
+        help: { type: 'boolean', short: 'h' },
+      },
+      strict: true,
+      allowPositionals: true,
+    });
+    if (values.help) {
+      return {
+        help: true,
+        doctor: false,
+        doctorJson: false,
+        cwd: resolve(baseCwd),
+        additionalDirectories: [],
+        continueLast: false,
+      };
+    }
+    if (positionals.length > 0) {
+      throw new Error(`Unexpected extra arguments for update: ${positionals.join(' ')}`);
+    }
+    return {
+      help: false,
+      update: {
+        checkOnly: !!values.check,
+        force: !!values.force,
+        ...(values.version ? { targetVersion: values.version } : {}),
+      },
+      doctor: false,
+      doctorJson: false,
+      cwd: resolve(baseCwd),
+      additionalDirectories: [],
+      continueLast: false,
+    };
+  }
+
   const { values, positionals } = parseArgs({
     args: [...argv],
     options: {
@@ -94,6 +146,7 @@ export function parseCliArgs(argv: readonly string[], baseCwd = process.cwd()): 
       'prompt-interactive': { type: 'string', short: 'i' },
       doctor: { type: 'boolean' },
       json: { type: 'boolean' },
+      version: { type: 'boolean', short: 'V' },
       help: { type: 'boolean', short: 'h' },
     },
     strict: true,
@@ -103,6 +156,17 @@ export function parseCliArgs(argv: readonly string[], baseCwd = process.cwd()): 
   if (values.help) {
     return {
       help: true,
+      doctor: false,
+      doctorJson: false,
+      cwd: resolve(baseCwd),
+      additionalDirectories: [],
+      continueLast: false,
+    };
+  }
+  if (values.version) {
+    return {
+      help: false,
+      version: true,
       doctor: false,
       doctorJson: false,
       cwd: resolve(baseCwd),

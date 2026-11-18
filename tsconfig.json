@@ -4,6 +4,7 @@
     "lib": ["ES2024"],
     "module": "Preserve",
     "moduleResolution": "bundler",
+    "resolveJsonModule": true,
     "jsx": "react-jsx",
     "jsxImportSource": "@stencil-hq/tern",
     "strict": true,

@@ -1425,7 +1425,7 @@ const connection = agent({ name: 'e2e-protocol-fixture' })
       await notify({ sessionUpdate: 'usage_update', used, size });
       await text(`Updated context usage to ${used}/${size}.`);
     } else if (command.startsWith('demo-media')) {
-      const target = command.slice('demo-media'.length).trim() || 'docs/screenshots/serve/phase5-home-rich.png';
+      const target = command.slice('demo-media'.length).trim() || 'assets/preview-ready.png';
       const resolved = resolve(cwd, target);
       await notify({
         sessionUpdate: 'tool_call',

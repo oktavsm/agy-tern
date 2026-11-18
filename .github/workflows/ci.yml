@@ -40,10 +40,10 @@ jobs:
           import pathlib, re, sys
 
           emoji_re = re.compile(r'[\U0001F300-\U0001FAFF\u2600-\u27BF\uFE0F]')
-          roots = [pathlib.Path('src'), pathlib.Path('test'), pathlib.Path('docs'), pathlib.Path('README.md'), pathlib.Path('SECURITY.md'), pathlib.Path('CONTRIBUTING.md')]
+          roots = [pathlib.Path('src'), pathlib.Path('test'), pathlib.Path('scripts'), pathlib.Path('README.md'), pathlib.Path('CHANGELOG.md'), pathlib.Path('SECURITY.md'), pathlib.Path('CONTRIBUTING.md')]
           violations = []
           for root in roots:
-              paths = [root] if root.is_file() else [p for p in root.rglob('*') if p.is_file()]
+              paths = [root] if root.is_file() else ([p for p in root.rglob('*') if p.is_file()] if root.exists() else [])
               for p in paths:
                   if p.suffix in {'.png', '.jpg', '.jpeg', '.webp', '.gif'}:
                       continue
@@ -51,7 +51,7 @@ jobs:
                   for i, line in enumerate(text.splitlines(), 1):
                       if emoji_re.search(line):
                           violations.append(f'{p}:{i}: emoji character found')
-                      if root.name in {'src', 'docs', 'README.md'} and '\u2014' in line:
+                      if root.name in {'src', 'README.md', 'CHANGELOG.md'} and '\u2014' in line:
                           violations.append(f'{p}:{i}: em-dash character found')
           if violations:
               print('\n'.join(violations), file=sys.stderr)

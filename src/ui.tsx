@@ -3240,7 +3240,19 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
           loadSessions(false, true, false);
         }
         if (resumeId) showToast('Reconnected to Antigravity');
-        else if (launch?.initialPrompt && !disconnected) submitPrompt(launch.initialPrompt);
+        else {
+          if (launch?.initialPrompt && !disconnected) submitPrompt(launch.initialPrompt);
+          if (!options.executable || options.executable === 'agy') {
+            void import('./updater')
+              .then(m => m.checkForUpdatePassive())
+              .then(res => {
+                if (res && !quitting && !panel && !toastMessage) {
+                  showToast(`Update available: ${res.latestTag}`, 'Run `agy-tern update` to upgrade');
+                }
+              })
+              .catch(() => {});
+          }
+        }
       }).catch(error => {
         if (quitting) return;
         agent = undefined;

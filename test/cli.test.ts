@@ -103,4 +103,21 @@ describe('CLI argument parser', () => {
     expect(() => parseCliArgs(['--max-fps', 'fast'], root)).toThrow('--max-fps');
     expect(() => parseCliArgs(['--motion', 'hyper'], root)).toThrow('--motion');
   });
+
+  test('parses update subcommand and -V/--version flags', async () => {
+    const root = await makeTempDir();
+    expect(parseCliArgs(['-V'], root)).toMatchObject({ version: true, help: false });
+    expect(parseCliArgs(['--version'], root)).toMatchObject({ version: true, help: false });
+
+    expect(parseCliArgs(['update'], root)).toMatchObject({
+      help: false,
+      update: { checkOnly: false, force: false },
+    });
+    expect(parseCliArgs(['update', '--check', '--force', '--version', 'v0.2.0'], root)).toMatchObject({
+      help: false,
+      update: { checkOnly: true, force: true, targetVersion: 'v0.2.0' },
+    });
+    expect(parseCliArgs(['update', '--help'], root)).toMatchObject({ help: true });
+    expect(() => parseCliArgs(['update', 'extra-arg'], root)).toThrow('Unexpected extra arguments for update');
+  });
 });
