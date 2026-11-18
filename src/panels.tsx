@@ -54,6 +54,16 @@ import {
   ToolBody,
   type InspectTarget,
 } from './transcript-view';
+import {
+  buildSettingsViewData,
+  extractChangeBoolean,
+  isPrefsPageId,
+  patchForLocalPrefChange,
+  patchForPrefRowReset,
+  resolvePrefsFocusRow,
+  stripConfigPrefix,
+  type UpdateStatusState,
+} from './settings-nav';
 import type { FollowUpSessionState, QuestionAnswerValue } from './follow-up';
 
 export type Panel =
@@ -134,6 +144,8 @@ export interface PanelRenderContext {
   pickerTab: string;
   pickerSelected: string;
   prefsPage: string;
+  prefsFocus?: string;
+  updateStatus?: UpdateStatusState;
   usageTab: string;
   panelError: string;
   userPrefs: UserPrefs;
@@ -151,11 +163,13 @@ export interface PanelRenderContext {
   onSetPickerTab(tab: string, clearSelected?: boolean): void;
   onSetPickerSelected(item: string): void;
   onSetPrefsPage(page: string): void;
+  onSetPrefsFocus?(rowId: string): void;
   onSetUsageTab(tab: string): void;
   onOpenPanel(next: Panel): void;
   onClosePanel(): void;
   onUpdatePrefs(patch: Partial<UserPrefs>): void;
   onResetPrefs(): void;
+  onCheckUpdates?(): void;
   onShowToast(text: string, sub?: string): void;
   onChangeConfig(option: SessionConfigOption, value: string | boolean): void;
   onChooseCommand(command: Command, args?: string, completeOnly?: boolean): void;
@@ -192,336 +206,95 @@ export interface PanelRenderContext {
 }
 
 function renderPrefsPanel(ctx: PanelRenderContext): JSX.Element {
-  const { userPrefs, metadata, modeOption: mode } = ctx;
-  const pages = [
-    { id: 'appearance', label: 'Appearance & UI', icon: 'appearance' as const },
-    { id: 'session', label: 'Session & Model', icon: 'model' as const },
-    { id: 'permissions', label: 'Permissions & Sandbox', icon: 'shield' as const },
-    { id: 'keys', label: 'Keybindings', icon: 'keyboard' as const },
-  ];
-  const leadByPage: Record<string, string> = {
-    appearance: 'Transcript rendering, diff layout, and composer settings saved locally for agy-tern.',
-    session: 'Dynamic session options supplied by agy over ACP. Changes apply to the active session.',
-    permissions: 'Session mode reported by agy and sandbox boundary status.',
-    keys: 'Keyboard shortcuts for the native composer, transcript navigation, and one-time approvals.',
+  const { metadata } = ctx;
+  const activePage = isPrefsPageId(ctx.prefsPage) ? ctx.prefsPage : 'appearance';
+  const viewData = buildSettingsViewData({
+    userPrefs: ctx.userPrefs,
+    metadata,
+    modeOption: ctx.modeOption,
+    options: ctx.options,
+    workspaceName: ctx.workspaceName,
+    agent: ctx.agent,
+    disconnected: ctx.disconnected,
+    agentConnecting: ctx.agentConnecting,
+    busy: ctx.busy,
+    changingConfig: ctx.changingConfig,
+    sessionOperation: ctx.sessionOperation,
+    updateStatus: ctx.updateStatus,
+  });
+  const focusedRow = resolvePrefsFocusRow(viewData.sections, activePage, ctx.prefsFocus, ctx.panelDraft.text);
+
+  const handlePageEvent = (candidate: unknown): boolean => {
+    if (typeof candidate === 'string' && isPrefsPageId(candidate)) {
+      ctx.onSetPrefsPage(candidate);
+      return true;
+    }
+    return false;
   };
-  const lockReason = ctx.busy || ctx.changingConfig || !!ctx.sessionOperation || ctx.disconnected || !ctx.agent
-    ? 'Wait until the active session is idle and connected'
-    : undefined;
-  const sessionRows: PrefsRow[] = metadata.configOptions.map(option => ({
-    id: `cfg:${option.id}`,
-    label: option.name,
-    hint: option.description ?? option.id,
-    disabled: lockReason,
-    control: option.type === 'boolean'
-      ? { k: 'switch', on: Boolean(option.currentValue) }
-      : {
-        k: 'choice',
-        value: option.currentValue,
-        style: configValues(option).length <= 3 ? 'segmented' : 'menu',
-        options: configValues(option).map(entry => ({
-          value: entry.value,
-          label: entry.name,
-          detail: entry.description ?? undefined,
-        })),
-      },
-  }));
-  return <prefs key="prefs" title="agy-tern settings" page={ctx.prefsPage}
-    lead={leadByPage[ctx.prefsPage]} query={ctx.panelDraft.text} cursor={ctx.panelDraft.cursor}
-    pages={pages}
-    sections={[
-      {
-        id: 'transcript',
-        title: 'Transcript & Diffs',
-        page: 'appearance',
-        rows: [
-          {
-            id: 'diffMode',
-            label: 'Diff layout',
-            hint: 'How file edit diffs render inside tool cards',
-            changed: userPrefs.diffMode !== DEFAULT_PREFS.diffMode,
-            defaultLabel: DEFAULT_PREFS.diffMode,
-            control: {
-              k: 'choice',
-              value: userPrefs.diffMode,
-              style: 'segmented',
-              options: [
-                { value: 'auto', label: 'Auto' },
-                { value: 'unified', label: 'Unified' },
-                { value: 'split', label: 'Split' },
-              ],
-            },
-          },
-          {
-            id: 'toolDisplay',
-            label: 'Tool activity default',
-            hint: 'Compact collapses read/search/command bodies until clicked; Expanded opens all tools',
-            changed: userPrefs.toolDisplay !== DEFAULT_PREFS.toolDisplay,
-            defaultLabel: DEFAULT_PREFS.toolDisplay,
-            control: {
-              k: 'choice',
-              value: userPrefs.toolDisplay,
-              style: 'segmented',
-              options: [
-                { value: 'compact', label: 'Compact' },
-                { value: 'expanded', label: 'Expanded' },
-              ],
-            },
-          },
-          {
-            id: 'thoughtExpanded',
-            label: 'Expand Thought blocks by default',
-            hint: 'Keep agent reasoning open automatically instead of collapsed as Thought >',
-            changed: userPrefs.thoughtExpanded !== DEFAULT_PREFS.thoughtExpanded,
-            control: { k: 'switch', on: userPrefs.thoughtExpanded },
-          },
-          {
-            id: 'transcriptDensity',
-            label: 'Transcript density',
-            hint: 'Comfortable adds turn dividers and avatars; Compact tightens spacing',
-            changed: userPrefs.transcriptDensity !== DEFAULT_PREFS.transcriptDensity,
-            defaultLabel: DEFAULT_PREFS.transcriptDensity,
-            control: {
-              k: 'choice',
-              value: userPrefs.transcriptDensity,
-              style: 'segmented',
-              options: [
-                { value: 'comfortable', label: 'Comfortable' },
-                { value: 'compact', label: 'Compact' },
-              ],
-            },
-          },
-          {
-            id: 'showTimestamps',
-            label: 'Show turn timestamps',
-            hint: 'Display HH:MM timestamps on messages and turn dividers',
-            changed: userPrefs.showTimestamps !== DEFAULT_PREFS.showTimestamps,
-            control: { k: 'switch', on: userPrefs.showTimestamps },
-          },
-          {
-            id: 'autoPreviewMedia',
-            label: 'Auto-open modal popup for images during turns',
-            hint: 'Default off: screenshots and images display inline; click any image to open its modal preview',
-            changed: userPrefs.autoPreviewMedia !== DEFAULT_PREFS.autoPreviewMedia,
-            control: { k: 'switch', on: userPrefs.autoPreviewMedia },
-          },
-          {
-            id: 'notifyOnTurnComplete',
-            label: 'Terminal attention notifications',
-            hint: 'Notify terminal when long turns (>= 8s) finish or approvals await',
-            changed: userPrefs.notifyOnTurnComplete !== DEFAULT_PREFS.notifyOnTurnComplete,
-            control: { k: 'switch', on: userPrefs.notifyOnTurnComplete },
-          },
-        ],
-      },
-      {
-        id: 'composer',
-        title: 'Composer & Dock',
-        page: 'appearance',
-        rows: [
-          {
-            id: 'composerLines',
-            label: 'Composer max lines',
-            hint: 'Maximum visible lines before the input box scrolls',
-            changed: userPrefs.composerLines !== DEFAULT_PREFS.composerLines,
-            defaultLabel: String(DEFAULT_PREFS.composerLines),
-            control: {
-              k: 'choice',
-              value: String(userPrefs.composerLines),
-              style: 'segmented',
-              options: [
-                { value: '4', label: '4 lines' },
-                { value: '6', label: '6 lines' },
-                { value: '10', label: '10 lines' },
-              ],
-            },
-          },
-          {
-            id: 'maxFps',
-            label: 'Streaming frame cap',
-            hint: 'Lower FPS saves CPU and battery on mid-low laptops during long agent streams',
-            changed: userPrefs.maxFps !== DEFAULT_PREFS.maxFps,
-            defaultLabel: `${DEFAULT_PREFS.maxFps} FPS`,
-            control: {
-              k: 'choice',
-              value: String(userPrefs.maxFps),
-              style: 'segmented',
-              options: [
-                { value: '15', label: '15 FPS' },
-                { value: '25', label: '25 FPS' },
-                { value: '40', label: '40 FPS' },
-                { value: '60', label: '60 FPS' },
-              ],
-            },
-          },
-          {
-            id: 'motion',
-            label: 'Animation & shimmer motion',
-            hint: 'Auto follows terminal reduced-motion signals; Reduced freezes shimmer/spinner cadence',
-            changed: userPrefs.motion !== DEFAULT_PREFS.motion,
-            defaultLabel: DEFAULT_PREFS.motion,
-            control: {
-              k: 'choice',
-              value: userPrefs.motion,
-              style: 'segmented',
-              options: [
-                { value: 'auto', label: 'Auto' },
-                { value: 'full', label: 'Full' },
-                { value: 'reduced', label: 'Reduced' },
-              ],
-            },
-          },
-          {
-            id: 'showKeyLegend',
-            label: 'Show shortcut legend below dock',
-            hint: 'Approval shortcuts still appear automatically while a permission prompt is active',
-            changed: userPrefs.showKeyLegend !== DEFAULT_PREFS.showKeyLegend,
-            control: { k: 'switch', on: userPrefs.showKeyLegend },
-          },
-          {
-            id: 'resetPrefs',
-            label: 'Reset local UI preferences',
-            hint: 'Restore default transcript and composer settings without touching agy session config',
-            control: { k: 'action', act: 'reset-prefs', label: 'Reset defaults' },
-          },
-        ],
-      },
-      {
-        id: 'acp-session',
-        title: sessionRows.length ? 'Server Session Options' : 'No ACP Options Reported',
-        page: 'session',
-        rows: sessionRows.length ? sessionRows : [{
-          id: 'no-acp-options',
-          label: 'No session settings supplied by agy',
-          hint: 'Available options appear here after ACP session creation',
-        }],
-      },
-      {
-        id: 'model-memory',
-        title: 'Model Defaults & Memory',
-        page: 'session',
-        rows: [
-          {
-            id: 'rememberModel',
-            label: 'Remember last selected model & thinking level',
-            hint: `Falls back to ${DEFAULT_MODEL_ID} (${DEFAULT_THINKING_ID}) for new sessions until changed`,
-            changed: userPrefs.rememberModel !== DEFAULT_PREFS.rememberModel,
-            control: { k: 'switch', on: userPrefs.rememberModel },
-          },
-          {
-            id: 'clearRememberedModel',
-            label: 'Reset remembered model choice',
-            hint: userPrefs.lastModel || userPrefs.lastThinking
-              ? `Saved: ${userPrefs.lastModel ?? DEFAULT_MODEL_ID} · ${userPrefs.lastThinking ?? DEFAULT_THINKING_ID}`
-              : `Using built-in default (${DEFAULT_MODEL_ID} · ${DEFAULT_THINKING_ID})`,
-            changed: !!(userPrefs.lastModel || userPrefs.lastThinking),
-            control: { k: 'action', act: 'clear-remembered-model', label: 'Use default' },
-          },
-        ],
-      },
-      {
-        id: 'perms-summary',
-        title: 'Sandbox & Mode',
-        page: 'permissions',
-        rows: [
-          ...(mode && mode.type === 'select' ? [{
-            id: `cfg:${mode.id}`,
-            label: mode.name,
-            hint: 'Session mode supplied by agy; Plan mode does not verify read-only OS enforcement',
-            disabled: lockReason,
-            control: {
-              k: 'choice' as const,
-              value: mode.currentValue,
-              style: 'segmented' as const,
-              options: configValues(mode).map(entry => ({ value: entry.value, label: entry.name })),
-            },
-          }] : []),
-          {
-            id: 'sandbox-flag',
-            label: 'Sandbox status (--sandbox)',
-            hint: 'Requested when launching agy acp; OS containment and allow/deny rules are owned by agy',
-            control: { k: 'action', act: 'open-permissions', label: 'View details' },
-          },
-          {
-            id: 'account-shortcut',
-            label: 'Account & official login',
-            hint: 'Manage shared agy CLI authentication or check quota',
-            control: { k: 'action', act: 'open-account', label: 'Open Account' },
-          },
-        ],
-      },
-      {
-        id: 'keys-list',
-        title: 'Shortcuts',
-        page: 'keys',
-        rows: [
-          { id: 'k-send', label: 'Send message', control: { k: 'keys', keys: [['enter']] } },
-          { id: 'k-newline', label: 'Insert newline', control: { k: 'keys', keys: [['shift', 'enter']] } },
-          { id: 'k-line-edges', label: 'Line start / end (shell style)', control: { k: 'keys', keys: [['ctrl', 'a'], ['ctrl', 'e']] } },
-          { id: 'k-words', label: 'Jump by word', control: { k: 'keys', keys: [['ctrl', 'left'], ['ctrl', 'right']] } },
-          { id: 'k-lines-hist', label: 'Move line / prompt history (when empty)', control: { k: 'keys', keys: [['up'], ['down']] } },
-          { id: 'k-turns', label: 'Jump between user turns in transcript', control: { k: 'keys', keys: [['ctrl', 'up'], ['ctrl', 'down']] } },
-          { id: 'k-kill', label: 'Delete word / line start / line end', control: { k: 'keys', keys: [['ctrl', 'w'], ['ctrl', 'u'], ['ctrl', 'k']] } },
-          { id: 'k-undo', label: 'Undo composer edit', control: { k: 'keys', keys: [['ctrl', 'z']] } },
-          { id: 'k-slash', label: 'Slash commands', control: { k: 'keys', keys: [['/']] } },
-          { id: 'k-at', label: 'Attach file/dir/image (or paste image path)', control: { k: 'keys', keys: [['@']] } },
-          { id: 'k-paste-img', label: 'Attach screenshot from system clipboard', control: { k: 'keys', keys: [['alt', 'v']] } },
-          { id: 'k-stop', label: 'Stop turn / Close modal', control: { k: 'keys', keys: [['esc']] } },
-          { id: 'k-scroll', label: 'Scroll conversation', control: { k: 'keys', keys: [['page_up'], ['page_down']] } },
-          { id: 'k-inspect', label: 'Inspect modal scroll & actions', control: { k: 'keys', keys: [['page_up'], ['page_down'], ['c'], ['s'], ['a']] } },
-          { id: 'k-allow', label: 'Allow / Deny tool once', control: { k: 'keys', keys: [['ctrl', 'y'], ['ctrl', 'n']] } },
-          { id: 'k-quit', label: 'Quit frontend', control: { k: 'keys', keys: [['ctrl', 'q']] } },
-        ],
-      },
-    ]}
+
+  const handleRowReset = (rowId: unknown): void => {
+    if (typeof rowId !== 'string') return;
+    if (rowId === 'clearRememberedModel') {
+      ctx.onUpdatePrefs({ lastModel: undefined, lastThinking: undefined });
+      ctx.onShowToast('Remembered model cleared', `Default for new sessions: ${DEFAULT_MODEL_ID} (${DEFAULT_THINKING_ID})`);
+      return;
+    }
+    const patch = patchForPrefRowReset(rowId);
+    if (patch) {
+      ctx.onUpdatePrefs(patch);
+      ctx.onShowToast('Setting restored to default');
+    }
+  };
+
+  return <prefs key="prefs" title="agy-tern settings" page={activePage}
+    lead={viewData.leadByPage[activePage]} query={ctx.panelDraft.text} cursor={ctx.panelDraft.cursor}
+    focus={focusedRow}
+    pages={viewData.pages}
+    sections={viewData.sections}
+    onEdit={event => ctx.onEditPanelDraft(event)}
+    onSelect={event => {
+      if (isPrefsPageId(event.item)) ctx.onSetPrefsPage(event.item);
+    }}
     onAction={{
       close: ctx.onClosePanel,
       page: event => {
-        if (typeof event.value === 'string') ctx.onSetPrefsPage(event.value);
+        if (!handlePageEvent(event.value)) handlePageEvent(event.item);
       },
+      nav: event => {
+        if (!handlePageEvent(event.value)) handlePageEvent(event.item);
+      },
+      tab: event => {
+        if (!handlePageEvent(event.value)) handlePageEvent(event.item);
+      },
+      reset: event => handleRowReset(event.item ?? event.value),
+      'reset-row': event => handleRowReset(event.item ?? event.value),
+      'reset-all': ctx.onResetPrefs,
       'reset-prefs': ctx.onResetPrefs,
-      'clear-remembered-model': () => {
-        ctx.onUpdatePrefs({ lastModel: undefined, lastThinking: undefined });
-        ctx.onShowToast('Remembered model cleared', `Default for new sessions: ${DEFAULT_MODEL_ID} (${DEFAULT_THINKING_ID})`);
-      },
+      'clear-remembered-model': () => handleRowReset('clearRememberedModel'),
+      'check-updates': () => ctx.onCheckUpdates?.(),
       'open-permissions': () => ctx.onOpenPanel({ kind: 'permissions' }),
       'open-account': () => ctx.onOpenPanel({ kind: 'account' }),
     }}
     onChange={event => {
       const key = event.item;
+      if ((!key || key === 'page' || event.name === 'page') && handlePageEvent(event.value)) {
+        return;
+      }
       if (!key) return;
-      if (key === 'diffMode' && (event.value === 'auto' || event.value === 'unified' || event.value === 'split')) {
-        ctx.onUpdatePrefs({ diffMode: event.value as DiffMode });
-      } else if (key === 'toolDisplay' && (event.value === 'compact' || event.value === 'expanded')) {
-        ctx.onUpdatePrefs({ toolDisplay: event.value as ToolDisplay });
-      } else if (key === 'thoughtExpanded' && typeof event.value === 'boolean') {
-        ctx.onUpdatePrefs({ thoughtExpanded: event.value });
-      } else if (key === 'transcriptDensity' && (event.value === 'comfortable' || event.value === 'compact')) {
-        ctx.onUpdatePrefs({ transcriptDensity: event.value as TranscriptDensity });
-      } else if (key === 'showTimestamps' && typeof event.value === 'boolean') {
-        ctx.onUpdatePrefs({ showTimestamps: event.value });
-      } else if (key === 'autoPreviewMedia' && typeof event.value === 'boolean') {
-        ctx.onUpdatePrefs({ autoPreviewMedia: event.value });
-      } else if (key === 'notifyOnTurnComplete' && typeof event.value === 'boolean') {
-        ctx.onUpdatePrefs({ notifyOnTurnComplete: event.value });
-      } else if (key === 'rememberModel' && typeof event.value === 'boolean') {
-        ctx.onUpdatePrefs({ rememberModel: event.value });
-      } else if (key === 'showKeyLegend' && typeof event.value === 'boolean') {
-        ctx.onUpdatePrefs({ showKeyLegend: event.value });
-      } else if (key === 'composerLines') {
-        const n = Number(event.value);
-        if (n === 4 || n === 6 || n === 10) ctx.onUpdatePrefs({ composerLines: n as ComposerLines });
-      } else if (key === 'maxFps') {
-        const fps = Number(event.value);
-        if (Number.isFinite(fps) && fps >= 5 && fps <= 60) ctx.onUpdatePrefs({ maxFps: fps });
-      } else if (key === 'motion' && (event.value === 'auto' || event.value === 'full' || event.value === 'reduced')) {
-        ctx.onUpdatePrefs({ motion: event.value as MotionPref });
-      } else if (key.startsWith('cfg:')) {
-        const configId = key.slice(4);
+      ctx.onSetPrefsFocus?.(key);
+
+      const localPatch = patchForLocalPrefChange(key, event);
+      if (localPatch) {
+        ctx.onUpdatePrefs(localPatch);
+        return;
+      }
+
+      const configId = stripConfigPrefix(key);
+      if (configId) {
         const option = metadata.configOptions.find(candidate => candidate.id === configId);
-        if (option && (typeof event.value === 'string' || typeof event.value === 'boolean')) {
-          ctx.onChangeConfig(option, event.value);
-        }
+        if (!option) return;
+        const val = typeof event.value === 'string' ? event.value : extractChangeBoolean(event);
+        if (val !== undefined) ctx.onChangeConfig(option, val);
       }
     }} />;
 }

@@ -103,13 +103,43 @@ describe('agy-tern native Tern E2E smoke', () => {
     await harness.waitForText('"channel":"stable"', 'main', 6_000);
     harness.assertWireInvariants();
 
-    // Verify /settings exposes maxFps and motion controls cleanly.
+    // Verify /settings navigation (clicks + keyboard), switches, choices, and sub-panel return cleanly.
     harness.sendText('/settings');
     harness.sendKey('enter');
     const prefsNode = await harness.waitForNode(node => node.k === 'prefs', 5_000);
     const prefsJson = JSON.stringify(prefsNode.p);
     expect(prefsJson).toContain('"id":"maxFps"');
     expect(prefsJson).toContain('"id":"motion"');
+    expect(prefsNode.p['page']).toBe('appearance');
+    expect(prefsNode.p['focus']).toBe('diffMode');
+
+    // Keyboard: Right changes diffMode (auto -> unified); Down+Down+Enter flips thoughtExpanded switch.
+    harness.sendKey('right');
+    await harness.waitForNode(node => node.k === 'prefs' && JSON.stringify(node.p).includes('"value":"unified"'), 4_000);
+    harness.sendKey('down');
+    harness.sendKey('down');
+    harness.sendKey('enter');
+    await harness.waitForNode(
+      node => node.k === 'prefs' && /"id":"thoughtExpanded"[^}]*"on":true/.test(JSON.stringify(node.p)),
+      4_000,
+    );
+
+    // Click navigation & click switch via Tern wire events (`change` with `value` / `on`).
+    harness.sendChange('layer.prefs', { value: 'session' });
+    await harness.waitForNode(node => node.k === 'prefs' && node.p['page'] === 'session', 4_000);
+    harness.sendAction('layer.prefs', 'page', { value: 'permissions' });
+    await harness.waitForNode(node => node.k === 'prefs' && node.p['page'] === 'permissions', 4_000);
+    harness.sendChange('layer.prefs', { item: 'showTimestamps', on: false });
+    await harness.waitForNode(
+      node => node.k === 'prefs' && /"id":"showTimestamps"[^}]*"on":false/.test(JSON.stringify(node.p)),
+      4_000,
+    );
+
+    // Trigger View details on permissions page -> Esc returns back to /settings instead of closing modal.
+    harness.sendAction('layer.prefs', 'open-permissions');
+    await harness.waitForText('Permissions & Sandbox', 'layer', 4_000);
+    harness.sendKey('esc');
+    await harness.waitForNode(node => node.k === 'prefs' && node.p['page'] === 'permissions', 4_000);
     harness.assertWireInvariants();
 
     harness.sendKey('esc');

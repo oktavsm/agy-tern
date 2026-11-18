@@ -113,6 +113,12 @@ import {
   stepPickerKey,
 } from './picker-nav';
 import {
+  buildSettingsViewData,
+  isPrefsPageId,
+  stepSettingsKey,
+  type UpdateStatusState,
+} from './settings-nav';
+import {
   clockTime,
   copyToClipboard,
   Entry,
@@ -330,6 +336,9 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     ...(launch?.motion !== undefined ? { motion: launch.motion } : {}),
   };
   let prefsPage = 'appearance';
+  let prefsFocus: string | undefined;
+  let updateStatus: UpdateStatusState | undefined;
+  let settingsChildPanel = false;
   let pickerTab = 'all';
   let pickerSelected = '';
   let usageTab = 'overview';
@@ -473,6 +482,31 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     }).catch(error => {
       if (!quitting) showToast('Could not reset preferences', error instanceof Error ? error.message : String(error));
     });
+  }
+
+  function checkUpdatesManually(): void {
+    if (quitting || updateStatus?.checking) return;
+    updateStatus = { checking: true };
+    render();
+    void import('./updater')
+      .then(async m => {
+        const latestTag = await m.resolveLatestTag({ signal: AbortSignal.timeout(5_000) });
+        const updateAvailable = m.compareSemver(latestTag, m.CURRENT_VERSION) > 0;
+        if (quitting) return;
+        updateStatus = { checking: false, latestTag, updateAvailable };
+        showToast(
+          updateAvailable ? `Update available: ${latestTag}` : `Up to date (v${m.CURRENT_VERSION})`,
+          updateAvailable ? 'Run `agy-tern update` in your terminal to upgrade' : undefined,
+        );
+        render();
+      })
+      .catch(error => {
+        if (quitting) return;
+        const message = error instanceof Error ? error.message : String(error);
+        updateStatus = { checking: false, error: message };
+        showToast('Update check failed', message);
+        render();
+      });
   }
 
   function clearPermissions(): void {
@@ -981,6 +1015,9 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     if (current.kind === 'mcp-add') return { kind: 'mcp' };
     if (current.kind === 'plugin-install') return { kind: 'plugins' };
     if (current.kind === 'account-switch') return { kind: 'account' };
+    if ((current.kind === 'permissions' || current.kind === 'account' || current.kind === 'config') && settingsChildPanel) {
+      return { kind: 'settings' };
+    }
     return undefined;
   }
 
@@ -995,6 +1032,8 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       return;
     }
     inspectReturnPanel = undefined;
+    settingsChildPanel = false;
+    prefsFocus = undefined;
     panel = undefined;
     panelError = '';
     sessionSearchToken++;
@@ -1574,6 +1613,15 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     if (permissions.length || quitting) return;
     reportAbort?.abort();
     extAbort?.abort();
+    const prevPanel = panel;
+    if (next.kind === 'settings') {
+      settingsChildPanel = false;
+    } else if (prevPanel?.kind === 'settings' &&
+      (next.kind === 'permissions' || next.kind === 'account' || next.kind === 'config')) {
+      settingsChildPanel = true;
+    } else if (!(settingsChildPanel && (next.kind === 'account-switch' || next.kind === 'account'))) {
+      settingsChildPanel = false;
+    }
     panel = next;
     const name = next.kind === 'rename' ? localNames.get(next.sessionId) ?? sessionInfo.get(next.sessionId)?.title ?? '' : '';
     panelDraft = { text: name, cursor: name.length };
@@ -1644,7 +1692,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         if (option.category === 'model' || option.id === 'model') updatePrefs({ lastModel: value });
         else if (option.category === 'thought_level' || option.id === 'thought_level') updatePrefs({ lastThinking: value });
       }
-      if (!quitting && panel?.kind !== 'settings') closePanel();
+      if (!quitting && panel?.kind !== 'settings') stepBackPanel();
       else if (!quitting) showToast(`${option.name} updated`);
     }).catch(error => {
       panelError = error instanceof Error ? error.message : String(error);
@@ -2223,6 +2271,8 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       pickerTab,
       pickerSelected,
       prefsPage,
+      prefsFocus,
+      updateStatus,
       usageTab,
       panelError,
       userPrefs,
@@ -2261,8 +2311,14 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         render();
       },
       onSetPrefsPage: page => {
+        if (!isPrefsPageId(page)) return;
         prefsPage = page;
+        prefsFocus = undefined;
+        panelDraft = { text: '', cursor: 0 };
         render();
+      },
+      onSetPrefsFocus: rowId => {
+        prefsFocus = rowId;
       },
       onSetUsageTab: tab => {
         usageTab = tab;
@@ -2272,6 +2328,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       onClosePanel: closePanel,
       onUpdatePrefs: updatePrefs,
       onResetPrefs: resetPrefs,
+      onCheckUpdates: checkUpdatesManually,
       onShowToast: showToast,
       onChangeConfig: changeConfig,
       onChooseCommand: chooseCommand,
@@ -3246,8 +3303,11 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
             void import('./updater')
               .then(m => m.checkForUpdatePassive())
               .then(res => {
-                if (res && !quitting && !panel && !toastMessage) {
-                  showToast(`Update available: ${res.latestTag}`, 'Run `agy-tern update` to upgrade');
+                if (res && !quitting) {
+                  updateStatus = { checking: false, latestTag: res.latestTag, updateAvailable: res.updateAvailable };
+                  if (!panel && !toastMessage) {
+                    showToast(`Update available: ${res.latestTag}`, 'Run `agy-tern update` to upgrade');
+                  }
                 }
               })
               .catch(() => {});
@@ -3396,12 +3456,70 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
           continue;
         }
         if (current.kind === 'settings') {
-          const pages = ['appearance', 'session', 'permissions', 'keys'];
-          if (key.name === 'tab') {
-            const idx = Math.max(0, pages.indexOf(prefsPage));
-            prefsPage = pages[(idx + (key.shift ? pages.length - 1 : 1)) % pages.length]!;
-          } else {
-            panelDraft = draftKey(panelDraft, key).draft;
+          const settingsView = buildSettingsViewData({
+            userPrefs,
+            metadata,
+            modeOption: modeOption(),
+            options,
+            workspaceName,
+            agent,
+            disconnected,
+            agentConnecting,
+            busy,
+            changingConfig,
+            sessionOperation,
+            updateStatus,
+          });
+          const step = stepSettingsKey(
+            { page: prefsPage, focusRowId: prefsFocus, draft: panelDraft },
+            key,
+            settingsView.sections,
+          );
+          prefsPage = step.page;
+          prefsFocus = step.focusRowId;
+          panelDraft = step.draft;
+          const effect = step.effect;
+          if (effect) {
+            if (effect.kind === 'prefs') {
+              updatePrefs(effect.patch);
+              continue;
+            }
+            if (effect.kind === 'config') {
+              const opt = metadata.configOptions.find(candidate => candidate.id === effect.optionId);
+              if (opt) changeConfig(opt, effect.value);
+              continue;
+            }
+            if (effect.kind === 'open-config') {
+              openPanel({ kind: 'config', id: effect.optionId });
+              continue;
+            }
+            if (effect.kind === 'disabled') {
+              showToast('Option locked', effect.reason);
+              continue;
+            }
+            if (effect.kind === 'action') {
+              if (effect.act === 'reset-prefs') {
+                resetPrefs();
+                continue;
+              }
+              if (effect.act === 'clear-remembered-model') {
+                updatePrefs({ lastModel: undefined, lastThinking: undefined });
+                showToast('Remembered model cleared', `Default for new sessions: ${DEFAULT_MODEL_ID} (${DEFAULT_THINKING_ID})`);
+                continue;
+              }
+              if (effect.act === 'open-permissions') {
+                openPanel({ kind: 'permissions' });
+                continue;
+              }
+              if (effect.act === 'open-account') {
+                openPanel({ kind: 'account' });
+                continue;
+              }
+              if (effect.act === 'check-updates') {
+                checkUpdatesManually();
+                continue;
+              }
+            }
           }
           render();
           continue;

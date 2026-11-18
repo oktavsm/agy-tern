@@ -2,6 +2,18 @@
 
 All notable changes to `agy-tern` are documented in this file.
 
+## [0.2.1] - 2026-11-18
+
+### Added
+- Full keyboard navigation inside `/settings` (`Up`/`Down`/`Home`/`End`/`PageUp`/`PageDown` row focus, `Left`/`Right` option stepping, `Enter`/`Space` switch toggles and actions, `Tab`/`Shift+Tab` and `Alt+1..4` page switching).
+- Frontend version readout and interactive `Check for updates` action in `/settings`, backed by GitHub Releases.
+- `Esc` / completion return stack from `/settings` sub-panels (`permissions`, `account`, `config` pickers) back to the active settings page.
+
+### Fixed
+- Fixed `/settings` sidebar page navigation clicks (`onChange` value/item, `onSelect`, `onAction`) and per-row `Reset` actions.
+- Fixed all boolean switch controls in `/settings` by reading Tern `ChangeEvent.on` and `ChangeEvent.checked` fields in addition to `value`.
+- Eliminated duplicate `cfg:mode` row IDs between `Session & Model` and `Permissions & Sandbox` using distinct `perm:mode` routing.
+
 ## [0.2.0] - 2026-11-18
 
 ### Added
