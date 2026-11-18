@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  listAvailableBrainSessionIds,
   PromptHistoryStore,
   readOfficialBrainTranscript,
   readSessionPreview,
@@ -101,6 +102,14 @@ describe('local transcript store & official brain log reader', () => {
       lastUser: 'audit project',
       lastAgent: 'Audit complete.',
     });
+    expect(preview?.searchText).toContain('audit project');
+    expect(preview?.searchText).toContain('audit complete.');
+    const brainIds = await listAvailableBrainSessionIds(appData);
+    expect(brainIds.has(sessionId)).toBe(true);
+    expect(await readSessionPreview('00000000-0000-4000-8000-000000000099', undefined, {
+      appDataDir: appData,
+      knownBrainIds: brainIds,
+    })).toBeUndefined();
 
     const richer = selectRicherTranscript(
       { source: 'cache', truncated: false, entries: loaded!.entries.slice(0, 1) },

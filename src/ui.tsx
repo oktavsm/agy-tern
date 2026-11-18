@@ -4,7 +4,7 @@ import { basename, resolve } from 'node:path';
 import { connect, type DiffHunk, type EditEvent, type JSX, type Renderable, type Session, type Surface, type Tone } from '@stencil-hq/tern';
 import type { AuthMethodTerminal, SessionConfigOption, SessionInfo } from '@agentclientprotocol/sdk';
 import { connectAgent } from './agent';
-import { terminalLoginProblem, type AgentAuthentication, type AgentMetadata, type AgentOptions, type AgentSession, type ElicitationPrompt, type PermissionPrompt, type ResourceAttachment } from './contracts';
+import { terminalLoginProblem, type AgentAuthentication, type AgentMetadata, type AgentOptions, type AgentSession, type ConnectionStage, type ElicitationPrompt, type PermissionPrompt, type ResourceAttachment } from './contracts';
 import {
   createFollowUpSessionState,
   formatFollowUpPromptReply,
@@ -34,7 +34,16 @@ import {
   type PluginValidationReport,
 } from './extensions';
 import { readOfficialReport, type OfficialReport } from './reports';
-import { PromptHistoryStore, readOfficialBrainTranscript, readSessionPreview, selectRicherTranscript, TranscriptStore, type SessionPreview } from './history';
+import {
+  buildSessionPreviewFromEntries,
+  listAvailableBrainSessionIds,
+  PromptHistoryStore,
+  readOfficialBrainTranscript,
+  readSessionPreview,
+  selectRicherTranscript,
+  TranscriptStore,
+  type SessionPreview,
+} from './history';
 import { SessionNames } from './session-names';
 import { PromptTemplatesStore, type PromptTemplate } from './templates';
 import { openInTernSplit, runCommandInTernSplit, sendTerminalAttention } from './tern-window';
@@ -247,10 +256,21 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
   const replayCoordinator = new HistoryReplayCoordinator();
   const pathPresenceCache = new AsyncPathPresenceCache();
   let listedSessions: SessionInfo[] = [];
+  let allListedSessions: SessionInfo[] = [];
   let nextSessionsCursor: string | undefined;
+  let allNextSessionsCursor: string | undefined;
   let sessionsLoading = false;
+  let allSessionsLoading = false;
   let sessionsLoadedAt = 0;
+  let allSessionsLoadedAt = 0;
   let sessionsPrefetchInFlight: Promise<void> | undefined;
+  let allSessionsPrefetchInFlight: Promise<void> | undefined;
+  let sessionIndexing: { done: number; total: number } | undefined;
+  let sessionSearchToken = 0;
+  let connectionStage: ConnectionStage | undefined;
+  let connectStartedAt: number | undefined;
+  let startupSyncingConfig = false;
+  const externalTranscriptStores = new Map<string, TranscriptStore>();
   let lastWorkspaceIndexAt = 0;
   let sessionOperation: string | undefined;
   let sessionTask: Promise<void> | undefined;
@@ -615,10 +635,82 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     replayPlaceholderId = undefined;
   }
 
+  function storeForSessionCwd(rowCwd?: string): TranscriptStore {
+    if (!rowCwd || rowCwd === options.cwd) return transcriptStore;
+    let store = externalTranscriptStores.get(rowCwd);
+    if (!store) {
+      store = new TranscriptStore(rowCwd);
+      externalTranscriptStores.set(rowCwd, store);
+    }
+    return store;
+  }
+
+  function warmSessionSearchIndex(rows: readonly SessionInfo[]): void {
+    const missing = rows.filter(row => row.sessionId && !sessionPreviewCache.has(row.sessionId));
+    if (!missing.length || quitting) {
+      sessionIndexing = undefined;
+      return;
+    }
+    const token = ++sessionSearchToken;
+    const total = missing.length;
+    let done = 0;
+    sessionIndexing = { done, total };
+    void (async () => {
+      const [knownBrainIds, knownCacheFiles] = await Promise.all([
+        listAvailableBrainSessionIds(),
+        transcriptStore.listCachedFiles(),
+      ]);
+      if (quitting || token !== sessionSearchToken) return;
+      const activeSid = stateManager.activeSessionId;
+      if (activeSid) {
+        const activeConv = stateManager.getConversation();
+        if (activeConv.entries.length && !sessionPreviewCache.has(activeSid)) {
+          sessionPreviewCache.set(activeSid, buildSessionPreviewFromEntries(activeConv.entries, 'cache', false));
+        }
+      }
+      let cursor = 0;
+      const workerCount = Math.min(6, missing.length);
+      const runWorker = async (): Promise<void> => {
+        while (cursor < missing.length && !quitting && token === sessionSearchToken) {
+          const row = missing[cursor++]!;
+          const sid = row.sessionId;
+          if (!sessionPreviewCache.has(sid)) {
+            const store = storeForSessionCwd(row.cwd);
+            const isLocalStore = store === transcriptStore;
+            const preview = await readSessionPreview(sid, store, {
+              maxReadBytes: 96_000,
+              maxEntries: 30,
+              ...(isLocalStore ? { knownCacheFiles } : {}),
+              knownBrainIds,
+            }).catch(() => undefined);
+            sessionPreviewCache.set(sid, preview ?? null);
+          }
+          done++;
+          sessionIndexing = { done, total };
+          if (done % 12 === 0 && !quitting && panel?.kind === 'sessions') scheduleRender();
+        }
+      };
+      await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
+    })().catch(() => {}).finally(() => {
+      if (token !== sessionSearchToken) return;
+      sessionIndexing = undefined;
+      if (!quitting && panel?.kind === 'sessions') scheduleRender();
+    });
+  }
+
   function requestSessionPreview(id: string): void {
     if (!id || sessionPreviewCache.has(id) || sessionPreviewInFlight.has(id) || quitting) return;
+    if (id === stateManager.activeSessionId) {
+      const activeConv = stateManager.getConversation();
+      if (activeConv.entries.length) {
+        sessionPreviewCache.set(id, buildSessionPreviewFromEntries(activeConv.entries, 'cache', false));
+        if (!quitting && panel?.kind === 'sessions') scheduleRender();
+        return;
+      }
+    }
     sessionPreviewInFlight.add(id);
-    void readSessionPreview(id, transcriptStore).then(preview => {
+    const store = storeForSessionCwd(sessionInfo.get(id)?.cwd);
+    void readSessionPreview(id, store).then(preview => {
       sessionPreviewInFlight.delete(id);
       sessionPreviewCache.set(id, preview ?? null);
       if (!quitting && panel?.kind === 'sessions') scheduleRender();
@@ -905,6 +997,8 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     inspectReturnPanel = undefined;
     panel = undefined;
     panelError = '';
+    sessionSearchToken++;
+    sessionIndexing = undefined;
     gitDiffCache.clear();
     cachedDiffsConversation = undefined;
     cachedSessionDiffs = [];
@@ -1019,37 +1113,81 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     });
   }
 
-  function loadSessions(append = false, silent = false): void {
+  function loadSessions(append = false, silent = false, allWorkspaces = false): void {
     const active = agent;
     if (!active?.capabilities.listSessions || disconnected || quitting) return;
-    if (sessionsPrefetchInFlight && !append) return;
-    sessionsLoading = true;
+    const inFlight = allWorkspaces ? allSessionsPrefetchInFlight : sessionsPrefetchInFlight;
+    if (inFlight && !append) {
+      if (!silent) {
+        if (allWorkspaces) allSessionsLoading = true;
+        else sessionsLoading = true;
+        panelError = '';
+        render();
+      }
+      return;
+    }
+    if (allWorkspaces) allSessionsLoading = true;
+    else sessionsLoading = true;
     if (!silent) { panelError = ''; render(); }
     const task = (async () => {
-      const response = await active.listSessions(append ? nextSessionsCursor : undefined);
-      if (quitting) return;
-      const rows = new Map((append ? listedSessions : []).map(row => [row.sessionId, row]));
-      for (const row of response.sessions) {
-        rows.set(row.sessionId, row);
-        sessionInfo.set(row.sessionId, row);
+      let cursor = append ? (allWorkspaces ? allNextSessionsCursor : nextSessionsCursor) : undefined;
+      const rows = new Map((append ? (allWorkspaces ? allListedSessions : listedSessions) : []).map(row => [row.sessionId, row]));
+      const maxPages = append ? 1 : 5;
+      for (let page = 0; page < maxPages; page++) {
+        const response = await active.listSessions(cursor, allWorkspaces ? { allWorkspaces: true } : undefined);
+        if (quitting) return;
+        for (const row of response.sessions) {
+          rows.set(row.sessionId, row);
+          sessionInfo.set(row.sessionId, row);
+        }
+        const merged = [...rows.values()];
+        cursor = response.nextCursor ?? undefined;
+        if (allWorkspaces) {
+          allListedSessions = merged;
+          allNextSessionsCursor = cursor;
+          allSessionsLoadedAt = Date.now();
+        } else {
+          listedSessions = merged;
+          nextSessionsCursor = cursor;
+          sessionsLoadedAt = Date.now();
+        }
+        if (page === 0 && !append) panelSelection = 0;
+        if (!quitting && panel?.kind === 'sessions') render();
+        const missingNameIds = response.sessions
+          .map(row => row.sessionId)
+          .filter(id => !localNames.has(id));
+        if (missingNameIds.length) {
+          const foundNames = await names.getMany(missingNameIds);
+          let changed = false;
+          for (const [sid, found] of foundNames) {
+            if (found) changed = true;
+            localNames.set(sid, found);
+          }
+          if (changed && !quitting && panel?.kind === 'sessions') scheduleRender();
+        }
+        if (!cursor) break;
       }
-      listedSessions = [...rows.values()];
-      nextSessionsCursor = response.nextCursor ?? undefined;
-      sessionsLoadedAt = Date.now();
-      await Promise.all(response.sessions.map(async row => {
-        localNames.set(row.sessionId, await names.get(row.sessionId));
-      }));
-      if (!append) panelSelection = 0;
+      if (!quitting && panel?.kind === 'sessions') {
+        warmSessionSearchIndex(allWorkspaces ? allListedSessions : listedSessions);
+      }
     })().catch(error => {
       if (!quitting && !silent) {
         panelError = error instanceof Error ? error.message : String(error);
       }
     }).finally(() => {
-      if (sessionsPrefetchInFlight === task) sessionsPrefetchInFlight = undefined;
-      sessionsLoading = false;
+      if (allWorkspaces) {
+        if (allSessionsPrefetchInFlight === task) allSessionsPrefetchInFlight = undefined;
+        allSessionsLoading = false;
+      } else {
+        if (sessionsPrefetchInFlight === task) sessionsPrefetchInFlight = undefined;
+        sessionsLoading = false;
+      }
       if (!quitting) render();
     });
-    if (!append) sessionsPrefetchInFlight = task;
+    if (!append) {
+      if (allWorkspaces) allSessionsPrefetchInFlight = task;
+      else sessionsPrefetchInFlight = task;
+    }
   }
 
   function loadExtensions(kind: 'mcp' | 'plugins' | 'agents'): void {
@@ -1252,6 +1390,16 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     }).catch(() => {});
   }
 
+  function startupStageLabel(stage: ConnectionStage | undefined): string {
+    switch (stage) {
+      case 'spawning': return 'Starting agy process (1/4)';
+      case 'initializing': return 'Checking ACP & account auth (2/4)';
+      case 'opening_session': return 'Opening workspace session (3/4)';
+      case 'syncing_config': return 'Syncing model & mode (4/4)';
+      default: return phase || 'Connecting to Antigravity';
+    }
+  }
+
   function startConfigSync(
     connected: AgentSession,
     allowExplicitWarnings: boolean,
@@ -1259,13 +1407,20 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
   ): Promise<void> {
     const token = ++configSyncToken;
     const sessionId = connected.sessionId;
+    startupSyncingConfig = true;
+    connectionStage = 'syncing_config';
+    if (!busy && !sessionOperation && !disconnected) scheduleRender();
     const task = applyPreferredConfigOptions(
       connected,
       allowExplicitWarnings,
       applyDefaults,
       () => quitting || token !== configSyncToken || connected.sessionId !== sessionId,
     ).catch(() => {}).finally(() => {
-      if (!quitting && token === configSyncToken) scheduleRender();
+      if (!quitting && token === configSyncToken) {
+        startupSyncingConfig = false;
+        if (connectionStage === 'syncing_config') connectionStage = undefined;
+        scheduleRender();
+      }
     });
     configSyncPromise = task;
     return task;
@@ -1428,6 +1583,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     pickerSelected = '';
     if (next.kind === 'report') usageTab = 'overview';
     if (next.kind === 'changes') pickerTab = 'edits';
+    if (next.kind === 'sessions') pickerTab = 'workspace';
     if (next.kind !== 'inspect') inspectReturnPanel = undefined;
     if (next.kind === 'config') {
       const option = metadata.configOptions.find(candidate => candidate.id === next.id);
@@ -1456,8 +1612,13 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     if (next.kind === 'mcp' || next.kind === 'plugins' || next.kind === 'agents') loadExtensions(next.kind);
     if (next.kind === 'templates') loadTemplates();
     if (next.kind === 'sessions' && agent?.capabilities.listSessions) {
-      if (!sessionsPrefetchInFlight && (!listedSessions.length || Date.now() - sessionsLoadedAt >= 3_000)) {
-        loadSessions(false, listedSessions.length > 0);
+      if (sessionsPrefetchInFlight) {
+        sessionsLoading = true;
+        render();
+      } else if (!listedSessions.length || Date.now() - sessionsLoadedAt >= 3_000) {
+        loadSessions(false, false, false);
+      } else {
+        warmSessionSearchIndex(listedSessions);
       }
     }
     if (next.kind === 'changes') {
@@ -2036,14 +2197,18 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       reportLoading,
       reportText,
       sessionsLoading,
+      allSessionsLoading,
       sessionOperation,
       activeSessionId: stateManager.activeSessionId,
       previousSessionId,
       listedSessions,
+      allListedSessions,
       nextSessionsCursor,
+      allNextSessionsCursor,
       sessionInfo,
       localNames,
       sessionPreviews: sessionPreviewCache,
+      sessionIndexing,
       mcpServers,
       pluginsList,
       agentsList,
@@ -2079,6 +2244,16 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       onSetPickerTab: (tab, clearSelected) => {
         pickerTab = tab;
         if (clearSelected) pickerSelected = '';
+        if (panel?.kind === 'sessions' && tab === 'all' && agent?.capabilities.listSessions) {
+          if (allSessionsPrefetchInFlight) {
+            allSessionsLoading = true;
+          } else if (!allListedSessions.length || Date.now() - allSessionsLoadedAt >= 15_000) {
+            loadSessions(false, false, true);
+            return;
+          } else {
+            warmSessionSearchIndex(allListedSessions);
+          }
+        }
         render();
       },
       onSetPickerSelected: item => {
@@ -2102,7 +2277,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       onChooseCommand: chooseCommand,
       onOpenConversation: openConversation,
       onNewConversation: newConversation,
-      onLoadSessions: append => loadSessions(append),
+      onLoadSessions: (append, allWorkspaces) => loadSessions(Boolean(append), false, Boolean(allWorkspaces)),
       onCloseSavedSession: closeSavedSession,
       onRequestSessionPreview: requestSessionPreview,
       onLoadExtensions: loadExtensions,
@@ -2215,15 +2390,17 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     const rowsNow = viewportRows();
     const colsNow = viewportCols();
     const showComposerBar = rowsNow >= 18;
-    const showHud = !!(busy || activeTools.length > 0 || (planSummary && activePlan) || (!showComposerBar && contextUsage));
+    const startupBusy = agentConnecting || startupSyncingConfig || Boolean(sessionOperation);
+    const startupLabel = sessionOperation ?? startupStageLabel(connectionStage);
+    const showHud = !!(busy || startupBusy || activeTools.length > 0 || (planSummary && activePlan) || (!showComposerBar && contextUsage));
     const activeToolTop = activeTools.at(-1);
     const activeToolSummary = activeToolTop ? summarizeToolCall(activeToolTop.call, options.cwd) : undefined;
     const liveTaskLabel = activeToolSummary
       ? `Running${activeTools.length > 1 ? ` (${activeTools.length})` : ''}: ${activeToolSummary.title}${activeToolSummary.target ? ` · ${compactToolHeaderText(activeToolSummary.target, 36)}` : ''}`
       : phase;
     const hudAgeMs = rc.stableAge(
-      activeToolTop ? `hud:${activeToolTop.id}` : 'hud:turn',
-      activeToolTop?.startedAt ?? turnStartedAt,
+      activeToolTop ? `hud:${activeToolTop.id}` : startupBusy ? 'hud:startup' : 'hud:turn',
+      activeToolTop?.startedAt ?? (startupBusy ? connectStartedAt : turnStartedAt),
     );
     const layout = currentResponsiveLayout({
       hasPermission: !!permission,
@@ -2356,9 +2533,14 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
           </row>}
           {visibleEntries.length ? visibleEntries.map(renderEntryNode) :
             <col key="empty-wrap" gap={layout.compactEmpty ? 'sm' : 'md'} align="center">
-              <empty icon={layout.compactEmpty ? undefined : 'tern'} title={agent ? 'Ask Antigravity about this project' : disconnected ? 'Antigravity is unavailable' : 'Opening an ACP session'}
-                text={layout.compactEmpty ? (agent ? 'Use / for commands or @ for files & dirs.' : disconnected ? 'Open /account to sign in.' : 'Opening ACP session...') : (agent ? 'Type / for commands or @ to attach files, directories, and images (including gitignored entries). Thoughts, diffs, and one-time approvals appear here.' :
-                  disconnected ? 'Open /account to sign in, or Quit to return to your shell.' : 'The official agy process handles authentication and tools.')} />
+              {!agent && !disconnected && <row key="startup-progress" gap="sm" align="center">
+                <spinner style="starburst" />
+                <shimmer text={startupStageLabel(connectionStage)} />
+                <elapsed age={hudAgeMs} />
+              </row>}
+              <empty icon={layout.compactEmpty ? undefined : 'tern'} title={agent ? 'Ask Antigravity about this project' : disconnected ? 'Antigravity is unavailable' : 'Connecting to Antigravity'}
+                text={layout.compactEmpty ? (agent ? 'Use / for commands or @ for files & dirs.' : disconnected ? 'Open /account to sign in.' : startupStageLabel(connectionStage)) : (agent ? 'Type / for commands or @ to attach files, directories, and images (including gitignored entries). Thoughts, diffs, and one-time approvals appear here.' :
+                  disconnected ? 'Open /account to sign in, or Quit to return to your shell.' : 'Initializing ACP subprocess, verifying shared agy authentication, and opening session...')} />
               {agent && !disconnected && !permission && rowsNow >= 20 && <suggestions variant="chips"
                 items={[
                   { id: 'explain', text: 'Summarize this project structure', icon: 'compass' },
@@ -2379,7 +2561,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         <col key="shell" role="agy.dock.center" max={{ w: '92ch' }} gap="xs">
           {showHud && <row key="hud" role="omp.working" justify="between" align="center" gap="sm" wrap>
             <row gap="sm" align="center" wrap>
-              {(busy || activeTools.length > 0) && <row key="live-turn" gap="sm" align="center">
+              {(busy || activeTools.length > 0) ? <row key="live-turn" gap="sm" align="center">
                 <spinner style="starburst" />
                 <shimmer text={liveTaskLabel} />
                 <elapsed age={hudAgeMs} />
@@ -2387,6 +2569,10 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
                 <button size="sm" variant="danger" disabled={cancelling && 'Cancellation requested'} onClick={stop}>
                   {cancelling ? 'Stopping...' : 'Stop'}
                 </button>
+              </row> : startupBusy && <row key="startup-hud" gap="sm" align="center">
+                <spinner style="starburst" />
+                <shimmer text={startupLabel} />
+                <elapsed age={hudAgeMs} />
               </row>}
               {activePlan && planSummary && <checklist key="plan-hud" mode="hud"
                 note={`${planSummary.done}/${planSummary.total}`}
@@ -2833,9 +3019,16 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       if (quitting || agentConnecting) return Promise.resolve();
       agentConnecting = true;
       disconnected = false;
+      connectStartedAt = Date.now();
+      connectionStage = 'spawning';
       phase = resumeId ? 'Reconnecting to Antigravity' : 'Connecting to Antigravity';
       render();
       return connectAgent({ ...options, signal }, {
+        connectionStage(stage) {
+          if (quitting) return;
+          connectionStage = stage;
+          render();
+        },
         authentication(next) {
           if (!quitting) { authentication = next; authenticationKnown = true; render(); }
         },
@@ -2971,6 +3164,8 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
           if (quitting) return;
           agent = undefined;
           agentConnecting = false;
+          startupSyncingConfig = false;
+          connectionStage = undefined;
           disconnected = true;
           phase = 'Disconnected';
           clearPermissions();
@@ -3037,11 +3232,12 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
           }
         }
         if (quitting) return;
+        if (!startupSyncingConfig) connectionStage = undefined;
         phase = replayCoordinator.isReplaying ? 'Syncing history' : 'Ready';
         render();
         if (!replayCoordinator.isReplaying) surface?.scroll('main.conversation', 'end');
         if (!resumeId && connected.capabilities.listSessions && !listedSessions.length) {
-          loadSessions(false, true);
+          loadSessions(false, true, false);
         }
         if (resumeId) showToast('Reconnected to Antigravity');
         else if (launch?.initialPrompt && !disconnected) submitPrompt(launch.initialPrompt);
@@ -3049,6 +3245,8 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         if (quitting) return;
         agent = undefined;
         agentConnecting = false;
+        startupSyncingConfig = false;
+        connectionStage = undefined;
         disconnected = true;
         phase = 'Connection failed';
         clearPermissions();
@@ -3289,12 +3487,17 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
               if (chosenPath) { closePanel(); attachFile(chosenPath); }
             };
           } else if (current.kind === 'sessions') {
-            const rows = new Map(listedSessions.map(row => [row.sessionId, row]));
+            const sourceRows = pickerTab === 'workspace'
+              ? listedSessions
+              : (allListedSessions.length ? allListedSessions : listedSessions);
+            const rows = new Map(sourceRows.map(row => [row.sessionId, row]));
             const sid = stateManager.activeSessionId;
             if (sid) rows.set(sid, sessionInfo.get(sid) ?? { sessionId: sid, cwd: options.cwd });
-            tabIds = ['all', 'named'];
-            visibleIds = filterSessionRows([...rows.values()], localNames, sid, sessionTitle, pickerTab, panelDraft.text)
-              .map(row => row.sessionId);
+            tabIds = ['workspace', 'all', 'named'];
+            visibleIds = filterSessionRows([...rows.values()], localNames, sid, sessionTitle, pickerTab, panelDraft.text, {
+              currentCwd: options.cwd,
+              previews: sessionPreviewCache,
+            }).map(row => row.sessionId);
             activate = chosenId => {
               if (!changingConfig && !sessionOperation && !busy && !disconnected &&
                 (chosenId === sid || agent?.capabilities.loadSession)) {
@@ -3318,10 +3521,21 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
               if (!changingConfig && !busy && !disconnected) changeConfig(configOpt, chosenId);
             };
           }
+          const prevTab = pickerTab;
           const step = stepPickerKey({ tab: pickerTab, selected: pickerSelected, draft: panelDraft }, key, tabIds, visibleIds);
           pickerTab = step.tab;
           pickerSelected = step.selected;
           panelDraft = step.draft;
+          if (current.kind === 'sessions' && pickerTab === 'all' && prevTab !== 'all' && agent?.capabilities.listSessions) {
+            if (allSessionsPrefetchInFlight) {
+              allSessionsLoading = true;
+            } else if (!allListedSessions.length || Date.now() - allSessionsLoadedAt >= 15_000) {
+              loadSessions(false, false, true);
+              continue;
+            } else {
+              warmSessionSearchIndex(allListedSessions);
+            }
+          }
           if (step.activateId) {
             activate(step.activateId);
             continue;

@@ -47,6 +47,7 @@ import {
   filterSessionRows,
   filterTemplatesList,
   groupSelectConfigOptions,
+  sessionRowMatchesQuery,
 } from './picker-nav';
 import {
   cachedPathExists,
@@ -106,14 +107,19 @@ export interface PanelRenderContext {
   reportLoading: boolean;
   reportText: string;
   sessionsLoading: boolean;
+  allSessionsLoading?: boolean;
   sessionOperation: string | undefined;
   activeSessionId: string;
   previousSessionId: string | undefined;
   listedSessions: readonly SessionInfo[];
+  allListedSessions?: readonly SessionInfo[];
   nextSessionsCursor: string | undefined;
+  allNextSessionsCursor?: string;
   sessionInfo: ReadonlyMap<string, SessionInfo>;
   localNames: ReadonlyMap<string, string | undefined>;
   sessionPreviews: ReadonlyMap<string, SessionPreview | null>;
+  sessionSearchTexts?: ReadonlyMap<string, string>;
+  sessionIndexing?: { done: number; total: number };
   mcpServers: readonly McpServerEntry[];
   pluginsList: readonly PluginEntry[];
   agentsList: readonly AgentEntry[];
@@ -155,7 +161,7 @@ export interface PanelRenderContext {
   onChooseCommand(command: Command, args?: string, completeOnly?: boolean): void;
   onOpenConversation(id: string, mode?: 'load' | 'resume'): void;
   onNewConversation(): void;
-  onLoadSessions(append?: boolean): void;
+  onLoadSessions(append?: boolean, allWorkspaces?: boolean): void;
   onCloseSavedSession(id: string): void;
   onRequestSessionPreview(id: string): void;
   onLoadExtensions(kind: 'mcp' | 'plugins' | 'agents'): void;
@@ -597,11 +603,24 @@ function renderSelectConfigPicker(ctx: PanelRenderContext, option: Extract<Sessi
 }
 
 function renderSessionsPicker(ctx: PanelRenderContext): JSX.Element {
-  const rows = new Map(ctx.listedSessions.map(row => [row.sessionId, row]));
-  if (ctx.activeSessionId) rows.set(ctx.activeSessionId, ctx.sessionInfo.get(ctx.activeSessionId) ?? { sessionId: ctx.activeSessionId, cwd: ctx.options.cwd });
-  const allRows = [...rows.values()];
+  const workspaceMap = new Map(ctx.listedSessions.map(row => [row.sessionId, row]));
+  const allMap = new Map((ctx.allListedSessions?.length ? ctx.allListedSessions : ctx.listedSessions).map(row => [row.sessionId, row]));
+  if (ctx.activeSessionId) {
+    const activeRow = ctx.sessionInfo.get(ctx.activeSessionId) ?? { sessionId: ctx.activeSessionId, cwd: ctx.options.cwd };
+    workspaceMap.set(ctx.activeSessionId, activeRow);
+    allMap.set(ctx.activeSessionId, activeRow);
+  }
+  const workspaceRows = [...workspaceMap.values()];
+  const allRows = [...allMap.values()];
   const namedRows = allRows.filter(row => !!ctx.localNames.get(row.sessionId));
-  const filtered = filterSessionRows(allRows, ctx.localNames, ctx.activeSessionId, ctx.sessionTitle, ctx.pickerTab, ctx.panelDraft.text);
+  const activeTab = ctx.pickerTab === 'all' || ctx.pickerTab === 'named' ? ctx.pickerTab : 'workspace';
+  const sourceRows = activeTab === 'workspace' ? workspaceRows : allRows;
+  const filterOpts = {
+    currentCwd: ctx.options.cwd,
+    previews: ctx.sessionPreviews,
+    searchTexts: ctx.sessionSearchTexts,
+  };
+  const filtered = filterSessionRows(sourceRows, ctx.localNames, ctx.activeSessionId, ctx.sessionTitle, activeTab, ctx.panelDraft.text, filterOpts);
   const selectedId = filtered.some(row => row.sessionId === ctx.pickerSelected)
     ? ctx.pickerSelected
     : filtered[0]?.sessionId ?? '';
@@ -611,16 +630,25 @@ function renderSessionsPicker(ctx: PanelRenderContext): JSX.Element {
     const idToLoad = highlighted.sessionId;
     queueMicrotask(() => ctx.onRequestSessionPreview(idToLoad));
   }
+  const needle = ctx.panelDraft.text.trim();
+  const normalizedCwd = resolve(ctx.options.cwd);
   const items: PickerItem[] = filtered.map(row => {
+    const matchInfo = needle
+      ? sessionRowMatchesQuery(row, ctx.localNames, ctx.sessionTitle, needle, filterOpts)
+      : { matched: true, chatOnlyMatch: false };
+    const rowCwd = typeof row.cwd === 'string' && row.cwd ? row.cwd : undefined;
+    const isOtherWorkspace = Boolean(rowCwd && resolve(rowCwd) !== normalizedCwd);
+    const folderLabel = rowCwd ? (basename(rowCwd) || rowCwd) : 'Unknown folder';
     const badges = [
       ...(row.sessionId === ctx.activeSessionId ? [{ text: 'Current', tone: 'success' as const }] : []),
       ...(ctx.previousSessionId && row.sessionId === ctx.previousSessionId ? [{ text: 'Previous', tone: 'info' as const }] : []),
       ...(ctx.localNames.get(row.sessionId) ? [{ text: 'Local name', tone: 'accent' as const }] : []),
+      ...(matchInfo.chatOnlyMatch ? [{ text: 'Chat match', tone: 'info' as const }] : []),
     ];
     return {
       id: row.sessionId,
       label: ctx.sessionTitle(row.sessionId),
-      detail: `${row.updatedAt ?? 'No timestamp'} · ${row.sessionId.slice(0, 12)}`,
+      detail: `${isOtherWorkspace ? `${folderLabel} · ` : ''}${row.updatedAt ?? 'No timestamp'} · ${row.sessionId.slice(0, 12)}`,
       badges: badges.length ? badges : undefined,
       disabled: row.sessionId !== ctx.activeSessionId && !ctx.agent?.capabilities.loadSession
         ? 'agy does not advertise loading previous sessions' : undefined,
@@ -628,28 +656,41 @@ function renderSessionsPicker(ctx: PanelRenderContext): JSX.Element {
     };
   });
   const cannotSwitch = ctx.busy || ctx.changingConfig || !!ctx.sessionOperation || ctx.disconnected;
+  const isAllTab = activeTab === 'all';
+  const tabLoading = isAllTab ? Boolean(ctx.allSessionsLoading || ctx.sessionsLoading) : ctx.sessionsLoading;
+  const activeCursor = isAllTab ? (ctx.allNextSessionsCursor ?? ctx.nextSessionsCursor) : ctx.nextSessionsCursor;
+  const idxStatus = ctx.sessionIndexing && ctx.sessionIndexing.done < ctx.sessionIndexing.total
+    ? `Indexing chat messages (${ctx.sessionIndexing.done}/${ctx.sessionIndexing.total})...`
+    : undefined;
   const pv = highlightedPreview;
-  return <picker key="picker" size={ctx.rLayout.panelSize} title="Workspace conversations" icon="history"
-    subtitle={`Filtered by cwd reported by agy (${ctx.options.cwd}); original workspace is not verified.`}
-    placeholder="Search conversations by title, local name, or ID..."
+  const highlightedWorkspaceDiffers = Boolean(highlighted?.cwd && resolve(highlighted.cwd) !== normalizedCwd);
+  return <picker key="picker" size={ctx.rLayout.panelSize} title="Conversations" icon="history"
+    subtitle={isAllTab
+      ? `All workspaces (reported by agy)`
+      : `${ctx.workspaceName} only (use All workspaces for other folders)`}
+    placeholder="Search title, folder, ID, or chat..."
     query={ctx.panelDraft.text} cursor={ctx.panelDraft.cursor}
     tabs={[
-      { id: 'all', label: 'All', count: allRows.length },
+      { id: 'workspace', label: 'This folder', count: workspaceRows.length },
+      { id: 'all', label: 'All workspaces', count: allRows.length },
       { id: 'named', label: 'Local named', count: namedRows.length },
     ]}
-    tab={ctx.pickerTab}
+    tab={activeTab}
     order={filtered.map(row => row.sessionId)}
     items={items} selected={selectedId}
     current={ctx.activeSessionId ? [ctx.activeSessionId] : undefined}
-    state={ctx.sessionOperation || (ctx.sessionsLoading && !allRows.length) ? 'loading' : ctx.panelError ? 'error' : 'ready'}
-    message={ctx.sessionOperation ?? (ctx.sessionsLoading ? 'Syncing conversations from agy...' : ctx.panelError || (!ctx.agent?.capabilities.listSessions ? 'agy does not advertise session listing.' : undefined))}
+    state={ctx.sessionOperation || tabLoading ? 'loading' : ctx.panelError ? 'error' : 'ready'}
+    message={ctx.sessionOperation
+      ?? (tabLoading
+        ? (isAllTab ? `Syncing conversations across all workspaces from agy (${allRows.length} loaded)...` : `Syncing workspace conversations from agy (${workspaceRows.length} loaded)...`)
+        : ctx.panelError || idxStatus || (!ctx.agent?.capabilities.listSessions ? 'agy does not advertise session listing.' : undefined))}
     empty="No saved conversations matched your filter."
     preview={highlighted ? 'below' : 'none'}
     actions={[
       { id: 'new', label: 'New', disabled: cannotSwitch ? (true as const) : undefined },
       { id: 'rename', label: 'Rename', disabled: (cannotSwitch || !ctx.activeSessionId) ? (true as const) : undefined },
       ...(ctx.agent?.capabilities.listSessions ? [{ id: 'refresh', label: 'Refresh', disabled: cannotSwitch ? (true as const) : undefined }] : []),
-      ...(ctx.nextSessionsCursor ? [{ id: 'more', label: 'Load older', disabled: cannotSwitch ? (true as const) : undefined }] : []),
+      ...(activeCursor ? [{ id: 'more', label: 'Load older', disabled: cannotSwitch ? (true as const) : undefined }] : []),
       ...(ctx.agent?.capabilities.resumeSession ? [{ id: 'resume', label: 'Fast resume',
         disabled: (cannotSwitch || !highlighted || highlighted.sessionId === ctx.activeSessionId) ? (true as const) : undefined }] : []),
       ...(ctx.agent?.capabilities.closeSession ? [{ id: 'closeSession', label: 'Close session',
@@ -669,8 +710,8 @@ function renderSessionsPicker(ctx: PanelRenderContext): JSX.Element {
       },
       new: ctx.onNewConversation,
       rename: () => ctx.onOpenPanel({ kind: 'rename', sessionId: ctx.activeSessionId }),
-      refresh: () => ctx.onLoadSessions(),
-      more: () => ctx.onLoadSessions(true),
+      refresh: () => ctx.onLoadSessions(false, isAllTab),
+      more: () => ctx.onLoadSessions(true, isAllTab),
       resume: () => {
         if (highlighted && !cannotSwitch) ctx.onOpenConversation(highlighted.sessionId, 'resume');
       },
@@ -685,6 +726,12 @@ function renderSessionsPicker(ctx: PanelRenderContext): JSX.Element {
       <kv items={[
         { k: 'Title', v: ctx.sessionTitle(highlighted.sessionId) },
         { k: 'Session ID', v: highlighted.sessionId },
+        {
+          k: 'Origin workspace',
+          v: highlighted.cwd
+            ? (highlightedWorkspaceDiffers ? `${highlighted.cwd} (loads into current workspace)` : highlighted.cwd)
+            : 'Not reported by agy',
+        },
         { k: 'Updated', v: highlighted.updatedAt ?? 'Not reported' },
         { k: 'Label source', v: ctx.localNames.get(highlighted.sessionId) ? 'Local agy-tern label' : 'Reported by agy' },
         ...(pv ? [

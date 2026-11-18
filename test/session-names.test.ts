@@ -55,6 +55,19 @@ describe('local session names', () => {
     await other.set('same-id', '');
     expect(await names.get('same-id')).toBe('First workspace');
   });
+
+  test('batch-reads stored names cleanly with getMany without creating storage directory', async () => {
+    const emptyMap = await names.getMany(['missing-1', 'missing-2']);
+    expect([...emptyMap.entries()]).toEqual([['missing-1', undefined], ['missing-2', undefined]]);
+    expect(await readdir(root)).toEqual([]);
+
+    await names.set('sess-a', 'Alpha');
+    await names.set('sess-b', 'Beta');
+    const batch = await names.getMany(['sess-a', 'missing-3', 'sess-b']);
+    expect(batch.get('sess-a')).toBe('Alpha');
+    expect(batch.get('missing-3')).toBeUndefined();
+    expect(batch.get('sess-b')).toBe('Beta');
+  });
 });
 
 describe('private session name storage', () => {

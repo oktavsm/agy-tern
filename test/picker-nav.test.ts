@@ -4,6 +4,7 @@ import {
   filterMcpServers,
   filterPluginsList,
   filterSessionRows,
+  sessionRowMatchesQuery,
   stepPickerKey,
 } from '../src/picker-nav';
 
@@ -56,5 +57,38 @@ describe('picker navigation and filters', () => {
       { sessionId: 's3', cwd: '/repo', title: 'Named', updatedAt: '2026-11-16T10:00:00Z' },
     ], new Map([['s3', 'Custom']]), 's2', id => (id === 's3' ? 'Custom' : id), 'all', '');
     expect(sessions.map(s => s.sessionId)).toEqual(['s2', 's3', 's1']);
+
+    const previews = new Map([
+      ['s4', {
+        source: 'brain' as const,
+        entryCount: 4,
+        messageCount: 2,
+        toolCount: 0,
+        lastUser: 'Fix PostgreSQL migration lock',
+        lastAgent: 'Added advisory transaction lock cleanly.',
+        searchText: 'fix postgresql migration lock added advisory transaction lock cleanly',
+        truncated: false,
+      }],
+    ]);
+    const crossRows = [
+      { sessionId: 's1', cwd: '/repo', title: 'Local task', updatedAt: '2026-11-15T10:00:00Z' },
+      { sessionId: 's4', cwd: '/other-project', title: 'Backend refactor', updatedAt: '2026-11-16T10:00:00Z' },
+    ];
+    expect(filterSessionRows(crossRows, new Map(), 's1', id => id, 'workspace', '', {
+      currentCwd: '/repo',
+      previews,
+    }).map(r => r.sessionId)).toEqual(['s1']);
+
+    const byChat = filterSessionRows(crossRows, new Map(), 's1', id => id, 'all', 'advisory transaction', {
+      currentCwd: '/repo',
+      previews,
+    });
+    expect(byChat.map(r => r.sessionId)).toEqual(['s4']);
+    expect(sessionRowMatchesQuery(crossRows[1]!, new Map(), id => id, 'advisory transaction', { previews }))
+      .toEqual({ matched: true, chatOnlyMatch: true });
+    expect(filterSessionRows(crossRows, new Map(), 's1', id => id, 'all', 'other-project', {
+      currentCwd: '/repo',
+      previews,
+    }).map(r => r.sessionId)).toEqual(['s4']);
   });
 });

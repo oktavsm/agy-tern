@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { chmod, mkdir, open, readFile, rename, rm, unlink } from 'node:fs/promises';
+import { chmod, mkdir, open, readdir, readFile, rename, rm, unlink } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { isAbsolute, join, resolve } from 'node:path';
+import { basename, isAbsolute, join, resolve } from 'node:path';
 
 function normalizeName(name: string): string {
   if (!name.isWellFormed() || /[\p{Cc}\u2028\u2029]/u.test(name)) {
@@ -50,6 +50,35 @@ export class SessionNames {
     const normalized = normalizeName(name);
     if (!normalized || name !== normalized) throw new Error('Stored session name is empty or untrimmed');
     return name;
+  }
+
+  /** Batch-read local names for many session IDs using a single directory scan to avoid N+1 ENOENT syscalls. */
+  async getMany(sessionIds: readonly string[]): Promise<Map<string, string | undefined>> {
+    const result = new Map<string, string | undefined>();
+    if (!sessionIds.length) return result;
+    let present: Set<string>;
+    try {
+      present = new Set(await readdir(this.directory));
+    } catch (error) {
+      if (error instanceof Error && 'code' in error && error.code === 'ENOENT') {
+        for (const id of sessionIds) result.set(id, undefined);
+        return result;
+      }
+      throw error;
+    }
+    await Promise.all(sessionIds.map(async (sessionId) => {
+      const file = this.filename(sessionId);
+      if (!present.has(basename(file))) {
+        result.set(sessionId, undefined);
+        return;
+      }
+      try {
+        result.set(sessionId, await this.get(sessionId));
+      } catch {
+        result.set(sessionId, undefined);
+      }
+    }));
+    return result;
   }
 
   async set(sessionId: string, name: string): Promise<void> {

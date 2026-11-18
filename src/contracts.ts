@@ -52,6 +52,12 @@ export interface AgentAuthentication {
   logout: boolean;
 }
 
+export type ConnectionStage = 'spawning' | 'initializing' | 'opening_session' | 'syncing_config';
+
+export interface ListSessionsOptions {
+  allWorkspaces?: boolean;
+}
+
 export interface AgentEvents {
   update(notification: SessionNotification): void;
   permission(prompt: PermissionPrompt): void;
@@ -59,6 +65,7 @@ export interface AgentEvents {
   elicitationComplete?(notification: CompleteElicitationNotification): void;
   diagnostic(text: string): void;
   disconnected(message: string): void;
+  connectionStage?(stage: ConnectionStage): void;
   metadata?(metadata: AgentMetadata): void;
   authentication?(authentication: AgentAuthentication): void;
   sessionChanged?(sessionId: string): void;
@@ -80,7 +87,7 @@ export interface AgentSession {
     readonly image: boolean;
     readonly embeddedContext?: boolean;
   };
-  listSessions(cursor?: string): Promise<ListSessionsResponse>;
+  listSessions(cursor?: string, options?: ListSessionsOptions): Promise<ListSessionsResponse>;
   newSession(): Promise<void>;
   loadSession(sessionId: string): Promise<void>;
   resumeSession?(sessionId: string): Promise<void>;

@@ -15,6 +15,7 @@ import {
   type ClientConnection,
   type ContentBlock,
   type CreateElicitationResponse,
+  type ListSessionsRequest,
   type RequestPermissionResponse,
   type ListSessionsResponse,
   type SendRequestOptions,
@@ -23,7 +24,7 @@ import {
   type SessionNotification,
   type SetSessionConfigOptionRequest,
 } from '@agentclientprotocol/sdk';
-import type { AccountTier, AgentAuthentication, AgentEvents, AgentMetadata, AgentOptions, AgentSession, ElicitationPrompt, ImageAttachment, ResourceAttachment } from './contracts';
+import type { AccountTier, AgentAuthentication, AgentEvents, AgentMetadata, AgentOptions, AgentSession, ElicitationPrompt, ImageAttachment, ListSessionsOptions, ResourceAttachment } from './contracts';
 
 const STARTUP_TIMEOUT_MS = 30_000;
 const CANCEL_WRITE_TIMEOUT_MS = 1_000;
@@ -149,6 +150,7 @@ export async function connectAgent(options: AgentOptions, events: AgentEvents): 
   const extraDirs = (options.additionalDirectories ?? []).map(dir => resolve(cwd, dir));
   const executable = options.executable ?? 'agy';
   if (options.signal?.aborted) throw asError(options.signal.reason);
+  events.connectionStage?.('spawning');
   const processGroup = process.platform !== 'win32';
   const acpArgs = [
     'acp',
@@ -508,6 +510,7 @@ export async function connectAgent(options: AgentOptions, events: AgentEvents): 
     }, { once: true });
     if (connection.signal.aborted) disconnect(connection.signal.reason);
     assertOpen();
+    events.connectionStage?.('initializing');
     const initialized = await connection.agent.request(methods.agent.initialize, {
       protocolVersion: PROTOCOL_VERSION,
       clientInfo: { name: 'agy-tern', version: '0.1.0' },
@@ -547,6 +550,7 @@ export async function connectAgent(options: AgentOptions, events: AgentEvents): 
     const systemPromptMetaParam = capabilities.appendSystemPrompt && options.appendSystemPrompt
       ? { _meta: { antigravity: { systemPrompt: { append: options.appendSystemPrompt } } } }
       : {};
+    events.connectionStage?.('opening_session');
     const session = await connection.agent.request(methods.agent.session.new, {
       cwd,
       mcpServers: [],
@@ -587,14 +591,18 @@ export async function connectAgent(options: AgentOptions, events: AgentEvents): 
     }
   }
 
-  async function listSessions(cursor?: string): Promise<ListSessionsResponse> {
+  async function listSessions(cursor?: string, listOptions?: ListSessionsOptions): Promise<ListSessionsResponse> {
     assertOpen();
     if (lifecycleMutation) throw new Error('An Antigravity session lifecycle operation is already running.');
     if (!capabilities.listSessions) throw new Error('Antigravity ACP does not support listing sessions.');
+    const allWorkspaces = listOptions?.allWorkspaces === true;
+    const params: ListSessionsRequest = allWorkspaces
+      ? (cursor === undefined ? {} : { cursor })
+      : (cursor === undefined ? { cwd } : { cwd, cursor });
     try {
       const response = await sessionRequest((requestOptions) => agentConnection.agent.request(
         methods.agent.session.list,
-        cursor === undefined ? { cwd } : { cwd, cursor },
+        params,
         requestOptions,
       ));
       if (!Array.isArray(response?.sessions)) {
@@ -602,10 +610,12 @@ export async function connectAgent(options: AgentOptions, events: AgentEvents): 
       }
       return {
         ...response,
-        sessions: response.sessions.filter((session) => (
-          typeof session.cwd === 'string' && !session.cwd.includes('\0') &&
-          isAbsolute(session.cwd) && canonicalPath(session.cwd) === cwd
-        )),
+        sessions: response.sessions.filter((session) => {
+          if (typeof session.cwd !== 'string' || session.cwd.includes('\0') || !isAbsolute(session.cwd)) {
+            return false;
+          }
+          return allWorkspaces || canonicalPath(session.cwd) === cwd;
+        }),
       };
     } catch (cause) {
       throw failure ?? explainError(cause, stderrTail);

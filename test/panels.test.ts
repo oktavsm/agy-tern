@@ -366,4 +366,42 @@ describe('panel renderers & transcript view helpers', () => {
     expect(fullJson).toContain('Quota bar');
     expect(fullJson).toContain('Gemini 3 Pro');
   });
+
+  test('/sessions picker surfaces loading state despite active session and supports All workspaces + chat match', () => {
+    const loadingCtx = baseContext({ kind: 'sessions' });
+    loadingCtx.sessionsLoading = true;
+    loadingCtx.pickerTab = 'workspace';
+    const loadingNode = renderActivePanel(loadingCtx) as unknown as {
+      props: { state?: string; message?: string; tabs?: Array<{ id: string; label: string }> };
+    };
+    expect(loadingNode.props.state).toBe('loading');
+    expect(loadingNode.props.message).toContain('Syncing workspace conversations');
+    expect(loadingNode.props.tabs?.map(t => t.id)).toEqual(['workspace', 'all', 'named']);
+
+    const allCtx = baseContext({ kind: 'sessions' });
+    allCtx.pickerTab = 'all';
+    allCtx.panelDraft = { text: 'oauth rotation', cursor: 14 };
+    allCtx.allListedSessions = [
+      { sessionId: 'sess-1', cwd: process.cwd(), title: 'Demo session' },
+      { sessionId: 'other-1', cwd: '/tmp/another-repo', title: 'Security follow-up', updatedAt: '2026-11-17T12:00:00Z' },
+    ];
+    allCtx.sessionTitle = id => allCtx.allListedSessions?.find(s => s.sessionId === id)?.title ?? id;
+    allCtx.sessionPreviews = new Map([
+      ['other-1', {
+        source: 'brain',
+        entryCount: 6,
+        messageCount: 4,
+        toolCount: 2,
+        lastUser: 'Audit OAuth rotation logic',
+        lastAgent: 'Updated refresh token window.',
+        searchText: 'audit oauth rotation logic updated refresh token window',
+        truncated: false,
+      }],
+    ]);
+    const allJson = JSON.stringify(renderActivePanel(allCtx));
+    expect(allJson).toContain('Security follow-up');
+    expect(allJson).toContain('another-repo');
+    expect(allJson).toContain('Chat match');
+    expect(allJson).toContain('/tmp/another-repo (loads into current workspace)');
+  });
 });

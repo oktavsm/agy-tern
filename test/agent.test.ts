@@ -959,4 +959,29 @@ describe('official ACP subprocess boundary', () => {
     expect(JSON.parse(await nextText(obs1))).toEqual({ action: 'accept', content: { target: 'prod' } });
     expect(await nextText(obs2)).toBe('Synthetic fixture reply: hello from terminal 2');
   });
+
+  test('emits connection stages at startup and supports cross-workspace listSessions({ allWorkspaces: true })', async () => {
+    const cwd = await workspace('all-workspaces');
+    const stages: string[] = [];
+    const obs = observer();
+    obs.events.connectionStage = stage => { stages.push(stage); };
+    const session = await connectAgent({ cwd, executable: fixture }, obs.events);
+    sessions.push(session);
+    expect(stages).toEqual(['spawning', 'initializing', 'opening_session']);
+
+    // Default remains workspace-filtered; allWorkspaces returns cross-cwd sessions as well.
+    await expect(session.listSessions()).resolves.toBeDefined();
+    const obsPages = observer();
+    const pagesSession = await open(obsPages, 'list-pages');
+    const scoped = await pagesSession.listSessions();
+    expect(scoped.sessions).toEqual([]);
+    const crossWorkspace = await pagesSession.listSessions(undefined, { allWorkspaces: true });
+    expect(crossWorkspace.sessions.map(entry => entry.sessionId)).toContain('foreign-workspace');
+    await pagesSession.prompt('inspect');
+    const inspected = JSON.parse(await nextText(obsPages));
+    expect(inspected.listed).toEqual([
+      { cwd: inspected.cwd },
+      {},
+    ]);
+  });
 });

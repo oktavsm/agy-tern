@@ -151,11 +151,29 @@ export class TranscriptStore {
     return next;
   }
 
-  private filePathFor(sessionId: string): string | undefined {
+  private fileNameFor(sessionId: string): string | undefined {
     const clean = sessionId.trim();
     if (!clean || /[\0-\u001f\u007f]/.test(clean)) return undefined;
     const digest = createHash('sha256').update(`${this.cwd}\n${clean}`).digest('hex').slice(0, 32);
-    return join(this.directory, `${digest}.json`);
+    return `${digest}.json`;
+  }
+
+  private filePathFor(sessionId: string): string | undefined {
+    const name = this.fileNameFor(sessionId);
+    return name ? join(this.directory, name) : undefined;
+  }
+
+  async listCachedFiles(): Promise<Set<string>> {
+    try {
+      return new Set(await readdir(this.directory));
+    } catch {
+      return new Set();
+    }
+  }
+
+  hasKnownFile(sessionId: string, knownFiles: ReadonlySet<string>): boolean {
+    const name = this.fileNameFor(sessionId);
+    return Boolean(name && knownFiles.has(name));
   }
 
   async save(sessionId: string, entries: readonly TranscriptEntry[]): Promise<void> {
@@ -426,48 +444,89 @@ export interface SessionPreview {
   toolCount: number;
   lastUser?: string;
   lastAgent?: string;
+  searchText?: string;
   truncated: boolean;
 }
 
-function compactPreviewLine(raw: string, maxLen = 140): string {
-  const single = raw.replace(/\s+/g, ' ').trim();
-  return single.length > maxLen ? `${single.slice(0, maxLen - 3)}...` : single;
+const MAX_SEARCH_TEXT_CHARS = 8_000;
+
+/** List brain UUID folders present on disk once so batch preview scanning avoids per-session ENOENT probes. */
+export async function listAvailableBrainSessionIds(appDataDir?: string): Promise<Set<string>> {
+  const baseDir = resolve(appDataDir ?? join(homedir(), '.gemini', 'antigravity-cli'));
+  try {
+    const entries = await readdir(join(baseDir, 'brain'));
+    return new Set(entries.filter(id => UUID_RE.test(id)));
+  } catch {
+    return new Set();
+  }
 }
 
-/** Read a lightweight last-turn preview for `/sessions` without invoking ACP `session/load`. */
-export async function readSessionPreview(
-  sessionId: string,
-  store?: TranscriptStore,
-  options?: { appDataDir?: string; maxReadBytes?: number },
-): Promise<SessionPreview | undefined> {
-  const loaded = (await store?.load(sessionId)) ??
-    (await readOfficialBrainTranscript(sessionId, {
-      appDataDir: options?.appDataDir,
-      maxReadBytes: options?.maxReadBytes ?? 280_000,
-      maxEntries: 30,
-    }));
-  if (!loaded) return undefined;
+/** Extract compact preview metadata + searchable message text from transcript entries. */
+export function buildSessionPreviewFromEntries(
+  entries: readonly TranscriptEntry[],
+  source: 'cache' | 'brain',
+  truncated: boolean,
+): SessionPreview {
   let lastUser: string | undefined;
   let lastAgent: string | undefined;
   let messageCount = 0;
   let toolCount = 0;
-  for (const entry of loaded.entries) {
+  const searchChunks: string[] = [];
+  let searchChars = 0;
+  for (const entry of entries) {
     if (entry.type === 'tool') toolCount++;
     else if (entry.type === 'message') {
       messageCount++;
-      const text = compactPreviewLine(entry.text);
-      if (!text) continue;
-      if (entry.role === 'user') lastUser = text;
-      else if (entry.role === 'agent') lastAgent = text;
+      const normalized = entry.text.replace(/\s+/g, ' ').trim();
+      if (!normalized) continue;
+      const line = normalized.length > 140 ? `${normalized.slice(0, 137)}...` : normalized;
+      if (entry.role === 'user') lastUser = line;
+      else if (entry.role === 'agent') lastAgent = line;
+      if (searchChars < MAX_SEARCH_TEXT_CHARS) {
+        const remaining = MAX_SEARCH_TEXT_CHARS - searchChars;
+        const chunk = normalized.slice(0, remaining).toLowerCase();
+        searchChunks.push(chunk);
+        searchChars += chunk.length + 1;
+      }
     }
   }
+  const searchText = searchChunks.join(' ');
   return {
-    source: loaded.source,
-    entryCount: loaded.entries.length,
+    source,
+    entryCount: entries.length,
     messageCount,
     toolCount,
     ...(lastUser ? { lastUser } : {}),
     ...(lastAgent ? { lastAgent } : {}),
-    truncated: loaded.truncated,
+    ...(searchText ? { searchText } : {}),
+    truncated,
   };
+}
+
+/** Read a lightweight last-turn preview + chat search text for `/sessions` without invoking ACP `session/load`. */
+export async function readSessionPreview(
+  sessionId: string,
+  store?: TranscriptStore,
+  options?: {
+    appDataDir?: string;
+    maxReadBytes?: number;
+    maxEntries?: number;
+    knownCacheFiles?: ReadonlySet<string>;
+    knownBrainIds?: ReadonlySet<string>;
+  },
+): Promise<SessionPreview | undefined> {
+  const canCheckCache = store && (!options?.knownCacheFiles || store.hasKnownFile(sessionId, options.knownCacheFiles));
+  const cacheLoaded = canCheckCache ? await store.load(sessionId) : undefined;
+  if (cacheLoaded) {
+    return buildSessionPreviewFromEntries(cacheLoaded.entries, cacheLoaded.source, cacheLoaded.truncated);
+  }
+  const canCheckBrain = !options?.knownBrainIds || options.knownBrainIds.has(sessionId.trim());
+  if (!canCheckBrain) return undefined;
+  const brainLoaded = await readOfficialBrainTranscript(sessionId, {
+    appDataDir: options?.appDataDir,
+    maxReadBytes: options?.maxReadBytes ?? 160_000,
+    maxEntries: options?.maxEntries ?? 40,
+  });
+  if (!brainLoaded) return undefined;
+  return buildSessionPreviewFromEntries(brainLoaded.entries, brainLoaded.source, brainLoaded.truncated);
 }

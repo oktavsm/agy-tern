@@ -1,8 +1,10 @@
+import { resolve } from 'node:path';
 import type { SessionConfigOption, SessionInfo } from '@agentclientprotocol/sdk';
 import { commandCategory, filterCommands, type Command } from './commands';
 import { draftKey, type Draft } from './draft';
 import type { AgentEntry, McpServerEntry, PluginEntry } from './extensions';
 import type { GitStatusEntry } from './files';
+import type { SessionPreview } from './history';
 import type { ToolStep, TranscriptEntry } from './model';
 import type { PromptTemplate } from './templates';
 import {
@@ -106,6 +108,33 @@ export function filterFindMatches(matches: readonly TranscriptSearchMatch[], pic
   return pickerTab === 'all' ? [...matches] : matches.filter(m => m.kind === pickerTab);
 }
 
+export interface SessionFilterOptions {
+  currentCwd?: string;
+  searchTexts?: ReadonlyMap<string, string>;
+  previews?: ReadonlyMap<string, SessionPreview | null>;
+}
+
+/** Match a session row against metadata (`title`, `localName`, `id`, `cwd`) and cached chat message text. */
+export function sessionRowMatchesQuery(
+  row: SessionInfo,
+  localNames: ReadonlyMap<string, string | undefined>,
+  titleOf: (id: string) => string,
+  query: string,
+  filterOpts?: SessionFilterOptions,
+): { matched: boolean; chatOnlyMatch: boolean } {
+  const needle = query.trim().toLowerCase();
+  if (!needle) return { matched: true, chatOnlyMatch: false };
+  const metaHaystack = `${titleOf(row.sessionId)} ${row.title ?? ''} ${row.sessionId} ${row.cwd ?? ''}`.toLowerCase();
+  if (metaHaystack.includes(needle)) return { matched: true, chatOnlyMatch: false };
+  const pv = filterOpts?.previews?.get(row.sessionId);
+  const pvText = pv ? `${pv.lastUser ?? ''} ${pv.lastAgent ?? ''} ${pv.searchText ?? ''}`.toLowerCase() : '';
+  const extraSearch = filterOpts?.searchTexts?.get(row.sessionId) ?? '';
+  if (pvText.includes(needle) || extraSearch.toLowerCase().includes(needle)) {
+    return { matched: true, chatOnlyMatch: true };
+  }
+  return { matched: false, chatOnlyMatch: false };
+}
+
 export function filterSessionRows(
   rows: readonly SessionInfo[],
   localNames: ReadonlyMap<string, string | undefined>,
@@ -113,11 +142,18 @@ export function filterSessionRows(
   titleOf: (id: string) => string,
   pickerTab: string,
   query: string,
+  filterOpts?: SessionFilterOptions,
 ): SessionInfo[] {
-  const needle = query.trim().toLowerCase();
+  const cleanCwd = filterOpts?.currentCwd ? resolve(filterOpts.currentCwd) : undefined;
   return rows
-    .filter(row => pickerTab !== 'named' || !!localNames.get(row.sessionId))
-    .filter(row => `${titleOf(row.sessionId)} ${row.title ?? ''} ${row.sessionId}`.toLowerCase().includes(needle))
+    .filter(row => {
+      if (pickerTab === 'named') return !!localNames.get(row.sessionId);
+      if (pickerTab === 'workspace' && cleanCwd) {
+        return row.sessionId === activeSessionId || (typeof row.cwd === 'string' && resolve(row.cwd) === cleanCwd);
+      }
+      return true;
+    })
+    .filter(row => sessionRowMatchesQuery(row, localNames, titleOf, query, filterOpts).matched)
     .sort((a, b) => Number(b.sessionId === activeSessionId) - Number(a.sessionId === activeSessionId) ||
       (Date.parse(b.updatedAt ?? '') || 0) - (Date.parse(a.updatedAt ?? '') || 0));
 }
@@ -255,9 +291,12 @@ export interface PickerModelInput {
   sessionDiffs: readonly SessionDiffItem[];
   gitChanges: readonly GitStatusEntry[];
   listedSessions: readonly SessionInfo[];
+  allListedSessions?: readonly SessionInfo[];
   activeSessionId: string;
   sessionInfo: ReadonlyMap<string, SessionInfo>;
   localNames: ReadonlyMap<string, string | undefined>;
+  sessionPreviews?: ReadonlyMap<string, SessionPreview | null>;
+  sessionSearchTexts?: ReadonlyMap<string, string>;
   sessionTitle: (id: string) => string;
 }
 
@@ -430,34 +469,40 @@ export function buildPickerModel(input: PickerModelInput): PickerModel {
       };
     }
     case 'sessions': {
-      const rows = new Map(input.listedSessions.map(row => [row.sessionId, row]));
+      const workspaceRows = new Map(input.listedSessions.map(row => [row.sessionId, row]));
+      const allRowsMap = new Map((input.allListedSessions?.length ? input.allListedSessions : input.listedSessions).map(row => [row.sessionId, row]));
       if (input.activeSessionId) {
-        rows.set(
-          input.activeSessionId,
-          input.sessionInfo.get(input.activeSessionId) ?? { sessionId: input.activeSessionId, cwd },
-        );
+        const activeRow = input.sessionInfo.get(input.activeSessionId) ?? { sessionId: input.activeSessionId, cwd };
+        workspaceRows.set(input.activeSessionId, activeRow);
+        allRowsMap.set(input.activeSessionId, activeRow);
       }
-      const allRows = [...rows.values()];
-      const namedRowsCount = allRows.filter(row => !!input.localNames.get(row.sessionId)).length;
+      const sourceRows = pickerTab === 'workspace' ? [...workspaceRows.values()] : [...allRowsMap.values()];
+      const namedRowsCount = [...allRowsMap.values()].filter(row => !!input.localNames.get(row.sessionId)).length;
       const filtered = filterSessionRows(
-        allRows,
+        sourceRows,
         input.localNames,
         input.activeSessionId,
         input.sessionTitle,
         pickerTab,
         query,
+        {
+          currentCwd: cwd,
+          previews: input.sessionPreviews,
+          searchTexts: input.sessionSearchTexts,
+        },
       );
       const visibleIds = filtered.map(row => row.sessionId);
       return {
         kind: 'sessions',
-        tabIds: ['all', 'named'],
+        tabIds: ['workspace', 'all', 'named'],
         tabs: [
-          { id: 'all', label: 'All', count: allRows.length },
+          { id: 'workspace', label: 'This folder', count: workspaceRows.size },
+          { id: 'all', label: 'All workspaces', count: allRowsMap.size },
           { id: 'named', label: 'Local named', count: namedRowsCount },
         ],
         visibleIds,
         selectedId: pickSelectedId(visibleIds, pickerSelected),
-        allRowsCount: allRows.length,
+        allRowsCount: allRowsMap.size,
         namedRowsCount,
         filtered,
       };
