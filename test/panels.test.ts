@@ -286,4 +286,84 @@ describe('panel renderers & transcript view helpers', () => {
     expect(cmdJson).toContain('Inspect details');
     expect(runCommands.length).toBe(0);
   });
+
+  test('/usage details tab renders account, runtime session, context breakdown, and quota table', () => {
+    const emptyDetailsCtx = baseContext({ kind: 'report', report: 'usage' });
+    emptyDetailsCtx.usageTab = 'details';
+    const emptyJson = JSON.stringify(renderActivePanel(emptyDetailsCtx));
+    expect(emptyJson).toContain('Account & connection');
+    expect(emptyJson).toContain('Active session & runtime');
+    expect(emptyJson).toContain('Context & quota breakdown');
+    expect(emptyJson).toContain('Official agy shared auth (email not exposed by ACP)');
+    expect(emptyJson).toContain('Gemini 4 Hydrogen (gemini-4-hydrogen)');
+    expect(emptyJson).toContain('No session-context token usage has been reported by ACP yet.');
+
+    const fullDetailsCtx = baseContext({ kind: 'report', report: 'usage' });
+    fullDetailsCtx.usageTab = 'details';
+    fullDetailsCtx.agent = {
+      sessionId: 'sess-1',
+      metadata: fullDetailsCtx.metadata,
+      authentication: { terminalMethods: [{ id: 'login', name: 'Browser OAuth', args: ['--login'] }], logout: true },
+      capabilities: {
+        listSessions: true,
+        loadSession: true,
+        resumeSession: true,
+        closeSession: false,
+        additionalDirectories: true,
+        appendSystemPrompt: true,
+      },
+      promptCapabilities: { image: true, embeddedContext: true },
+      listSessions: async () => ({ sessions: [] }),
+      newSession: async () => {},
+      loadSession: async () => {},
+      setConfigOption: async () => {},
+      prompt: async () => 'end_turn',
+      cancel: async () => {},
+      logout: async () => {},
+      close: async () => {},
+    };
+    fullDetailsCtx.loginMethod = { id: 'login', name: 'Browser OAuth', args: ['--login'] };
+    fullDetailsCtx.metadata = {
+      ...fullDetailsCtx.metadata,
+      tier: { name: 'Google AI Pro', id: 'ai-pro', upgradeUri: 'https://one.google.com' },
+      usage: { used: 2_000, size: 100_000, cost: { amount: 0.12, currency: 'USD' } },
+      configOptions: [
+        ...fullDetailsCtx.metadata.configOptions,
+        {
+          id: 'thought_level',
+          name: 'Thinking',
+          category: 'thought_level',
+          type: 'select',
+          currentValue: 'high',
+          options: [{ value: 'high', name: 'High' }],
+        },
+        {
+          id: 'mode',
+          name: 'Mode',
+          category: 'mode',
+          type: 'select',
+          currentValue: 'default',
+          options: [{ value: 'default', name: 'Default' }],
+        },
+      ],
+    };
+    fullDetailsCtx.modeOption = fullDetailsCtx.metadata.configOptions[2];
+    fullDetailsCtx.reportText = [
+      'Gemini 3 Pro\t100 req\t82%\t3h 12m',
+      'Claude / GPT\t50 req\t24%\t1h 05m',
+    ].join('\n');
+
+    const fullJson = JSON.stringify(renderActivePanel(fullDetailsCtx));
+    expect(fullJson).toContain('Google AI Pro (ai-pro)');
+    expect(fullJson).toContain('https://one.google.com');
+    expect(fullJson).toContain('Browser OAuth (login)');
+    expect(fullJson).toContain('agy acp --sandbox (Connected)');
+    expect(fullJson).toContain('Thinking effort');
+    expect(fullJson).toContain('High (high)');
+    expect(fullJson).toContain('98,000');
+    expect(fullJson).toContain('100,000');
+    expect(fullJson).toContain('0.12 USD');
+    expect(fullJson).toContain('Quota bar');
+    expect(fullJson).toContain('Gemini 3 Pro');
+  });
 });

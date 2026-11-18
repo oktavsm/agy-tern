@@ -177,6 +177,31 @@ const COMPOSER_LAYOUT_CSS = [
   ".sf-col[data-role='agy.dock.center'] .sf-text[data-role='agy.dock.keys'] {",
   '  text-align: center;',
   '}',
+  '.sf-scroll.scroll {',
+  '  flex: 1 1 0 !important;',
+  '  min-height: 0 !important;',
+  '}',
+  '.sf-scroll.scroll > .sf-scroll-view {',
+  '  flex: 1 1 0 !important;',
+  '  min-height: 0 !important;',
+  '}',
+  '.sf-overlay .sf-scroll.scroll,',
+  '.sf-tool .sf-scroll.scroll {',
+  '  flex: 0 1 auto !important;',
+  '}',
+  '.sf-overlay .sf-scroll.scroll > .sf-scroll-view,',
+  '.sf-tool .sf-scroll.scroll > .sf-scroll-view {',
+  '  flex: 0 1 auto !important;',
+  '}',
+  '.sf-scroll.can > .sf-scroll-bar {',
+  '  user-select: none;',
+  '  -webkit-user-select: none;',
+  '  width: 14px;',
+  '  cursor: grab;',
+  '}',
+  '.sf-scroll.can > .sf-scroll-bar.held {',
+  '  cursor: grabbing;',
+  '}',
 ].join('\n');
 
 function thinkingToEffort(value: string | undefined): 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' {
@@ -2320,7 +2345,8 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     const canSendQueueHead = !busy && !permission && !changingConfig && !sessionOperation && !authBusy && !!agent && !disconnected;
     const view: Renderable = {
       main: <col>
-        <scroll key="conversation" stick={visibleEntries.length ? 'end' : undefined} max={{ h: layout.scrollMaxH }} gap="md" aria="Conversation">
+        <scroll key="conversation" bar="always" stick={visibleEntries.length ? 'end' : undefined}
+          max={session?.caps.features.includes('styles') ? undefined : { h: layout.scrollMaxH }} gap="md" aria="Conversation">
           {hiddenCount > 0 && <row key="older-history" justify="between" align="center" gap="sm" wrap>
             <text><span s="muted">{hiddenCount} earlier {hiddenCount === 1 ? 'entry' : 'entries'} hidden for speed</span></text>
             <row gap="xs">
@@ -2394,7 +2420,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
             targetKind={approvalSummary.targetKind}
             status="pending" note="Approval required">
             <text>Choose a one-time permission for this tool. Tab selects a choice; Ctrl+Y allows, Ctrl+N denies. Enter never approves.</text>
-            <scroll max={{ h: layout.approvalBodyMaxH }}>
+            <scroll bar="always" max={{ h: layout.approvalBodyMaxH }}>
               <ToolBody call={approvalCall} cwd={options.cwd} showRawInput={approvalSummary.showRawInput}
                 fullCommand={approvalSummary.fullCommand} diffMode={userPrefs.diffMode}
                 pathExists={pathExists} getBlob={blobForImage} onInspect={openInspect}

@@ -5,7 +5,7 @@ import type { AuthMethodTerminal, SessionConfigOption, SessionInfo } from '@agen
 import { terminalLoginProblem, type AgentAuthentication, type AgentMetadata, type AgentOptions, type AgentSession } from './contracts';
 import type { ToolStep, TranscriptEntry } from './model';
 import { editDraft, type Draft } from './draft';
-import { configLabel, configValues, commandCategory, filterCommands, type Command } from './commands';
+import { configLabel, configValues, commandCategory, filterCommands, modelOption, type Command } from './commands';
 import type { AgentEntry, McpServerEntry, PluginEntry } from './extensions';
 import type { OfficialReport } from './reports';
 import { parseQuotaReport } from './reports';
@@ -33,6 +33,8 @@ import {
   searchTranscriptCached,
   summarizeQuotaRows,
   summarizeToolCall,
+  thinkingOption,
+  type QuotaSummary,
   type ResponsiveLayout,
   type SessionDiffItem,
 } from './ui-format';
@@ -928,12 +930,12 @@ function renderInspectOverlay(ctx: PanelRenderContext, p: Extract<Panel, { kind:
       <image blob={item.blob} alt={item.name ?? item.mimeType} />
     </col>}
     {item.type === 'diff' && (item.hunks.length
-      ? <scroll key="inspect-scroll" max={{ h: bodyMaxH }}><diff mode={ctx.userPrefs.diffMode} path={item.path} hunks={item.hunks} /></scroll>
+      ? <scroll key="inspect-scroll" bar="always" max={{ h: bodyMaxH }}><diff mode={ctx.userPrefs.diffMode} path={item.path} hunks={item.hunks} /></scroll>
       : <text><span s="muted">No diff hunks recorded.</span></text>)}
-    {item.type === 'file' && <scroll key="inspect-scroll" max={{ h: bodyMaxH }}>
+    {item.type === 'file' && <scroll key="inspect-scroll" bar="always" max={{ h: bodyMaxH }}>
       <code numbers path={item.path}>{item.content}</code>
     </scroll>}
-    {isDir && <scroll key="inspect-scroll" max={{ h: bodyMaxH }}>
+    {isDir && <scroll key="inspect-scroll" bar="always" max={{ h: bodyMaxH }}>
       <col gap="xs">
         <kv items={[
           { k: 'Directory', v: item.preview.path },
@@ -1387,7 +1389,7 @@ function renderFollowUpOverlay(
           <button size="sm" variant="primary" onClick={() => ctx.onSubmitFollowUp?.()}>Done</button>
         </row>
       </row>}>
-      <scroll key="overlay-scroll" max={{ h: ctx.rLayout.inspectBodyMaxH }}>
+      <scroll key="overlay-scroll" bar="always" max={{ h: ctx.rLayout.inspectBodyMaxH }}>
         <col gap="sm">
           {p.message && <text wrap="word">{p.message}</text>}
           <kv items={[{ k: 'URL', v: p.urlMode.url }]} />
@@ -1434,7 +1436,7 @@ function renderFollowUpOverlay(
         </button>
       </row>
     </row>}>
-    <scroll key="overlay-scroll" max={{ h: ctx.rLayout.inspectBodyMaxH }}>
+    <scroll key="overlay-scroll" bar="always" max={{ h: ctx.rLayout.inspectBodyMaxH }}>
       <col gap="md">
         {(st?.message || p.message) && <text wrap="word">{st?.message || p.message}</text>}
         {fields.map((field, idx) => {
@@ -1518,6 +1520,115 @@ function renderFollowUpOverlay(
   </overlay>;
 }
 
+function formatConfigDetail(option: SessionConfigOption | undefined, fallback: string): string {
+  if (!option) return fallback;
+  const label = configLabel(option);
+  const raw = String(option.currentValue);
+  return raw && raw !== label ? `${label} (${raw})` : label;
+}
+
+/** Render the detailed account, active session, context window, and quota table view inside /usage. */
+function renderUsageDetails(
+  ctx: PanelRenderContext,
+  quotaSummary: QuotaSummary | undefined,
+  contextUsage: ReturnType<typeof formatContextUsage>,
+): JSX.Element {
+  const tier = ctx.metadata.tier;
+  const tierLabel = tier
+    ? (tier.id && tier.id !== tier.name ? `${tier.name} (${tier.id})` : tier.name)
+    : 'Not reported by ACP';
+  const connectionState = ctx.disconnected
+    ? 'Disconnected'
+    : ctx.agent
+      ? 'Connected'
+      : ctx.agentConnecting
+        ? 'Connecting'
+        : 'Idle';
+  const method = ctx.loginMethod;
+  const authMethodLabel = method
+    ? `${method.name} (${method.id})`
+    : ctx.authenticationKnown
+      ? 'Terminal sign-in not advertised'
+      : 'Waiting for ACP auth metadata';
+  const capabilityList = ctx.agent ? [
+    ...(ctx.agent.promptCapabilities?.image ? ['image'] : []),
+    ...(ctx.agent.promptCapabilities?.embeddedContext ? ['embeddedContext'] : []),
+    ...(ctx.agent.capabilities.listSessions ? ['sessions'] : []),
+    ...(ctx.agent.capabilities.loadSession ? ['load'] : []),
+    ...(ctx.agent.capabilities.resumeSession ? ['resume'] : []),
+    ...(ctx.agent.capabilities.closeSession ? ['close'] : []),
+    ...(ctx.agent.capabilities.additionalDirectories ? ['add-dir'] : []),
+    ...(ctx.agent.capabilities.appendSystemPrompt ? ['systemPrompt'] : []),
+  ] : [];
+  const modelOpt = modelOption(ctx.metadata.configOptions);
+  const thinkingOpt = thinkingOption(ctx.metadata.configOptions);
+  const usage = ctx.metadata.usage;
+  const remainingTokens = usage ? Math.max(0, usage.size - usage.used) : undefined;
+
+  return <col gap="md">
+    <section head="Account & connection">
+      <kv items={[
+        { k: 'Subscription tier', v: tierLabel },
+        ...(tier?.upgradeUri ? [{ k: 'Upgrade URL', v: tier.upgradeUri }] : []),
+        { k: 'Account identity', v: 'Official agy shared auth (email not exposed by ACP)' },
+        { k: 'Sign-in method', v: authMethodLabel },
+        { k: 'ACP runtime', v: `${ctx.options.executable ?? 'agy'} acp --sandbox (${connectionState})` },
+      ]} />
+    </section>
+    <section head="Active session & runtime">
+      <kv items={[
+        { k: 'Conversation', v: ctx.activeSessionId ? `${ctx.sessionTitle(ctx.activeSessionId)} (${ctx.activeSessionId})` : 'No active session' },
+        { k: 'Model', v: formatConfigDetail(modelOpt, 'Not reported') },
+        { k: 'Thinking effort', v: formatConfigDetail(thinkingOpt, 'Default') },
+        { k: 'Session mode', v: formatConfigDetail(ctx.modeOption, 'Default') },
+        {
+          k: 'Workspace',
+          v: ctx.options.additionalDirectories?.length
+            ? `${ctx.options.cwd} (+${ctx.options.additionalDirectories.length} --add-dir)`
+            : ctx.options.cwd,
+        },
+        { k: 'Capabilities', v: capabilityList.join(', ') || (ctx.agent ? 'Minimal ACP profile' : 'Unavailable') },
+      ]} />
+    </section>
+    <section head="Context & quota breakdown">
+      <col gap="sm">
+        {usage && contextUsage ? <>
+          <meter style="bar" size="sm"
+            value={contextUsage.percent / 100}
+            thresholds={{ warn: 0.75, bad: 0.9 }}
+            label={`Session context: ${contextUsage.summary}`} />
+          <kv items={[
+            { k: 'Used tokens', v: usage.used.toLocaleString() },
+            { k: 'Remaining tokens', v: (remainingTokens ?? 0).toLocaleString() },
+            { k: 'Context window', v: usage.size.toLocaleString() },
+            ...(usage.cost ? [{ k: 'Session cost', v: `${usage.cost.amount} ${usage.cost.currency}` }] : []),
+          ]} />
+        </> : <text><span s="muted">No session-context token usage has been reported by ACP yet.</span></text>}
+        {quotaSummary ? <table cols={[
+          { id: 'group', head: 'Model group', grow: 1, priority: 4 },
+          { id: 'limit', head: 'Limit', priority: 2 },
+          { id: 'meter', head: 'Quota bar', priority: 3 },
+          { id: 'remaining', head: 'Left', align: 'end', mono: true, priority: 4 },
+          { id: 'reset', head: 'Reset', mono: true, priority: 1 },
+        ]} rows={quotaSummary.rows.map((row, index) => ({
+          id: `detail-${index}`,
+          cells: {
+            group: row.group,
+            limit: row.limit,
+            meter: { meter: {
+              value: row.fraction,
+              tone: row.fraction <= 0.15 ? 'error' : row.fraction <= 0.35 ? 'warning' : 'success',
+            } },
+            remaining: row.remaining,
+            reset: row.reset,
+          },
+          title: `${row.group}: ${row.limit}, ${row.remaining} remaining, reset ${row.reset}`,
+        }))} /> : ctx.reportText && <md>{ctx.reportText}</md>}
+      </col>
+    </section>
+  </col>;
+}
+
 /** Render the active modal picker, prefs window, report overlay, or inspector dialog. */
 export function renderActivePanel(ctx: PanelRenderContext): JSX.Element {
   const currentPanel = ctx.panel;
@@ -1559,7 +1670,7 @@ export function renderActivePanel(ctx: PanelRenderContext): JSX.Element {
       currentPanel.kind === 'account' || currentPanel.kind === 'account-switch' ? 'user' : 'slash'}
     end={<button keys={['esc']} variant="quiet" disabled={ctx.authBusy} onClick={ctx.onClosePanel}>Close</button>}>
     {currentPanel.kind === 'report' ? <>
-      <scroll key="overlay-scroll" max={{ h: ctx.rLayout.inspectBodyMaxH }}>
+      <scroll key="overlay-scroll" bar="always" max={{ h: ctx.rLayout.inspectBodyMaxH }}>
         {currentPanel.report === 'usage' ? <col gap="md">
           <tabs variant="segmented" active={ctx.usageTab}
             items={[
@@ -1567,7 +1678,9 @@ export function renderActivePanel(ctx: PanelRenderContext): JSX.Element {
               { id: 'details', label: 'Details' },
               { id: 'raw', label: 'Raw report' },
             ]}
-            onChange={event => ctx.onSetUsageTab(String(event.value ?? 'overview'))} />
+            onSelect={event => ctx.onSetUsageTab(String(event.item || 'overview'))}
+            onActivate={event => ctx.onSetUsageTab(String(event.item || 'overview'))}
+            onChange={event => ctx.onSetUsageTab(String(event.value ?? event.item ?? 'overview'))} />
           {ctx.reportLoading && <spinner label="Reading official /usage report" />}
           {ctx.usageTab === 'overview' && <>
             <stats items={[
@@ -1615,25 +1728,7 @@ export function renderActivePanel(ctx: PanelRenderContext): JSX.Element {
               title: `${row.group}: ${row.limit}, ${row.remaining} remaining, reset ${row.reset}`,
             }))} /> : ctx.reportText && <md>{ctx.reportText}</md>}
           </>}
-          {ctx.usageTab === 'details' && <>
-            {(ctx.metadata.tier || ctx.metadata.usage) ? <kv items={[
-              ...(ctx.metadata.tier ? [{ k: 'Subscription tier', v: ctx.metadata.tier.name }] : []),
-              ...(ctx.metadata.usage ? [
-                { k: 'Session context tokens', v: ctx.metadata.usage.used.toLocaleString() },
-                { k: 'Context window', v: ctx.metadata.usage.size.toLocaleString() },
-                ...(ctx.metadata.usage.cost ? [{ k: 'Session cost', v: `${ctx.metadata.usage.cost.amount} ${ctx.metadata.usage.cost.currency}` }] : []),
-              ] : []),
-            ]} /> : <text>No session-context usage or plan tier has been reported by ACP yet.</text>}
-            {quotas ? <table cols={[
-              { id: 'group', head: 'Model group', grow: 1, priority: 4 },
-              { id: 'limit', head: 'Limit', priority: 2 },
-              { id: 'remaining', head: 'Remaining', align: 'end', mono: true, priority: 3 },
-              { id: 'reset', head: 'Reset', mono: true, priority: 1 },
-            ]} rows={quotas.map((row, index) => ({
-              id: `detail-${index}`,
-              cells: { group: row.group, limit: row.limit, remaining: row.remaining, reset: row.reset },
-            }))} /> : ctx.reportText && <md>{ctx.reportText}</md>}
-          </>}
+          {ctx.usageTab === 'details' && renderUsageDetails(ctx, quotaSummary, contextUsage)}
           {ctx.usageTab === 'raw' && (ctx.reportText
             ? <code wrap>{ctx.reportText}</code>
             : <text><span s="muted">No raw report output captured yet.</span></text>)}
@@ -1647,7 +1742,7 @@ export function renderActivePanel(ctx: PanelRenderContext): JSX.Element {
         onClick={() => ctx.onLoadReport(currentPanel.report)}>Refresh report</button>
       <text wrap="word">Up/Down/PgUp/PgDn scroll. Tab selects Refresh or Close. Enter activates; Esc returns to the conversation.</text>
     </> : <>
-      {currentPanel.kind === 'account' && <scroll key="overlay-scroll" max={{ h: ctx.rLayout.inspectBodyMaxH }}>
+      {currentPanel.kind === 'account' && <scroll key="overlay-scroll" bar="always" max={{ h: ctx.rLayout.inspectBodyMaxH }}>
         <col gap="xs">
           <kv items={[
             { k: 'ACP connection', v: ctx.disconnected ? 'Disconnected' : ctx.agent ? 'Connected; model access not guaranteed' : 'Connecting' },
@@ -1663,14 +1758,14 @@ export function renderActivePanel(ctx: PanelRenderContext): JSX.Element {
           {(ctx.busy || ctx.changingConfig || ctx.sessionOperation) && <text>Wait for the active operation before signing in or changing accounts.</text>}
         </col>
       </scroll>}
-      {currentPanel.kind === 'account-switch' && <scroll key="overlay-scroll" max={{ h: ctx.rLayout.inspectBodyMaxH }}>
+      {currentPanel.kind === 'account-switch' && <scroll key="overlay-scroll" bar="always" max={{ h: ctx.rLayout.inspectBodyMaxH }}>
         <col gap="xs">
           <text wrap="word">This signs out first. Antigravity shares credentials across CLI, App and IDE extensions, so they may also lose their login. If login is cancelled, the old credentials are not restored.</text>
           <text wrap="word">Choose your other account in the official login flow. Afterwards this frontend starts a fresh session and keeps only your unsent draft. It does not replay the failed prompt or automatically transfer the old conversation.</text>
           {method && <code wrap>{JSON.stringify([ctx.options.executable ?? 'agy', 'acp', '--sandbox', ...(method.args ?? [])])}</code>}
         </col>
       </scroll>}
-      {currentPanel.kind === 'permissions' && <scroll key="overlay-scroll" max={{ h: ctx.rLayout.inspectBodyMaxH }}>
+      {currentPanel.kind === 'permissions' && <scroll key="overlay-scroll" bar="always" max={{ h: ctx.rLayout.inspectBodyMaxH }}>
         <col gap="xs">
           <kv items={[
             { k: 'Session mode', v: mode ? configLabel(mode) : 'Not reported by agy' },
