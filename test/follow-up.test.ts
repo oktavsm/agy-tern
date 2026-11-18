@@ -3,6 +3,7 @@ import {
   createFollowUpSessionState,
   extractMarkdownFollowUpQuestions,
   extractToolFollowUpQuestions,
+  followUpFocusTarget,
   formatFollowUpPromptReply,
   parseElicitationRequest,
   validateElicitationAnswers,
@@ -111,5 +112,68 @@ describe('follow-up question and ACP elicitation helpers', () => {
       'Should I commit the workflow files now?',
       'Do you want a v0.1.0 release tag created?',
     ]);
+    expect(followUpFocusTarget(createFollowUpSessionState('Follow-up', '', fromMarkdown))).toBe(
+      'layer.panel.overlay-scroll.form.field-q1.input-q1',
+    );
+
+    const mcMarkdown = extractMarkdownFollowUpQuestions([
+      'Which release step should we run next?',
+      '1. **Verify locally** - Run inside Tern first',
+      '2. **Cut v0.2.2** - Commit, tag, and push release',
+    ].join('\n'));
+    expect(mcMarkdown).toHaveLength(1);
+    expect(mcMarkdown[0]).toMatchObject({
+      kind: 'single-select',
+      name: 'q1',
+      label: 'Which release step should we run next?',
+      allowCustom: true,
+    });
+    if (mcMarkdown[0]?.kind === 'single-select') {
+      expect(mcMarkdown[0].options).toEqual([
+        { value: 'Verify locally', label: 'Verify locally', description: 'Run inside Tern first' },
+        { value: 'Cut v0.2.2', label: 'Cut v0.2.2', description: 'Commit, tag, and push release' },
+      ]);
+    }
+    const mcState = createFollowUpSessionState('Follow-up', '', mcMarkdown);
+    expect(followUpFocusTarget(mcState)).toBeNull();
+
+    // Preceding summary bullets must NOT become choices for the final question line.
+    const summaryThenQuestion = extractMarkdownFollowUpQuestions([
+      'Verification summary:',
+      '- typecheck passed',
+      '- tests passed',
+      '',
+      'Do you want to cut v0.2.2 now?',
+    ].join('\n'));
+    expect(summaryThenQuestion).toHaveLength(1);
+    expect(summaryThenQuestion[0]?.kind).toBe('text');
+
+    // Prompt + choices tool shape and custom text overriding required single-select default.
+    const promptChoiceTool = extractToolFollowUpQuestions({
+      toolCallId: 'tc-choice',
+      name: 'ask_user',
+      status: 'in_progress',
+      rawInput: {
+        prompt: 'Select environment',
+        choices: ['dev', 'prod'],
+      },
+    });
+    expect(promptChoiceTool?.fields[0]).toMatchObject({
+      kind: 'single-select',
+      label: 'Select environment',
+    });
+    const reqState = createFollowUpSessionState('Deploy', '', [{
+      kind: 'single-select',
+      name: 'env',
+      label: 'Env',
+      required: true,
+      allowCustom: true,
+      options: [{ value: 'staging', label: 'Staging' }, { value: 'prod', label: 'Prod' }],
+    }]);
+    reqState.customDrafts.env = 'canary';
+    expect(validateElicitationAnswers(reqState.fields, reqState)).toEqual({
+      ok: true,
+      content: { env: 'canary' },
+    });
   });
 });

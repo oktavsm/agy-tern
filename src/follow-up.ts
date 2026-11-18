@@ -86,6 +86,7 @@ export interface FollowUpSessionState {
   answers: Record<string, QuestionAnswerValue>;
   customDrafts: Record<string, string>;
   freeNote: string;
+  draftCursors?: Record<string, { cursor: number; anchor?: number }>;
   error?: string;
 }
 
@@ -274,6 +275,7 @@ export function createFollowUpSessionState(
     answers,
     customDrafts,
     freeNote: '',
+    draftCursors: {},
   };
 }
 
@@ -308,7 +310,8 @@ export function validateElicitationAnswers(
     }
     if (field.kind === 'single-select') {
       const custom = (state.customDrafts[field.name] ?? '').trim();
-      const val = typeof raw === 'string' && raw ? raw : (field.allowCustom && custom ? custom : '');
+      const rawStr = typeof raw === 'string' && raw ? raw : '';
+      const val = field.allowCustom && custom ? custom : rawStr;
       if (!val) {
         if (field.required) return { ok: false, error: `"${field.label}" requires a selection.`, fieldIndex: i };
         continue;
@@ -422,7 +425,12 @@ export function extractToolFollowUpQuestions(call: ToolCallUpdate): { message: s
       const parsed = normalizeQuestionItem(q, idx);
       if (parsed) fields.push(parsed);
     });
-  } else if (typeof input.question === 'string' && input.question.trim()) {
+  } else if (
+    (typeof input.question === 'string' && input.question.trim()) ||
+    (typeof input.prompt === 'string' && input.prompt.trim()) ||
+    Array.isArray(input.options) ||
+    Array.isArray(input.choices)
+  ) {
     const parsed = normalizeQuestionItem(input, 0);
     if (parsed) fields.push(parsed);
   }
@@ -435,12 +443,56 @@ export function extractToolFollowUpQuestions(call: ToolCallUpdate): { message: s
   };
 }
 
-/** Detect clear follow-up questions at the end of an agent markdown reply so the user can answer via modal. */
+function parseMarkdownChoiceOption(rawLine: string): QuestionOption | undefined {
+  const match = /^(?:[-*+]\s+(?:\[[ xX]\]\s+)?|\d+[.)]\s+|[A-Za-z][.)]\s+)(.+)$/.exec(rawLine);
+  if (!match) return undefined;
+  const body = match[1]!.trim();
+  if (!body || body.endsWith('?') || body.length > 180) return undefined;
+  const splitMatch = /^\*\*([^*\n]{1,80})\*\*\s*(?:[:\-]+\s*(.+))?$/.exec(body);
+  if (splitMatch) {
+    const label = splitMatch[1]!.trim();
+    const description = splitMatch[2]?.replace(/[*_`]+/g, '').trim();
+    return {
+      value: label,
+      label,
+      ...(description ? { description } : {}),
+    };
+  }
+  const clean = body.replace(/[*_`]+/g, '').trim();
+  if (!clean) return undefined;
+  return { value: clean, label: clean };
+}
+
+/** Detect clear follow-up questions or multiple-choice prompts at the end of an agent markdown reply. */
 export function extractMarkdownFollowUpQuestions(markdown: string): QuestionField[] {
   if (!markdown || !markdown.includes('?')) return [];
   const stripped = markdown.replace(/```[\s\S]*?```/g, ' ').trim();
-  const tail = stripped.slice(-1_200);
+  const tail = stripped.slice(-1_500);
   const lines = tail.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+
+  // Check for a trailing question line immediately followed by 2..6 list choices.
+  const trailingOptions: QuestionOption[] = [];
+  let cursor = lines.length - 1;
+  while (cursor >= 0 && trailingOptions.length < 6) {
+    const parsedOpt = parseMarkdownChoiceOption(lines[cursor]!);
+    if (!parsedOpt) break;
+    trailingOptions.unshift(parsedOpt);
+    cursor--;
+  }
+  if (trailingOptions.length >= 2 && cursor >= 0) {
+    const heading = lines[cursor]!.replace(/^(?:\*\*|\*|>+\s*|#{1,3}\s+)+/, '').replace(/\*\*$/g, '').trim();
+    if (heading.endsWith('?') && heading.length >= 8 && heading.length <= 220) {
+      return [{
+        kind: 'single-select',
+        name: 'q1',
+        label: heading,
+        required: false,
+        options: trailingOptions,
+        allowCustom: true,
+      }];
+    }
+  }
+
   const questions: string[] = [];
   for (let i = lines.length - 1; i >= 0 && questions.length < 4; i--) {
     const raw = lines[i]!;
@@ -457,6 +509,17 @@ export function extractMarkdownFollowUpQuestions(markdown: string): QuestionFiel
     label,
     required: false,
   }));
+}
+
+/** Return the Tern focus target ID for the currently active follow-up input field, or null when a choice button leads. */
+export function followUpFocusTarget(state: FollowUpSessionState | undefined): string | null {
+  if (!state || !state.fields.length) return null;
+  const field = state.fields[state.activeFieldIdx] ?? state.fields[0];
+  if (!field) return null;
+  if (field.kind === 'text' || field.kind === 'number' || field.kind === 'integer') {
+    return `layer.panel.overlay-scroll.form.field-${field.name}.input-${field.name}`;
+  }
+  return null;
 }
 
 /** Format user modal answers into a crisp prompt reply sent to the ACP session. */

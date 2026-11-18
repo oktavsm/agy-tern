@@ -2,6 +2,20 @@
 
 All notable changes to `agy-tern` are documented in this file.
 
+## [0.2.2] - 2026-11-18
+
+### Added
+- Antigravity visual branding: native square logo badge rendered via Tern PNG blob on the welcome screen and assistant message avatars (with automatic `tern` icon fallback), plus adaptive dark/light lockup header in `README.md`.
+- Live expandable Gemini reasoning cards (`<trace variant="card">`) that stream active thought text while working, show live extracted step topics in both the card title and working HUD, and fold smoothly once completed unless pinned or configured open.
+- Adaptive `agy-motion` CSS stylesheet choreography (`agy-brand-in`, `agy-card-in`, `agy-hud-in`, `agy-thought-rail`, `agy-composer-halo`), paired with `orbit` startup spinners and `kitt` active-turn shimmer while respecting `motion: reduced` and `prefers-reduced-motion`.
+- Automatic centered follow-up modal opening at turn completion for tool follow-up payloads and markdown questions/multiple-choice lists, including clickable option extraction for trailing question choice blocks and `prompt`/`choices` tool inputs.
+
+### Fixed
+- Fixed `Tern: unknown id layer.panel.overlay-scroll.input-q1` when opening text follow-up modals by adding deterministic `key="form"` hierarchy and `followUpFocusTarget()` focus resolution across open, validation errors, and `Tab` field navigation.
+- Fixed uneditable free-form `<input>` fields inside follow-up modals (`input-*`, `custom-*`, `free-note`) by dispatching `ctx.onFocus(event.id)` on click/focus and tracking native `cursor`/`anchor` state per field.
+- Resolved single-select custom-answer override conflicts so preset selection and `"Or type a custom answer..."` stay mutually consistent across validation and prompt submission.
+- Surfaced explicit toast lock reasons when locked ACP options (`Model` / `Thinking level` while busy, disconnected, or single-option), missing slash command targets, or unavailable session actions are triggered in `/settings`, narrow dock segments, or the composer, and added `cfg-model` / `cfg-thought_level` / `perm-mode` colon-free row IDs plus `/help [query]` filtering and `onEdit` search input handlers across picker panels.
+
 ## [0.2.1] - 2026-11-18
 
 ### Added

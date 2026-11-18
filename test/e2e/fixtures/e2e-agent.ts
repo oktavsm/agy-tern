@@ -1201,6 +1201,10 @@ const connection = agent({ name: 'e2e-protocol-fixture' })
     } else if (command === 'mode-notify') {
       await notify({ sessionUpdate: 'current_mode_update', currentModeId: 'accept-edits' });
       await text('Mode updated via current_mode_update.');
+    } else if (command === 'markdown-followup') {
+      await text('Summary complete.\n\nReady to test or release?');
+    } else if (command === 'markdown-choice') {
+      await text('Which step should we take next?\n1. **Run locally** - Inspect animations in Tern\n2. **Release v0.2.2** - Commit and publish tag');
     } else if (command === 'ask-followup') {
       const reply = await client.request(methods.client.elicitation.create, {
         sessionId,
@@ -1218,6 +1222,11 @@ const connection = agent({ name: 'e2e-protocol-fixture' })
                 { const: 'stable', title: 'Stable release' },
                 { const: 'beta', title: 'Beta prerelease' },
               ],
+            },
+            other: {
+              type: 'string',
+              title: 'Other',
+              description: 'Optional free-form note',
             },
           },
         },

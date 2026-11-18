@@ -4,9 +4,11 @@ import { DEFAULT_PREFS } from '../src/prefs';
 import {
   buildSettingsViewData,
   extractChangeBoolean,
+  getConfigLockReason,
   patchForLocalPrefChange,
   patchForPrefRowReset,
   stepSettingsKey,
+  stripConfigPrefix,
   visibleSettingsRows,
 } from '../src/settings-nav';
 
@@ -113,41 +115,43 @@ describe('settings navigation and controls', () => {
     const toggleStep = stepSettingsKey(step, key('enter'), view.sections);
     expect(toggleStep.effect).toEqual({ kind: 'prefs', patch: { thoughtExpanded: true } });
 
-    // Tab switches to Session & Model page and focuses first row (cfg:model).
-    const tabStep = stepSettingsKey(toggleStep, key('tab'), view.sections);
+    // Tab switches to Session & Model page and focuses first row (cfg-model).
+    const tabStep = stepSettingsKey(toggleStep, key('tab'), view.sections, sampleMetadata.configOptions);
     expect(tabStep.page).toBe('session');
-    expect(tabStep.focusRowId).toBe('cfg:model');
+    expect(tabStep.focusRowId).toBe('cfg-model');
+    expect(stripConfigPrefix('cfg-model')).toBe('model');
+    expect(stripConfigPrefix('perm-mode')).toBe('mode');
 
-    // Enter on menu-style ACP option opens the dedicated picker; Right cycles inline.
-    expect(stepSettingsKey(tabStep, key('enter'), view.sections).effect).toEqual({
-      kind: 'open-config',
-      optionId: 'model',
+    // Enter on Model row opens the dedicated picker; Right cycles inline when configOptions supplied.
+    expect(stepSettingsKey(tabStep, key('enter'), view.sections, sampleMetadata.configOptions).effect).toEqual({
+      kind: 'action',
+      act: 'open-config:model',
     });
-    expect(stepSettingsKey(tabStep, key('right'), view.sections).effect).toEqual({
+    expect(stepSettingsKey(tabStep, key('right'), view.sections, sampleMetadata.configOptions).effect).toEqual({
       kind: 'config',
       optionId: 'model',
       value: 'claude-4.5-sonnet',
     });
 
     // Moving down to Check for updates row on Session & Model page triggers check-updates action.
-    const modeRow = stepSettingsKey(tabStep, key('down'), view.sections);
-    expect(modeRow.focusRowId).toBe('cfg:mode');
-    const rememberRow = stepSettingsKey(modeRow, key('down'), view.sections);
+    const modeRow = stepSettingsKey(tabStep, key('down'), view.sections, sampleMetadata.configOptions);
+    expect(modeRow.focusRowId).toBe('cfg-mode');
+    const rememberRow = stepSettingsKey(modeRow, key('down'), view.sections, sampleMetadata.configOptions);
     expect(rememberRow.focusRowId).toBe('rememberModel');
-    const clearRow = stepSettingsKey(rememberRow, key('down'), view.sections);
+    const clearRow = stepSettingsKey(rememberRow, key('down'), view.sections, sampleMetadata.configOptions);
     expect(clearRow.focusRowId).toBe('clearRememberedModel');
-    const checkUpdatesRow = stepSettingsKey(clearRow, key('down'), view.sections);
+    const checkUpdatesRow = stepSettingsKey(clearRow, key('down'), view.sections, sampleMetadata.configOptions);
     expect(checkUpdatesRow.focusRowId).toBe('checkUpdates');
-    expect(stepSettingsKey(checkUpdatesRow, key('enter'), view.sections).effect).toEqual({
+    expect(stepSettingsKey(checkUpdatesRow, key('enter'), view.sections, sampleMetadata.configOptions).effect).toEqual({
       kind: 'action',
       act: 'check-updates',
     });
 
-    // Alt+3 jumps to Permissions & Sandbox; Left/Right on Mode edits perm:mode cleanly.
-    const permStep = stepSettingsKey(tabStep, key('3', { alt: true, text: '3' }), view.sections);
+    // Alt+3 jumps to Permissions & Sandbox; Left/Right on Mode edits perm-mode cleanly.
+    const permStep = stepSettingsKey(tabStep, key('3', { alt: true, text: '3' }), view.sections, sampleMetadata.configOptions);
     expect(permStep.page).toBe('permissions');
-    expect(permStep.focusRowId).toBe('perm:mode');
-    expect(stepSettingsKey(permStep, key('right'), view.sections).effect).toEqual({
+    expect(permStep.focusRowId).toBe('perm-mode');
+    expect(stepSettingsKey(permStep, key('right'), view.sections, sampleMetadata.configOptions).effect).toEqual({
       kind: 'config',
       optionId: 'mode',
       value: 'plan',
@@ -165,5 +169,16 @@ describe('settings navigation and controls', () => {
     const typed = stepSettingsKey(state, key('s', { text: 's' }), view.sections);
     const matches = visibleSettingsRows(view.sections, typed.page, typed.draft.text);
     expect(matches.some(entry => entry.row.id === typed.focusRowId)).toBe(true);
+  });
+
+  test('reports explicit lock reasons for busy, startup sync, disconnect, and pending approvals', () => {
+    expect(getConfigLockReason({ agent: {}, disconnected: false })).toBeUndefined();
+    expect(getConfigLockReason({ agent: {}, busy: true })).toContain('active turn');
+    expect(getConfigLockReason({ agent: {}, changingConfig: true })).toContain('previous');
+    expect(getConfigLockReason({ agent: {}, startupSyncingConfig: true })).toContain('startup');
+    expect(getConfigLockReason({ agent: {}, disconnected: true })).toContain('disconnected');
+    expect(getConfigLockReason({ agent: {}, authBusy: true })).toContain('sign-in');
+    expect(getConfigLockReason({ agent: {}, hasPendingPermissions: true })).toContain('approval');
+    expect(getConfigLockReason({ agent: undefined, agentConnecting: true })).toContain('Waiting');
   });
 });

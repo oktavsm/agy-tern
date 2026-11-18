@@ -21,6 +21,7 @@ import {
   searchTranscript,
   splitMarkdownSegments,
   summarizeQuotaRows,
+  summarizeThoughtTopic,
   summarizeToolCall,
   thinkingOption,
 } from '../src/ui-format';
@@ -364,5 +365,9 @@ describe('ui formatting helpers', () => {
     expect(longTool.target?.includes('\n')).toBe(false);
     expect((longTool.target?.length ?? 0) <= 88).toBe(true);
     expect(longTool.fullCommand).toBe(longCmd);
+
+    expect(summarizeThoughtTopic('')).toBeUndefined();
+    expect(summarizeThoughtTopic('**Inspecting settings**\nReading nav rows\n**Updating controls**\nWriting edits')).toBe('Updating controls');
+    expect(summarizeThoughtTopic('- First check `src/ui.tsx` for **inline** styles')).toBe('First check src/ui.tsx for inline styles');
   });
 });

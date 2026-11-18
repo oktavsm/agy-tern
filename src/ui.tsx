@@ -1,5 +1,5 @@
 /** @jsxImportSource @stencil-hq/tern */
-import { statSync } from 'node:fs';
+import { existsSync, readFileSync, statSync } from 'node:fs';
 import { basename, resolve } from 'node:path';
 import { connect, type DiffHunk, type EditEvent, type JSX, type Renderable, type Session, type Surface, type Tone } from '@stencil-hq/tern';
 import type { AuthMethodTerminal, SessionConfigOption, SessionInfo } from '@agentclientprotocol/sdk';
@@ -7,6 +7,9 @@ import { connectAgent } from './agent';
 import { terminalLoginProblem, type AgentAuthentication, type AgentMetadata, type AgentOptions, type AgentSession, type ConnectionStage, type ElicitationPrompt, type PermissionPrompt, type ResourceAttachment } from './contracts';
 import {
   createFollowUpSessionState,
+  extractMarkdownFollowUpQuestions,
+  extractToolFollowUpQuestions,
+  followUpFocusTarget,
   formatFollowUpPromptReply,
   parseElicitationRequest,
   validateElicitationAnswers,
@@ -96,6 +99,7 @@ import {
   parseUnifiedGitDiff,
   searchTranscript,
   searchTranscriptCached,
+  summarizeThoughtTopic,
   summarizeToolCall,
   thinkingOption,
   type ResponsiveLayout,
@@ -114,6 +118,7 @@ import {
 } from './picker-nav';
 import {
   buildSettingsViewData,
+  getConfigLockReason,
   isPrefsPageId,
   stepSettingsKey,
   type UpdateStatusState,
@@ -216,6 +221,66 @@ const COMPOSER_LAYOUT_CSS = [
   '}',
   '.sf-scroll.can > .sf-scroll-bar.held {',
   '  cursor: grabbing;',
+  '}',
+].join('\n');
+
+const AGY_MOTION_CSS = [
+  '@keyframes agy-brand-in {',
+  '  0% { opacity: 0; transform: translateY(6px) scale(0.9); }',
+  '  100% { opacity: 1; transform: translateY(0) scale(1); }',
+  '}',
+  '@keyframes agy-card-in {',
+  '  0% { opacity: 0; transform: translateY(4px); }',
+  '  100% { opacity: 1; transform: translateY(0); }',
+  '}',
+  '@keyframes agy-hud-in {',
+  '  0% { opacity: 0; transform: translateY(3px); }',
+  '  100% { opacity: 1; transform: translateY(0); }',
+  '}',
+  '@keyframes agy-thought-rail {',
+  '  0%, 100% { border-left-color: rgb(from var(--accent) r g b / 45%); }',
+  '  50% { border-left-color: rgb(from var(--live) r g b / 85%); }',
+  '}',
+  '@keyframes agy-composer-halo {',
+  '  0%, 100% { box-shadow: 0 0 0 1px rgb(from var(--live) r g b / 22%); }',
+  '  50% { box-shadow: 0 0 0 1px rgb(from var(--live) r g b / 52%), 0 0 14px -4px rgb(from var(--live) r g b / 18%); }',
+  '}',
+  '@media (prefers-reduced-motion: no-preference) {',
+  "  [data-role='agy.brand.avatar'] {",
+  '    animation: agy-brand-in 340ms var(--out) both;',
+  '    transition: transform 180ms var(--out);',
+  '  }',
+  "  [data-role='agy.brand.avatar']:hover {",
+  '    transform: translateY(-1px) scale(1.03);',
+  '  }',
+  "  .sf-trace[data-role='agy.thought'],",
+  '  .sf-tool.card,',
+  "  [data-role='omp.queue.item'] {",
+  '    animation: agy-card-in 220ms var(--out) backwards;',
+  '  }',
+  "  .sf-trace[data-role='agy.thought'].st-running .sf-trace-prose {",
+  '    animation: agy-thought-rail 1.8s ease-in-out infinite;',
+  '  }',
+  "  .sf-row[data-role='omp.working'] {",
+  '    animation: agy-hud-in 180ms var(--out) backwards;',
+  '  }',
+  "  .sf-col[data-role='agy.dock.center'] .sf-row[data-role='omp.working'] ~ .sf-col[data-role='omp.editor'] .sf-editor:not(.focused) {",
+  '    animation: agy-composer-halo 2.4s ease-in-out infinite;',
+  '  }',
+  '  .sf-suggestions .sf-sug:hover {',
+  '    transform: translateY(-1px);',
+  '  }',
+  '}',
+  '.sf-still [data-role=\'agy.brand.avatar\'],',
+  '.sf-still .sf-trace[data-role=\'agy.thought\'],',
+  '.sf-still .sf-trace[data-role=\'agy.thought\'].st-running .sf-trace-prose,',
+  '.sf-still .sf-tool.card,',
+  '.sf-still [data-role=\'omp.queue.item\'],',
+  '.sf-still .sf-row[data-role=\'omp.working\'],',
+  '.sf-still .sf-col[data-role=\'agy.dock.center\'] .sf-row[data-role=\'omp.working\'] ~ .sf-col[data-role=\'omp.editor\'] .sf-editor,',
+  '.sf-still .sf-suggestions .sf-sug {',
+  '  animation: none !important;',
+  '  transition: none !important;',
   '}',
 ].join('\n');
 
@@ -385,6 +450,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
   }
   let turnStartedAt: number | undefined;
   const blobCache = new Map<string, string>();
+  let antigravityLogoBlob: string | undefined;
   const previousSessionId = launch?.previousSessionId;
   let inspectReturnPanel: Panel | undefined;
   const viewportCols = (): number => renderController?.cols ?? (process.stdout.columns || 120);
@@ -464,9 +530,21 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     }, 2_600);
   }
 
+  let motionSheetApplied: boolean | undefined;
+
+  function syncMotionStylesheet(): void {
+    if (!session?.caps.features.includes('styles') || !surface || surface.closed) return;
+    const reduceMotion = renderController?.effectiveReduceMotion() ?? (userPrefs.motion === 'reduced');
+    const wantActive = !reduceMotion;
+    if (motionSheetApplied === wantActive) return;
+    motionSheetApplied = wantActive;
+    surface.stylesheet('agy-motion', wantActive ? AGY_MOTION_CSS : null);
+  }
+
   function updatePrefs(patch: Partial<UserPrefs>): void {
     userPrefs = { ...userPrefs, ...patch };
     renderController?.updatePreferences({ maxFps: userPrefs.maxFps, motion: userPrefs.motion });
+    syncMotionStylesheet();
     render();
     void prefsStore.update(patch).catch(error => {
       if (!quitting) showToast('Could not save preferences', error instanceof Error ? error.message : String(error));
@@ -476,6 +554,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
   function resetPrefs(): void {
     userPrefs = { ...DEFAULT_PREFS };
     renderController?.updatePreferences({ maxFps: userPrefs.maxFps, motion: userPrefs.motion });
+    syncMotionStylesheet();
     render();
     void prefsStore.reset().then(() => {
       if (!quitting) showToast('Local UI preferences reset');
@@ -591,6 +670,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         followUpState.error = checked.error;
         followUpState.activeFieldIdx = checked.fieldIndex;
         render();
+        surface?.focus(followUpFocusTarget(followUpState));
         return;
       }
       elicitations.shift();
@@ -972,6 +1052,18 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     }
   }
 
+  function loadAntigravityLogoBlob(): string | undefined {
+    if (!session || session.closed) return undefined;
+    const assetPath = resolve(import.meta.dir, '..', 'assets', 'antigravity-logo.png');
+    try {
+      if (!existsSync(assetPath)) return undefined;
+      const bytes = readFileSync(assetPath);
+      return bytes.byteLength > 0 ? session.blob(bytes, 'image/png') : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
   function openInspect(title: string, item: InspectTarget, subtitle?: string): void {
     if (permissions.length || quitting) return;
     if (panel && panel.kind !== 'inspect') inspectReturnPanel = panel;
@@ -1129,8 +1221,36 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     });
   }
 
+  function configLockReason(): string | undefined {
+    return getConfigLockReason({
+      agent,
+      disconnected,
+      agentConnecting,
+      busy,
+      changingConfig,
+      startupSyncingConfig,
+      sessionOperation,
+      authBusy,
+      hasPendingPermissions: permissions.length > 0,
+    });
+  }
+
   function runSessionAction(label: string, action: (connected: AgentSession) => Promise<void>): void {
-    if (!agent || busy || changingConfig || sessionOperation || authBusy || disconnected || permissions.length || quitting) return;
+    if (quitting) return;
+    const lock = getConfigLockReason({
+      agent,
+      disconnected,
+      agentConnecting,
+      busy,
+      changingConfig,
+      sessionOperation,
+      authBusy,
+      hasPendingPermissions: permissions.length > 0,
+    });
+    if (lock || !agent) {
+      showToast(`Cannot ${label.toLowerCase()}`, lock ?? 'Antigravity session is not ready yet');
+      return;
+    }
     configSyncToken++;
     sessionOperation = label;
     panelError = '';
@@ -1646,11 +1766,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     const isPickerPanel = next.kind === 'commands' || next.kind === 'config' || next.kind === 'sessions' ||
       next.kind === 'changes' || next.kind === 'find' || next.kind === 'tasks' || next.kind === 'mcp' || next.kind === 'plugins' ||
       next.kind === 'agents' || next.kind === 'templates';
-    const firstFollowUpField = next.kind === 'followup' ? followUpState?.fields[0] : undefined;
-    const followUpFocus = next.kind === 'followup' && firstFollowUpField &&
-      (firstFollowUpField.kind === 'text' || firstFollowUpField.kind === 'number' || firstFollowUpField.kind === 'integer')
-      ? `layer.panel.overlay-scroll.input-${firstFollowUpField.name}`
-      : null;
+    const followUpFocus = next.kind === 'followup' ? followUpFocusTarget(followUpState) : null;
     const targetFocus = next.kind === 'settings' ? 'layer.prefs'
       : isPickerPanel && !needsCustomFocus ? 'layer.picker'
       : needsCustomFocus ? 'layer.panel.query'
@@ -1678,27 +1794,57 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
   }
 
   function changeConfig(option: SessionConfigOption, value: string | boolean): void {
-    if (!agent || busy || changingConfig || sessionOperation || authBusy || disconnected || permissions.length) return;
-    configSyncToken++;
+    const lock = getConfigLockReason({
+      agent,
+      disconnected,
+      agentConnecting,
+      busy,
+      changingConfig,
+      sessionOperation,
+      authBusy,
+      hasPendingPermissions: permissions.length > 0,
+    });
+    if (lock || !agent) {
+      showToast(`Cannot update ${option.name}`, lock ?? 'Antigravity session is not ready yet');
+      return;
+    }
+    if (option.currentValue === value) {
+      showToast(`${option.name} already set`, configLabel(option));
+      return;
+    }
+    const myToken = ++configSyncToken;
     changingConfig = true;
     panelError = '';
+    if (panel?.kind === 'settings') {
+      const targetName = typeof value === 'string'
+        ? (configValues(option).find(entry => entry.value === value)?.name ?? value)
+        : (value ? 'On' : 'Off');
+      showToast(`Updating ${option.name}...`, targetName);
+    }
     render();
     const active = agent;
     configTask = configSyncPromise.catch(() => {}).then(() => {
-      if (quitting) return;
+      if (quitting || myToken !== configSyncToken) return;
       return active.setConfigOption(option.id, value);
     }).then(() => {
-      if (!quitting && userPrefs.rememberModel && typeof value === 'string') {
+      if (quitting || myToken !== configSyncToken) return;
+      if (userPrefs.rememberModel && typeof value === 'string') {
         if (option.category === 'model' || option.id === 'model') updatePrefs({ lastModel: value });
         else if (option.category === 'thought_level' || option.id === 'thought_level') updatePrefs({ lastThinking: value });
       }
-      if (!quitting && panel?.kind !== 'settings') stepBackPanel();
-      else if (!quitting) showToast(`${option.name} updated`);
+      if (panel?.kind === 'config' && panel.id === option.id) {
+        const returnedToSettings = settingsChildPanel;
+        stepBackPanel();
+        if (returnedToSettings) showToast(`${option.name} updated`);
+      } else if (panel?.kind === 'settings') {
+        showToast(`${option.name} updated`);
+      }
     }).catch(error => {
+      if (quitting || myToken !== configSyncToken) return;
       panelError = error instanceof Error ? error.message : String(error);
-      if (panel?.kind === 'settings') showToast(`Could not update ${option.name}`, panelError);
+      showToast(`Could not update ${option.name}`, panelError);
     }).finally(() => {
-      changingConfig = false;
+      if (myToken === configSyncToken) changingConfig = false;
       render();
     });
   }
@@ -1733,7 +1879,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     }
     if (command.local) {
       if (args && command.local !== 'model' && command.local !== 'sessions' && command.local !== 'rename' &&
-        command.local !== 'export' && command.local !== 'find' && command.local !== 'templates') {
+        command.local !== 'export' && command.local !== 'find' && command.local !== 'templates' && command.local !== 'help') {
         stateManager.getConversation().notice(`/${command.name} does not take arguments in this frontend.`, true);
         render();
         return;
@@ -1741,7 +1887,10 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       if (st.draft.text.startsWith('/')) stateManager.resetDraft();
       switch (command.local) {
         case 'exit': quit(); return;
-        case 'help': openPanel({ kind: 'commands' }); return;
+        case 'help':
+          openPanel({ kind: 'commands' });
+          if (args) { panelDraft = { text: args, cursor: args.length }; render(); }
+          return;
         case 'account':
         case 'login': openPanel({ kind: 'account' }); return;
         case 'switch-account': openPanel({ kind: 'account-switch' }); return;
@@ -1791,7 +1940,12 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
           return;
         case 'model': {
           const option = modelOption(metadata.configOptions);
-          if (!option) { openPanel({ kind: 'settings' }); panelError = 'This agy session did not supply a model selector.'; render(); return; }
+          if (!option) {
+            prefsPage = 'session';
+            openPanel({ kind: 'settings' });
+            showToast('Model selector unavailable', 'This agy session did not supply a model option');
+            return;
+          }
           if (args) {
             const value = configValues(option).find(value => value.value === args || value.name.toLowerCase() === args.toLowerCase());
             openPanel({ kind: 'config', id: option.id });
@@ -1802,7 +1956,11 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         }
       }
     }
-    if (busy || changingConfig || sessionOperation || authBusy) return;
+    const remoteLock = configLockReason();
+    if (remoteLock) {
+      showToast(`Cannot run /${command.name}`, remoteLock);
+      return;
+    }
     closePanel();
     stateManager.resetDraft();
     submitPrompt(`/${command.name}${args ? ` ${args}` : ''}`);
@@ -1882,6 +2040,36 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       }
       render();
       surface?.scroll('main.conversation', 'end');
+      if (
+        completedNormally &&
+        !quitting &&
+        !disconnected &&
+        !panel &&
+        !permissions.length &&
+        !elicitations.length &&
+        !replayCoordinator.isReplaying &&
+        activeConv === stateManager.getConversation()
+      ) {
+        const turnEntries = activeConv.entries.slice(entryCountBeforePrompt);
+        const lastAgentMsg = [...turnEntries].reverse().find(
+          entry => entry.type === 'message' && entry.role === 'agent' && entry.text.trim(),
+        );
+        const mdQuestions = lastAgentMsg?.type === 'message'
+          ? extractMarkdownFollowUpQuestions(lastAgentMsg.text)
+          : [];
+        if (mdQuestions.length > 0) {
+          openFollowUpModal('Follow-up questions', 'Select an option or enter your answer below.', mdQuestions);
+        } else {
+          const toolPrompt = [...turnEntries]
+            .reverse()
+            .filter(entry => entry.type === 'tool')
+            .map(entry => ({ entry, parsed: extractToolFollowUpQuestions(entry.call) }))
+            .find(item => item.parsed && item.parsed.fields.length > 0);
+          if (toolPrompt?.parsed) {
+            openFollowUpModal('Follow-up questions', toolPrompt.parsed.message, toolPrompt.parsed.fields);
+          }
+        }
+      }
     });
   }
 
@@ -2241,6 +2429,8 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       busy,
       cancelling,
       changingConfig,
+      startupSyncingConfig,
+      hasPendingPermissions: permissions.length > 0,
       extLoading,
       reportLoading,
       reportText,
@@ -2452,9 +2642,15 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     const showHud = !!(busy || startupBusy || activeTools.length > 0 || (planSummary && activePlan) || (!showComposerBar && contextUsage));
     const activeToolTop = activeTools.at(-1);
     const activeToolSummary = activeToolTop ? summarizeToolCall(activeToolTop.call, options.cwd) : undefined;
+    const tailEntry = conv.entries.at(-1);
+    const activeThoughtTopic = !activeToolSummary && tailEntry?.type === 'thought' && tailEntry.endedAt === undefined
+      ? summarizeThoughtTopic(tailEntry.text, 44)
+      : undefined;
     const liveTaskLabel = activeToolSummary
       ? `Running${activeTools.length > 1 ? ` (${activeTools.length})` : ''}: ${activeToolSummary.title}${activeToolSummary.target ? ` · ${compactToolHeaderText(activeToolSummary.target, 36)}` : ''}`
-      : phase;
+      : activeThoughtTopic
+        ? `Thinking: ${activeThoughtTopic}`
+        : phase;
     const hudAgeMs = rc.stableAge(
       activeToolTop ? `hud:${activeToolTop.id}` : startupBusy ? 'hud:startup' : 'hud:turn',
       activeToolTop?.startedAt ?? (startupBusy ? connectStartedAt : turnStartedAt),
@@ -2470,6 +2666,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       working: busy,
       now: renderNow,
       agentStatus,
+      agentAvatarBlob: antigravityLogoBlob,
       prefs: userPrefs,
       proseMaxW: layout.proseMaxW,
       thoughtFoldOverrides: st.thoughtFoldOverrides,
@@ -2555,9 +2752,11 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       const recent = globalIdx >= Math.max(0, totalEntries - 8);
       const turnNumber = entry.type === 'message' && entry.role === 'user' ? ++turnCounter : undefined;
       const settled = isEntrySettled(entry, globalIdx, totalEntries, busy, replayCoordinator.isReplaying, activePlan);
-      const foldKey = entry.type === 'thought' || entry.type === 'compaction'
-        ? String(st.thoughtFoldOverrides.get(entry.id) ?? '')
-        : entry.type === 'tool' ? String(st.toolFoldOverrides.get(entry.id) ?? '') : '';
+      const foldKey = entry.type === 'thought'
+        ? `${String(st.thoughtFoldOverrides.get(entry.id) ?? '')}:${Number(entry.endedAt === undefined && busy)}`
+        : entry.type === 'compaction'
+          ? String(st.thoughtFoldOverrides.get(entry.id) ?? '')
+          : entry.type === 'tool' ? String(st.toolFoldOverrides.get(entry.id) ?? '') : '';
       const errorKey = entry.type === 'notice' && entry.error
         ? `${Number(entryCallbacks.canRetry)}${Number(entryCallbacks.canReconnect)}${Number(entryCallbacks.canSwitchAccount)}` : '';
       const stableAgeMs = entry.type === 'thought' || entry.type === 'tool'
@@ -2568,7 +2767,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         : renderNow;
       const entryAgentStatus = entry.type === 'message' && entry.role === 'agent' ? agentStatus : '';
       const entryRecent = entry.type === 'tool' ? (recent ? 1 : 0) : 0;
-      const sig = `${conv.revisionOf(entry)}|${continued ? 1 : 0}|${streaming ? 1 : 0}|${entryRecent}|${turnNumber ?? ''}|${settled ? 1 : 0}|${foldKey}|${errorKey}|${entryAgentStatus}|${userPrefs.diffMode}|${userPrefs.toolDisplay}|${Number(userPrefs.thoughtExpanded)}|${userPrefs.transcriptDensity}|${Number(userPrefs.showTimestamps)}|${layout.proseMaxW}|${pathPresenceCache.version}`;
+      const sig = `${conv.revisionOf(entry)}|${continued ? 1 : 0}|${streaming ? 1 : 0}|${entryRecent}|${turnNumber ?? ''}|${settled ? 1 : 0}|${foldKey}|${errorKey}|${entryAgentStatus}|${antigravityLogoBlob ? 1 : 0}|${userPrefs.diffMode}|${userPrefs.toolDisplay}|${Number(userPrefs.thoughtExpanded)}|${userPrefs.transcriptDensity}|${Number(userPrefs.showTimestamps)}|${layout.proseMaxW}|${pathPresenceCache.version}`;
       const record = rc.renderEntryMemoized(entry, { sig, settled }, () => (
         <Entry key={entry.id} entry={entry} continued={continued} streaming={streaming} recent={recent} turnNumber={turnNumber}
           callbacks={entryNow === renderNow ? entryCallbacks : { ...entryCallbacks, now: entryNow }} />
@@ -2591,11 +2790,12 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
           {visibleEntries.length ? visibleEntries.map(renderEntryNode) :
             <col key="empty-wrap" gap={layout.compactEmpty ? 'sm' : 'md'} align="center">
               {!agent && !disconnected && <row key="startup-progress" gap="sm" align="center">
-                <spinner style="starburst" />
-                <shimmer text={startupStageLabel(connectionStage)} />
+                <spinner style="orbit" />
+                <shimmer mode="classic" text={startupStageLabel(connectionStage)} />
                 <elapsed age={hudAgeMs} />
               </row>}
-              <empty icon={layout.compactEmpty ? undefined : 'tern'} title={agent ? 'Ask Antigravity about this project' : disconnected ? 'Antigravity is unavailable' : 'Connecting to Antigravity'}
+              {!layout.compactEmpty && antigravityLogoBlob && <avatar key="agy-brand" role="agy.brand.avatar" variant="square" size="lg" blob={antigravityLogoBlob} text="AG" seed="antigravity" title="Antigravity (agy acp)" />}
+              <empty icon={layout.compactEmpty ? undefined : antigravityLogoBlob ? '' : 'tern'} title={agent ? 'Ask Antigravity about this project' : disconnected ? 'Antigravity is unavailable' : 'Connecting to Antigravity'}
                 text={layout.compactEmpty ? (agent ? 'Use / for commands or @ for files & dirs.' : disconnected ? 'Open /account to sign in.' : startupStageLabel(connectionStage)) : (agent ? 'Type / for commands or @ to attach files, directories, and images (including gitignored entries). Thoughts, diffs, and one-time approvals appear here.' :
                   disconnected ? 'Open /account to sign in, or Quit to return to your shell.' : 'Initializing ACP subprocess, verifying shared agy authentication, and opening session...')} />
               {agent && !disconnected && !permission && rowsNow >= 20 && <suggestions variant="chips"
@@ -2620,15 +2820,15 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
             <row gap="sm" align="center" wrap>
               {(busy || activeTools.length > 0) ? <row key="live-turn" gap="sm" align="center">
                 <spinner style="starburst" />
-                <shimmer text={liveTaskLabel} />
+                <shimmer mode="kitt" text={liveTaskLabel} />
                 <elapsed age={hudAgeMs} />
                 <button size="sm" variant="quiet" onClick={() => openPanel({ kind: 'tasks' })}>Tasks</button>
                 <button size="sm" variant="danger" disabled={cancelling && 'Cancellation requested'} onClick={stop}>
                   {cancelling ? 'Stopping...' : 'Stop'}
                 </button>
               </row> : startupBusy && <row key="startup-hud" gap="sm" align="center">
-                <spinner style="starburst" />
-                <shimmer text={startupLabel} />
+                <spinner style="orbit" />
+                <shimmer mode="classic" text={startupLabel} />
                 <elapsed age={hudAgeMs} />
               </row>}
               {activePlan && planSummary && <checklist key="plan-hud" mode="hud"
@@ -2909,6 +3109,8 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
               onClick={() => {
                 if (agent && !disconnected && !permission) {
                   openPanel(currentModel ? { kind: 'config', id: currentModel.id } : { kind: 'settings' });
+                } else {
+                  showToast('Cannot open Model picker', configLockReason() ?? 'Wait until connected');
                 }
               }} />}
             {!showComposerBar && currentThinking && <seg key="thinking" priority={7} icon="thinking"
@@ -2924,6 +3126,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
               )}
               onClick={() => {
                 if (agent && !disconnected && !permission) openPanel({ kind: 'config', id: currentThinking.id });
+                else showToast('Cannot open Thinking level', configLockReason() ?? 'Wait until connected');
               }} />}
             {!showComposerBar && <seg key="mode" priority={6} icon="shield"
               tone={(!agent || !!permission) ? 'muted' : undefined}
@@ -2939,6 +3142,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
               )}
               onClick={() => {
                 if (agent && !permission) openPanel({ kind: 'permissions' });
+                else showToast('Cannot open Permissions', configLockReason() ?? 'Wait until connected');
               }} />}
             <seg key="sessions" priority={4} icon="history"
               tone={(!agent || disconnected || !!permission || busy || changingConfig || !!sessionOperation) ? 'muted' : undefined}
@@ -2955,6 +3159,8 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
               onClick={() => {
                 if (agent && !disconnected && !permission && !busy && !changingConfig && !sessionOperation) {
                   openPanel({ kind: 'sessions' });
+                } else {
+                  showToast('Cannot open Sessions', configLockReason() ?? 'Wait until connected');
                 }
               }} />
             <seg key="branch" priority={2} icon="branch"
@@ -3041,6 +3247,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     if (!session) return quitting ? outcome : { kind: 'unavailable' };
     if (signal.aborted || quitting) return outcome;
     surface = session.open({ mode: 'screen', title: 'Antigravity · agy-tern', font: 'sans' });
+    antigravityLogoBlob = loadAntigravityLogoBlob();
     if (session.caps.features.includes('styles')) {
       surface.stylesheet('agy-composer', COMPOSER_LAYOUT_CSS);
     }
@@ -3053,6 +3260,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       initialCols: process.stdout.columns || 120,
       initialRows: process.stdout.rows || 40,
     });
+    syncMotionStylesheet();
     void promptHistoryStore.load().then(saved => {
       if (quitting || !saved.length) return;
       const merged = [...saved];
@@ -3339,6 +3547,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
           render();
         } else {
           renderController.handleSessionEvent(input.event, render, process.stdout.rows || undefined);
+          if (input.event.ev === 'motion') syncMotionStylesheet();
         }
         continue;
       }
@@ -3442,6 +3651,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
               const step = key.name === 'up' || (key.name === 'tab' && key.shift) ? -1 : 1;
               followUpState.activeFieldIdx = (followUpState.activeFieldIdx + fields.length + step) % fields.length;
               render();
+              surface.focus(followUpFocusTarget(followUpState));
               continue;
             }
           }
@@ -3467,6 +3677,9 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
             agentConnecting,
             busy,
             changingConfig,
+            startupSyncingConfig,
+            authBusy,
+            hasPendingPermissions: permissions.length > 0,
             sessionOperation,
             updateStatus,
           });
@@ -3474,6 +3687,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
             { page: prefsPage, focusRowId: prefsFocus, draft: panelDraft },
             key,
             settingsView.sections,
+            metadata.configOptions,
           );
           prefsPage = step.page;
           prefsFocus = step.focusRowId;
@@ -3498,6 +3712,10 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
               continue;
             }
             if (effect.kind === 'action') {
+              if (effect.act.startsWith('open-config:')) {
+                openPanel({ kind: 'config', id: effect.act.slice('open-config:'.length) });
+                continue;
+              }
               if (effect.act === 'reset-prefs') {
                 resetPrefs();
                 continue;

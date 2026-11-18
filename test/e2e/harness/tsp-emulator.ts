@@ -1843,6 +1843,10 @@ export class TspHarness {
     return surface ? [...surface.settledIds] : [];
   }
 
+  getFocusedId(sf?: string): string | null | undefined {
+    return this.resolveSurface(sf)?.focusedId;
+  }
+
   getWireEvents(): readonly WireEventRecord[] {
     return this.wireEvents;
   }
@@ -1955,6 +1959,9 @@ export class TspHarness {
       for (const region of ['main', 'dock', 'layer'] as const) {
         const root = surface.regions[region];
         if (root) walk(root);
+      }
+      if (typeof surface.focusedId === 'string' && surface.focusedId.length > 0 && !this.findById(surface.focusedId, surface.id)) {
+        violations.push(`focusedId '${surface.focusedId}' does not exist in rendered tree`);
       }
     }
 

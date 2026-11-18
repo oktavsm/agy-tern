@@ -1,7 +1,7 @@
 import type { Key, PrefsControl, PrefsRow } from '@stencil-hq/tern';
 import type { SessionConfigOption } from '@agentclientprotocol/sdk';
 import type { AgentMetadata, AgentOptions, AgentSession } from './contracts';
-import { configValues } from './commands';
+import { configLabel, configValues } from './commands';
 import { draftKey, type Draft } from './draft';
 import {
   DEFAULT_MODEL_ID,
@@ -57,6 +57,9 @@ export interface SettingsViewInput {
   agentConnecting: boolean;
   busy: boolean;
   changingConfig: boolean;
+  startupSyncingConfig?: boolean;
+  authBusy?: boolean;
+  hasPendingPermissions?: boolean;
   sessionOperation: string | undefined;
   updateStatus?: UpdateStatusState;
 }
@@ -84,8 +87,31 @@ export function extractChangeBoolean(event: {
 }
 
 export function stripConfigPrefix(rowId: string): string | undefined {
-  if (rowId.startsWith('cfg:')) return rowId.slice(4);
-  if (rowId.startsWith('perm:')) return rowId.slice(5);
+  if (rowId.startsWith('cfg-') || rowId.startsWith('cfg:')) return rowId.slice(4);
+  if (rowId.startsWith('perm-') || rowId.startsWith('perm:')) return rowId.slice(5);
+  return undefined;
+}
+
+/** Return a clear user-facing reason when ACP config changes are temporarily blocked, or undefined when ready. */
+export function getConfigLockReason(input: {
+  agent?: unknown;
+  disconnected?: boolean;
+  agentConnecting?: boolean;
+  busy?: boolean;
+  changingConfig?: boolean;
+  startupSyncingConfig?: boolean;
+  sessionOperation?: string;
+  authBusy?: boolean;
+  hasPendingPermissions?: boolean;
+}): string | undefined {
+  if (input.authBusy) return 'Finish the active sign-in flow first';
+  if (input.hasPendingPermissions) return 'Resolve the pending tool approval first';
+  if (input.disconnected) return 'Session disconnected; reconnect to Antigravity first';
+  if (!input.agent) return input.agentConnecting ? 'Waiting for Antigravity connection...' : 'Antigravity session is not ready yet';
+  if (input.busy) return 'Wait for the active turn to finish';
+  if (input.sessionOperation) return `Wait until "${input.sessionOperation}" finishes`;
+  if (input.changingConfig) return 'Applying previous session option change...';
+  if (input.startupSyncingConfig) return 'Syncing startup model defaults...';
   return undefined;
 }
 
@@ -98,28 +124,36 @@ const LEAD_BY_PAGE: Record<PrefsPageId, string> = {
 
 export function buildSettingsViewData(input: SettingsViewInput): SettingsViewData {
   const { userPrefs, metadata, modeOption: mode } = input;
-  const lockReason = input.busy || input.changingConfig || !!input.sessionOperation || input.disconnected || !input.agent
-    ? 'Wait until the active session is idle and connected'
-    : undefined;
+  const lockReason = getConfigLockReason(input);
 
-  const sessionRows: PrefsRow[] = metadata.configOptions.map(option => ({
-    id: `cfg:${option.id}`,
-    label: option.name,
-    hint: option.description ?? option.id,
-    disabled: lockReason,
-    control: option.type === 'boolean'
-      ? { k: 'switch', on: Boolean(option.currentValue) }
-      : {
-        k: 'choice',
-        value: option.currentValue,
-        style: configValues(option).length <= 3 ? 'segmented' : 'menu',
-        options: configValues(option).map(entry => ({
-          value: entry.value,
-          label: entry.name,
-          detail: entry.description ?? undefined,
-        })),
-      },
-  }));
+  const sessionRows: PrefsRow[] = metadata.configOptions.map(option => {
+    const values = option.type === 'select' ? configValues(option) : [];
+    const currentText = configLabel(option);
+    const usePickerAction = option.type === 'select' && (values.length > 3 || option.category === 'model' || option.id === 'model');
+    const baseHint = option.description ?? (usePickerAction
+      ? `Current: ${currentText} · Click or Enter to choose from ${values.length} options`
+      : option.id);
+    return {
+      id: `cfg-${option.id}`,
+      label: option.name,
+      hint: lockReason ? `${baseHint} (${lockReason})` : baseHint,
+      disabled: usePickerAction ? undefined : lockReason,
+      control: option.type === 'boolean'
+        ? { k: 'switch', on: Boolean(option.currentValue) }
+        : usePickerAction
+          ? { k: 'action', act: `open-config:${option.id}`, label: currentText || 'Choose...' }
+          : {
+            k: 'choice',
+            value: option.currentValue,
+            style: 'segmented',
+            options: values.map(entry => ({
+              value: entry.value,
+              label: entry.name,
+              detail: entry.description ?? undefined,
+            })),
+          },
+    };
+  });
 
   const emptySessionHint = input.agentConnecting
     ? 'Waiting for agy ACP session initialization...'
@@ -171,7 +205,7 @@ export function buildSettingsViewData(input: SettingsViewInput): SettingsViewDat
         {
           id: 'thoughtExpanded',
           label: 'Expand Thought blocks by default',
-          hint: 'Keep agent reasoning open automatically instead of collapsed as Thought >',
+          hint: 'Keep reasoning expanded after turns finish (live thinking expands while running)',
           changed: userPrefs.thoughtExpanded !== DEFAULT_PREFS.thoughtExpanded,
           defaultLabel: DEFAULT_PREFS.thoughtExpanded ? 'On' : 'Off',
           control: { k: 'switch', on: userPrefs.thoughtExpanded },
@@ -358,7 +392,7 @@ export function buildSettingsViewData(input: SettingsViewInput): SettingsViewDat
       page: 'permissions',
       rows: [
         ...(mode && mode.type === 'select' ? [{
-          id: `perm:${mode.id}`,
+          id: `perm-${mode.id}`,
           label: mode.name,
           hint: 'Session mode supplied by agy; Plan mode does not verify read-only OS enforcement',
           disabled: lockReason,
@@ -535,7 +569,12 @@ export interface SettingsKeyStep {
   readonly effect?: SettingsKeyEffect;
 }
 
-function stepControlForRow(row: PrefsRow, direction: 1 | -1, preferOpenMenu: boolean): SettingsKeyEffect | undefined {
+function stepControlForRow(
+  row: PrefsRow,
+  direction: 1 | -1,
+  preferOpenMenu: boolean,
+  configOptions?: readonly SessionConfigOption[],
+): SettingsKeyEffect | undefined {
   const control: PrefsControl | undefined = row.control;
   if (!control) return undefined;
   if (row.disabled) return { kind: 'disabled', reason: row.disabled };
@@ -543,6 +582,18 @@ function stepControlForRow(row: PrefsRow, direction: 1 | -1, preferOpenMenu: boo
   const configId = stripConfigPrefix(row.id);
 
   if (control.k === 'action') {
+    if (!preferOpenMenu && control.act?.startsWith('open-config:') && configOptions) {
+      const targetId = control.act.slice('open-config:'.length);
+      const opt = configOptions.find(candidate => candidate.id === targetId);
+      if (opt?.type === 'select') {
+        const vals = configValues(opt);
+        if (vals.length > 0) {
+          const curIdx = Math.max(0, vals.findIndex(v => v.value === opt.currentValue));
+          const nextOpt = vals[(curIdx + vals.length + direction) % vals.length];
+          if (nextOpt) return { kind: 'config', optionId: opt.id, value: nextOpt.value };
+        }
+      }
+    }
     return control.act ? { kind: 'action', act: control.act } : undefined;
   }
   if (control.k === 'switch') {
@@ -573,6 +624,7 @@ export function stepSettingsKey(
   state: { page: string; focusRowId?: string; draft: Draft },
   key: Key,
   sections: readonly SettingsSectionData[],
+  configOptions?: readonly SessionConfigOption[],
 ): SettingsKeyStep {
   const currentPage: PrefsPageId = isPrefsPageId(state.page) ? state.page : 'appearance';
   const rows = visibleSettingsRows(sections, currentPage, state.draft.text);
@@ -613,8 +665,11 @@ export function stepSettingsKey(
     }
     if (key.name === 'left' || key.name === 'right') {
       const dir: -1 | 1 = key.name === 'left' ? -1 : 1;
-      if (activeEntry?.row.control && activeEntry.row.control.k !== 'keys' && activeEntry.row.control.k !== 'action') {
-        const effect = stepControlForRow(activeEntry.row, dir, false);
+      const isInlineConfigAction = activeEntry?.row.control?.k === 'action' &&
+        activeEntry.row.control.act?.startsWith('open-config:');
+      if (activeEntry?.row.control && activeEntry.row.control.k !== 'keys' &&
+        (activeEntry.row.control.k !== 'action' || isInlineConfigAction)) {
+        const effect = stepControlForRow(activeEntry.row, dir, false, configOptions);
         return { page: currentPage, focusRowId: currentFocus, draft: state.draft, effect };
       }
       if (!state.draft.text) {
@@ -629,7 +684,7 @@ export function stepSettingsKey(
     }
     if ((key.name === 'enter' && !key.shift) || ((key.name === 'space' || key.text === ' ') && state.draft.text === '')) {
       if (activeEntry) {
-        const effect = stepControlForRow(activeEntry.row, 1, true);
+        const effect = stepControlForRow(activeEntry.row, 1, true, configOptions);
         return { page: currentPage, focusRowId: currentFocus, draft: state.draft, effect };
       }
       return { page: currentPage, focusRowId: currentFocus, draft: state.draft };

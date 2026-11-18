@@ -344,6 +344,32 @@ export function compactToolHeaderText(raw: string, maxChars = 88): string {
   return `${single.slice(0, Math.max(8, maxChars - 3)).trimEnd()}...`;
 }
 
+/** Extract the latest concise headline or topic line from streaming Gemini/agent reasoning text. */
+export function summarizeThoughtTopic(raw: string, maxChars = 56): string | undefined {
+  const trimmed = raw.trim();
+  if (!trimmed) return undefined;
+
+  let latestHeading: string | undefined;
+  const headingMatches = trimmed.matchAll(/(?:^|\n)\s*(?:\*\*([^*\n]{2,120})\*\*|#{1,3}\s+([^\n]{2,120}))/g);
+  for (const match of headingMatches) {
+    const candidate = (match[1] ?? match[2] ?? '').trim();
+    if (candidate) latestHeading = candidate;
+  }
+
+  const fallbackLine = latestHeading ?? trimmed
+    .split(/\r?\n/)
+    .map(line => line.replace(/^\s*(?:[-*+>]+|\d+\.)\s*/, '').trim())
+    .find(Boolean);
+  if (!fallbackLine) return undefined;
+
+  const clean = fallbackLine
+    .replace(/[*_`~#]+/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!clean) return undefined;
+  return compactToolHeaderText(clean, maxChars);
+}
+
 /** Build native Tern <tool> display props from an ACP ToolCallUpdate. */
 export function summarizeToolCall(
   call: ToolCallUpdate,

@@ -1,3 +1,11 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/antigravity-lockup-dark.svg" />
+    <source media="(prefers-color-scheme: light)" srcset="assets/antigravity-lockup.svg" />
+    <img alt="Google Antigravity" src="assets/antigravity-lockup.svg" height="44" />
+  </picture>
+</p>
+
 # agy-tern
 
 [![CI](https://github.com/oktavsm/agy-tern/actions/workflows/ci.yml/badge.svg)](https://github.com/oktavsm/agy-tern/actions/workflows/ci.yml)
@@ -5,7 +13,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Bun >= 1.2.22](https://img.shields.io/badge/Bun-%3E%3D1.2.22-black)](https://bun.sh/)
 
-Native [Tern](https://docs.stencil.so/tern/protocol/index.md) terminal frontend for the official Antigravity CLI (`agy`) over the [Agent Client Protocol (ACP)](https://agentclientprotocol.com/).
+Native [Tern](https://docs.stencil.so/tern/protocol/index.md) terminal frontend built for the official Antigravity CLI (`agy`) over the [Agent Client Protocol (ACP)](https://agentclientprotocol.com/).
 
 `agy-tern` spawns `agy acp --sandbox` as a subprocess and renders streaming replies, collapsible reasoning traces, task plans, diffs, clickable tool outputs, media inspection, interactive follow-up modals, and explicit one-time approvals natively through the Tern Surface Protocol (TSP).
 

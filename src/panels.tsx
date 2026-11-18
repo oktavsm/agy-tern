@@ -113,6 +113,8 @@ export interface PanelRenderContext {
   busy: boolean;
   cancelling: boolean;
   changingConfig: boolean;
+  startupSyncingConfig?: boolean;
+  hasPendingPermissions?: boolean;
   extLoading: boolean;
   reportLoading: boolean;
   reportText: string;
@@ -219,6 +221,9 @@ function renderPrefsPanel(ctx: PanelRenderContext): JSX.Element {
     agentConnecting: ctx.agentConnecting,
     busy: ctx.busy,
     changingConfig: ctx.changingConfig,
+    startupSyncingConfig: ctx.startupSyncingConfig,
+    authBusy: ctx.authBusy,
+    hasPendingPermissions: ctx.hasPendingPermissions,
     sessionOperation: ctx.sessionOperation,
     updateStatus: ctx.updateStatus,
   });
@@ -247,11 +252,10 @@ function renderPrefsPanel(ctx: PanelRenderContext): JSX.Element {
   };
 
   return <prefs key="prefs" title="agy-tern settings" page={activePage}
-    lead={viewData.leadByPage[activePage]} query={ctx.panelDraft.text} cursor={ctx.panelDraft.cursor}
+    lead={viewData.leadByPage[activePage]} query={ctx.panelDraft.text} cursor={ctx.panelDraft.cursor} onEdit={ctx.onEditPanelDraft}
     focus={focusedRow}
     pages={viewData.pages}
     sections={viewData.sections}
-    onEdit={event => ctx.onEditPanelDraft(event)}
     onSelect={event => {
       if (isPrefsPageId(event.item)) ctx.onSetPrefsPage(event.item);
     }}
@@ -274,9 +278,13 @@ function renderPrefsPanel(ctx: PanelRenderContext): JSX.Element {
       'check-updates': () => ctx.onCheckUpdates?.(),
       'open-permissions': () => ctx.onOpenPanel({ kind: 'permissions' }),
       'open-account': () => ctx.onOpenPanel({ kind: 'account' }),
+      ...Object.fromEntries(metadata.configOptions.map(opt => [
+        `open-config:${opt.id}`,
+        () => ctx.onOpenPanel({ kind: 'config', id: opt.id }),
+      ])),
     }}
     onChange={event => {
-      const key = event.item;
+      const key = event.item ?? event.name;
       if ((!key || key === 'page' || event.name === 'page') && handlePageEvent(event.value)) {
         return;
       }
@@ -340,7 +348,7 @@ function renderSelectConfigPicker(ctx: PanelRenderContext, option: Extract<Sessi
   return <picker key="picker" size={ctx.rLayout.panelSize} title={option.name} icon={option.category === 'model' || option.id === 'model' ? 'model' : 'settings'}
     subtitle={option.description ?? 'Options supplied by the active agy ACP session'}
     placeholder={`Search ${option.name.toLowerCase()}...`}
-    query={ctx.panelDraft.text} cursor={ctx.panelDraft.cursor}
+    query={ctx.panelDraft.text} cursor={ctx.panelDraft.cursor} onEdit={ctx.onEditPanelDraft}
     tabs={tabs} tab={tabs ? ctx.pickerTab : undefined}
     order={order} items={items} selected={selectedId} current={[option.currentValue]}
     state={ctx.changingConfig ? 'loading' : ctx.panelError ? 'error' : 'ready'}
@@ -353,16 +361,14 @@ function renderSelectConfigPicker(ctx: PanelRenderContext, option: Extract<Sessi
         disabled: (!highlighted || ctx.busy || ctx.changingConfig || ctx.disconnected) ? true : undefined },
     ]}
     onSelect={event => ctx.onSetPickerSelected(event.item)}
-    onActivate={event => {
-      if (!ctx.busy && !ctx.changingConfig && !ctx.disconnected) ctx.onChangeConfig(option, event.item);
-    }}
+    onActivate={event => ctx.onChangeConfig(option, event.item)}
     onAction={{
       close: ctx.onClosePanel,
       tab: event => {
         if (typeof event.value === 'string') ctx.onSetPickerTab(event.value, false);
       },
       apply: () => {
-        if (highlighted && !ctx.busy && !ctx.changingConfig && !ctx.disconnected) ctx.onChangeConfig(option, highlighted.val.value);
+        if (highlighted) ctx.onChangeConfig(option, highlighted.val.value);
       },
     }}>
     {highlighted && <kv key="pv" items={[
@@ -442,7 +448,7 @@ function renderSessionsPicker(ctx: PanelRenderContext): JSX.Element {
       ? `All workspaces (reported by agy)`
       : `${ctx.workspaceName} only (use All workspaces for other folders)`}
     placeholder="Search title, folder, ID, or chat..."
-    query={ctx.panelDraft.text} cursor={ctx.panelDraft.cursor}
+    query={ctx.panelDraft.text} cursor={ctx.panelDraft.cursor} onEdit={ctx.onEditPanelDraft}
     tabs={[
       { id: 'workspace', label: 'This folder', count: workspaceRows.length },
       { id: 'all', label: 'All workspaces', count: allRows.length },
@@ -563,7 +569,7 @@ function renderChangesPicker(ctx: PanelRenderContext): JSX.Element {
   return <picker key="picker" size={ctx.rLayout.panelSize} title="Changes" icon="diff"
     subtitle="Session edits and git status"
     placeholder="Filter modified paths..."
-    query={ctx.panelDraft.text} cursor={ctx.panelDraft.cursor}
+    query={ctx.panelDraft.text} cursor={ctx.panelDraft.cursor} onEdit={ctx.onEditPanelDraft}
     tabs={[
       { id: 'edits', label: 'Session edits', count: ctx.sessionDiffs.length },
       { id: 'git', label: 'Git status', count: ctx.gitChanges.length },
@@ -662,7 +668,7 @@ function renderFindPicker(ctx: PanelRenderContext): JSX.Element {
   return <picker key="picker" size={ctx.rLayout.panelSize} title="Find" icon="slash"
     subtitle="Search transcript entries"
     placeholder="Type keywords to filter transcript..."
-    query={ctx.panelDraft.text} cursor={ctx.panelDraft.cursor}
+    query={ctx.panelDraft.text} cursor={ctx.panelDraft.cursor} onEdit={ctx.onEditPanelDraft}
     tabs={tabs}
     tab={ctx.pickerTab}
     order={order} items={items} selected={selectedId}
@@ -808,7 +814,7 @@ function renderCommandsPicker(ctx: PanelRenderContext): JSX.Element {
   return <picker key="picker" size={ctx.rLayout.panelSize} title="Commands & skills" icon="slash"
     subtitle="Frontend, workflows, and skills"
     placeholder="Filter commands by name or description..."
-    query={ctx.panelDraft.text} cursor={ctx.panelDraft.cursor}
+    query={ctx.panelDraft.text} cursor={ctx.panelDraft.cursor} onEdit={ctx.onEditPanelDraft}
     tabs={tabs} tab={ctx.pickerTab} order={order} items={items} selected={selectedId}
     state="ready"
     empty="No commands match your filter."
@@ -860,7 +866,7 @@ function renderMcpPicker(ctx: PanelRenderContext): JSX.Element {
   return <picker key="picker" size={ctx.rLayout.panelSize} title="MCP servers" icon="settings"
     subtitle="Configured via agy mcp CLI"
     placeholder="Filter MCP servers..."
-    query={ctx.panelDraft.text} cursor={ctx.panelDraft.cursor}
+    query={ctx.panelDraft.text} cursor={ctx.panelDraft.cursor} onEdit={ctx.onEditPanelDraft}
     tabs={[
       { id: 'all', label: 'All', count: visible.length },
       { id: 'enabled', label: 'Enabled', count: visible.filter(s => s.status === 'enabled').length },
@@ -931,7 +937,7 @@ function renderPluginsPicker(ctx: PanelRenderContext): JSX.Element {
   return <picker key="picker" size={ctx.rLayout.panelSize} title="Plugins & skills" icon="compass"
     subtitle="Installed Antigravity plugins via official `agy plugin list --json`"
     placeholder="Filter plugins or skill names..."
-    query={ctx.panelDraft.text} cursor={ctx.panelDraft.cursor}
+    query={ctx.panelDraft.text} cursor={ctx.panelDraft.cursor} onEdit={ctx.onEditPanelDraft}
     tabs={[
       { id: 'all', label: 'All', count: visible.length },
       { id: 'enabled', label: 'Enabled', count: visible.filter(p => p.enabled).length },
@@ -1014,7 +1020,7 @@ function renderAgentsPicker(ctx: PanelRenderContext): JSX.Element {
   return <picker key="picker" size={ctx.rLayout.panelSize} title="Agents & workspace scope" icon="tern"
     subtitle={`Active profile: ${ctx.options.agentName ?? 'Default'} · Workspace roots: ${1 + extraDirs.length}`}
     placeholder="Filter agents..."
-    query={ctx.panelDraft.text} cursor={ctx.panelDraft.cursor}
+    query={ctx.panelDraft.text} cursor={ctx.panelDraft.cursor} onEdit={ctx.onEditPanelDraft}
     tabs={[{ id: 'all', label: 'Configured agents', count: filtered.length }]}
     tab="all" order={order} items={items} selected={selectedId}
     state={ctx.extLoading ? 'loading' : ctx.panelError ? 'error' : 'ready'}
@@ -1058,7 +1064,7 @@ function renderTemplatesPicker(ctx: PanelRenderContext): JSX.Element {
   return <picker key="picker" size={ctx.rLayout.panelSize} title="Workspace prompt templates" icon="edit"
     subtitle={`Saved locally per workspace (${ctx.workspaceName})`}
     placeholder="Filter templates..."
-    query={ctx.panelDraft.text} cursor={ctx.panelDraft.cursor}
+    query={ctx.panelDraft.text} cursor={ctx.panelDraft.cursor} onEdit={ctx.onEditPanelDraft}
     tabs={[{ id: 'all', label: 'Templates', count: filtered.length }]}
     tab="all" order={order} items={items} selected={selectedId}
     state={ctx.extLoading ? 'loading' : ctx.panelError ? 'error' : 'ready'}
@@ -1157,7 +1163,7 @@ function renderTasksPicker(ctx: PanelRenderContext): JSX.Element {
   return <picker key="picker" size={ctx.rLayout.panelSize} title="Tasks & tool activity" icon="timer"
     subtitle={ctx.busy || runningCount ? `${runningCount} active tool(s) in current turn · Stop cancels the active ACP turn` : `${allTools.length} tool call(s) recorded in this session`}
     placeholder="Filter tasks by tool, command, or path..."
-    query={ctx.panelDraft.text} cursor={ctx.panelDraft.cursor}
+    query={ctx.panelDraft.text} cursor={ctx.panelDraft.cursor} onEdit={ctx.onEditPanelDraft}
     tabs={[
       { id: 'all', label: 'All', count: allTools.length },
       { id: 'running', label: 'Running', count: runningCount },
@@ -1224,8 +1230,10 @@ function renderFollowUpOverlay(
     ctx.onUpdateFollowUp?.(draft => {
       draft.activeFieldIdx = fieldIdx;
       draft.answers[fieldName] = value;
+      draft.customDrafts[fieldName] = '';
       draft.error = undefined;
     });
+    ctx.onFocus(null);
   };
   const toggleMultiOption = (fieldName: string, optionValue: string, fieldIdx: number): void => {
     ctx.onUpdateFollowUp?.(draft => {
@@ -1237,6 +1245,24 @@ function renderFollowUpOverlay(
       draft.answers[fieldName] = prev;
       draft.error = undefined;
     });
+    ctx.onFocus(null);
+  };
+  const applyInputEdit = (
+    draft: FollowUpSessionState,
+    cursorKey: string,
+    prevText: string,
+    event: EditEvent,
+  ): string => {
+    const cur = draft.draftCursors?.[cursorKey];
+    const next = editDraft(
+      { text: prevText, cursor: cur?.cursor ?? prevText.length, anchor: cur?.anchor },
+      event,
+    );
+    draft.draftCursors = {
+      ...(draft.draftCursors ?? {}),
+      [cursorKey]: { cursor: next.cursor, ...(next.anchor !== undefined ? { anchor: next.anchor } : {}) },
+    };
+    return next.text;
   };
 
   return <overlay key="panel" anchor="center" modal size={ctx.rLayout.panelSize}
@@ -1257,7 +1283,7 @@ function renderFollowUpOverlay(
       </row>
     </row>}>
     <scroll key="overlay-scroll" bar="always" max={{ h: ctx.rLayout.inspectBodyMaxH }}>
-      <col gap="md">
+      <col key="form" gap="md">
         {(st?.message || p.message) && <text wrap="word">{st?.message || p.message}</text>}
         {fields.map((field, idx) => {
           const val = st?.answers[field.name];
@@ -1282,12 +1308,22 @@ function renderFollowUpOverlay(
               {field.allowCustom && <input key={`custom-${field.name}`}
                 aria={`Custom answer for ${field.label}`}
                 text={st?.customDrafts[field.name] ?? ''}
+                cursor={st?.draftCursors?.[`custom:${field.name}`]?.cursor ?? (st?.customDrafts[field.name] ?? '').length}
+                anchor={st?.draftCursors?.[`custom:${field.name}`]?.anchor}
                 placeholder="Or type a custom answer..."
-                onFocus={() => ctx.onUpdateFollowUp?.(draft => { draft.activeFieldIdx = idx; })}
+                onFocus={event => {
+                  ctx.onUpdateFollowUp?.(draft => { draft.activeFieldIdx = idx; });
+                  ctx.onFocus(event.id);
+                }}
                 onEdit={event => ctx.onUpdateFollowUp?.(draft => {
                   draft.activeFieldIdx = idx;
-                  const prevText = draft.customDrafts[field.name] ?? '';
-                  draft.customDrafts[field.name] = editDraft({ text: prevText, cursor: prevText.length }, event).text;
+                  draft.answers[field.name] = '';
+                  draft.customDrafts[field.name] = applyInputEdit(
+                    draft,
+                    `custom:${field.name}`,
+                    draft.customDrafts[field.name] ?? '',
+                    event,
+                  );
                   draft.error = undefined;
                 })} />}
             </col>}
@@ -1312,12 +1348,17 @@ function renderFollowUpOverlay(
               <input key={`input-${field.name}`}
                 aria={field.label}
                 text={typeof val === 'string' ? val : ''}
+                cursor={st?.draftCursors?.[`answer:${field.name}`]?.cursor ?? (typeof val === 'string' ? val.length : 0)}
+                anchor={st?.draftCursors?.[`answer:${field.name}`]?.anchor}
                 placeholder={field.kind === 'text' ? 'Type your answer...' : `Enter ${field.kind}...`}
-                onFocus={() => ctx.onUpdateFollowUp?.(draft => { draft.activeFieldIdx = idx; })}
+                onFocus={event => {
+                  ctx.onUpdateFollowUp?.(draft => { draft.activeFieldIdx = idx; });
+                  ctx.onFocus(event.id);
+                }}
                 onEdit={event => ctx.onUpdateFollowUp?.(draft => {
                   draft.activeFieldIdx = idx;
                   const prevText = typeof draft.answers[field.name] === 'string' ? (draft.answers[field.name] as string) : '';
-                  draft.answers[field.name] = editDraft({ text: prevText, cursor: prevText.length }, event).text;
+                  draft.answers[field.name] = applyInputEdit(draft, `answer:${field.name}`, prevText, event);
                   draft.error = undefined;
                 })} />
             )}
@@ -1328,10 +1369,12 @@ function renderFollowUpOverlay(
           <input key="free-note"
             aria="Additional note"
             text={st?.freeNote ?? ''}
+            cursor={st?.draftCursors?.['free-note']?.cursor ?? (st?.freeNote ?? '').length}
+            anchor={st?.draftCursors?.['free-note']?.anchor}
             placeholder="Add extra clarification if needed..."
+            onFocus={event => ctx.onFocus(event.id)}
             onEdit={event => ctx.onUpdateFollowUp?.(draft => {
-              const prevText = draft.freeNote;
-              draft.freeNote = editDraft({ text: prevText, cursor: prevText.length }, event).text;
+              draft.freeNote = applyInputEdit(draft, 'free-note', draft.freeNote, event);
             })} />
         </col>}
         {st?.error && <text wrap="word"><span s="error">{st.error}</span></text>}

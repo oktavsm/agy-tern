@@ -23,6 +23,7 @@ import {
   extractToolOutputText,
   formatPathLabel,
   splitMarkdownSegments,
+  summarizeThoughtTopic,
   summarizeToolCall,
 } from './ui-format';
 
@@ -457,6 +458,7 @@ export interface EntryCallbacks {
   working: boolean;
   now: number;
   agentStatus: Tone;
+  agentAvatarBlob?: string;
   prefs: UserPrefs;
   proseMaxW?: `${number}ch`;
   thoughtFoldOverrides: Map<string, boolean>;
@@ -516,7 +518,7 @@ export function Entry({ entry, continued, streaming, recent, turnNumber, callbac
         reveal="hover"
         avatar={showAvatar ? (entry.role === 'user'
           ? <avatar variant="circle" icon="user" text="You" seed="local-user" size="sm" />
-          : <avatar variant="square" icon="tern" text="AG" seed="antigravity" size="sm" status={callbacks.agentStatus} />) : undefined}
+          : <avatar variant="square" blob={callbacks.agentAvatarBlob} icon={callbacks.agentAvatarBlob ? undefined : 'tern'} text="AG" seed="antigravity" size="sm" status={callbacks.agentStatus} />) : undefined}
         actions={entry.role === 'user'
           ? [{ act: 'copy', icon: 'copy', title: 'Copy message' }, { act: 'resend', icon: 'repeat', title: 'Load into composer' }]
           : [{ act: 'copy', icon: 'copy', title: 'Copy response' }]}
@@ -588,20 +590,28 @@ export function Entry({ entry, continued, streaming, recent, turnNumber, callbac
       return msgNode;
     }
     case 'thought': {
-      const open = callbacks.thoughtFoldOverrides.get(entry.id) ?? callbacks.prefs.thoughtExpanded;
       const running = entry.endedAt === undefined && callbacks.working;
+      const open = callbacks.thoughtFoldOverrides.get(entry.id) ?? (running || callbacks.prefs.thoughtExpanded);
       const elapsed = entry.endedAt !== undefined
         ? Math.max(0, entry.endedAt - entry.startedAt)
         : Math.max(0, callbacks.now - entry.startedAt);
-      return <trace key={entry.id} variant="summary" icon="thinking" title="Thought"
-        summary={running ? 'Thinking' : 'Thought'}
+      const topic = summarizeThoughtTopic(entry.text, 56);
+      const title = running
+        ? (topic
+          ? [{ t: 'Thinking', fx: 'shimmer' as const }, { t: `: ${topic}`, s: 'muted' as const }]
+          : [{ t: 'Thinking', fx: 'shimmer' as const }])
+        : (topic
+          ? [{ t: 'Thought', s: 'strong' as const }, { t: `: ${topic}`, s: 'muted' as const }]
+          : 'Thought');
+      return <trace key={entry.id} variant="card" role="agy.thought" icon="thinking"
+        title={title}
+        summary={running ? (topic ? `Thinking: ${topic}` : 'Thinking') : (topic ? `Thought: ${topic}` : 'Thought')}
         status={running ? 'running' : 'done'}
         age={running ? elapsed : undefined}
         took={running ? undefined : elapsed}
         open={open}
-        lines={open ? [{ id: 'body', title: 'Reasoning', status: running ? 'running' : 'done' }] : undefined}
         onToggle={event => callbacks.onToggleThought(entry.id, event.open ?? !open)}>
-        {open ? <md key="body">{entry.text}</md> : <spacer key="body" size="none" />}
+        <md key="reasoning" stream={running || undefined} max={{ w: callbacks.proseMaxW ?? '80ch' }}>{entry.text}</md>
       </trace>;
     }
     case 'tool': {

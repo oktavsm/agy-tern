@@ -285,6 +285,51 @@ describe('panel renderers & transcript view helpers', () => {
     expect(cmdJson).toContain('Run in split');
     expect(cmdJson).toContain('Inspect details');
     expect(runCommands.length).toBe(0);
+
+    const toggledThoughts: Array<{ id: string; open: boolean }> = [];
+    const liveThoughtEntry = {
+      type: 'thought' as const,
+      id: 'thought-live-1',
+      text: '**Inspecting project files**\nChecking src/ui.tsx layout rules.',
+      startedAt: 500,
+    };
+    const liveThoughtNode = Entry({
+      entry: liveThoughtEntry,
+      continued: false,
+      streaming: false,
+      recent: true,
+      callbacks: {
+        ...callbacks,
+        working: true,
+        onToggleThought(id, open) {
+          toggledThoughts.push({ id, open });
+        },
+      },
+    }) as unknown as {
+      kind: string;
+      props: { variant?: string; open?: boolean; status?: string; title?: unknown };
+      handlers: { onToggle?: (ev: { open?: boolean }) => void };
+    };
+    expect(liveThoughtNode.kind).toBe('trace');
+    expect(liveThoughtNode.props.variant).toBe('card');
+    expect(liveThoughtNode.props.open).toBe(true);
+    expect(liveThoughtNode.props.status).toBe('running');
+    expect(JSON.stringify(liveThoughtNode.props.title)).toContain('Inspecting project files');
+
+    liveThoughtNode.handlers.onToggle?.({ open: false });
+    expect(toggledThoughts).toEqual([{ id: 'thought-live-1', open: false }]);
+
+    const settledThoughtNode = Entry({
+      entry: { ...liveThoughtEntry, endedAt: 950 },
+      continued: false,
+      streaming: false,
+      recent: true,
+      callbacks,
+    }) as unknown as {
+      props: { open?: boolean; status?: string };
+    };
+    expect(settledThoughtNode.props.status).toBe('done');
+    expect(settledThoughtNode.props.open).toBe(false);
   });
 
   test('/usage details tab renders account, runtime session, context breakdown, and quota table', () => {
