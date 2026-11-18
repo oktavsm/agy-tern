@@ -2,6 +2,11 @@
 
 All notable changes to `agy-tern` are documented in this file.
 
+## [0.2.3] - 2026-11-18
+
+### Fixed
+- Removed unsupported `@media (prefers-reduced-motion: no-preference)` and `~` sibling combinators from the `agy-motion` stylesheet so Tern parses every motion rule cleanly without startup warnings.
+
 ## [0.2.2] - 2026-11-18
 
 ### Added

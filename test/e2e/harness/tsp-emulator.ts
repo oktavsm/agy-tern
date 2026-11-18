@@ -1963,6 +1963,14 @@ export class TspHarness {
       if (typeof surface.focusedId === 'string' && surface.focusedId.length > 0 && !this.findById(surface.focusedId, surface.id)) {
         violations.push(`focusedId '${surface.focusedId}' does not exist in rendered tree`);
       }
+      for (const [sheetName, css] of surface.stylesheets) {
+        if (/prefers-reduced-motion\s*:\s*no-preference/i.test(css)) {
+          violations.push(`stylesheet '${sheetName}': unsupported prefers-reduced-motion value 'no-preference'`);
+        }
+        if (/\s~\s/.test(css)) {
+          violations.push(`stylesheet '${sheetName}': unsupported '~' sibling combinator`);
+        }
+      }
     }
 
     if (violations.length > 0) {
