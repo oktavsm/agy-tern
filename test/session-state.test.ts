@@ -121,8 +121,16 @@ describe('SessionStateManager', () => {
 
     mgr.enqueuePrompt({ text: 'p1', files: [], dirs: [], images: [] });
     mgr.enqueuePrompt({ text: 'p2', files: [], dirs: [], images: [] });
-    expect(mgr.drainNextQueued()?.text).toBe('p1');
-    expect(mgr.pullQueuedAt(0)?.text).toBe('p2');
+    mgr.enqueuePrompt({ text: 'p3', files: [], dirs: [], images: [] });
+    expect(mgr.moveQueued(2, 0)).toBe(true);
+    expect(mgr.getActive().queuedPrompts.map(q => q.text)).toEqual(['p3', 'p1', 'p2']);
+    expect(mgr.moveQueued(99, 0)).toBe(false);
+    expect(mgr.togglePinnedTurn('entry-1')).toBe(true);
+    expect(mgr.getActive().pinnedTurnIds.has('entry-1')).toBe(true);
+    expect(mgr.togglePinnedTurn('entry-1')).toBe(false);
+    expect(mgr.drainNextQueued()?.text).toBe('p3');
+    expect(mgr.pullQueuedAt(0)?.text).toBe('p1');
+    expect(mgr.dropQueuedAt(0)?.text).toBe('p2');
     expect(mgr.deleteSession('s1')).toBe(false);
     mgr.switchSession('s2');
     expect(mgr.deleteSession('s1')).toBe(true);

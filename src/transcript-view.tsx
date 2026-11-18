@@ -486,6 +486,8 @@ export interface EntryCallbacks {
   onResend(text: string): void;
   onLoadDeeperHistory?(): void;
   onOpenFollowUp?(title: string, message: string, fields: readonly QuestionField[]): void;
+  pinnedTurnIds?: ReadonlySet<string>;
+  onTogglePin?(entryId: string): void;
 }
 
 export function Entry({ entry, continued, streaming, recent, turnNumber, callbacks }: {
@@ -509,27 +511,36 @@ export function Entry({ entry, continued, streaming, recent, turnNumber, callbac
       const mdFollowUpQuestions = entry.role === 'agent' && !streaming && entry.text && callbacks.onOpenFollowUp
         ? extractMarkdownFollowUpQuestions(entry.text)
         : [];
+      const isPinned = entry.role === 'user' && (callbacks.pinnedTurnIds?.has(entry.id) ?? false);
       const msgNode = <message key={withDivider ? 'msg' : entry.id} variant="auto"
         side={entry.role === 'user' ? 'end' : 'start'} author={entry.role === 'user' ? 'You' : 'Antigravity'}
         continued={continued}
         time={callbacks.prefs.showTimestamps ? entry.time : undefined}
         pending={streaming || undefined}
-        status={streaming ? 'Streaming' : undefined}
+        status={streaming ? 'Streaming' : (isPinned ? 'Pinned' : undefined)}
         reveal="hover"
         avatar={showAvatar ? (entry.role === 'user'
           ? <avatar variant="circle" icon="user" text="You" seed="local-user" size="sm" />
           : <avatar variant="square" blob={callbacks.agentAvatarBlob} icon={callbacks.agentAvatarBlob ? undefined : 'tern'} text="AG" seed="antigravity" size="sm" status={callbacks.agentStatus} />) : undefined}
         actions={entry.role === 'user'
-          ? [{ act: 'copy', icon: 'copy', title: 'Copy message' }, { act: 'resend', icon: 'repeat', title: 'Load into composer' }]
+          ? [
+            { act: 'copy', icon: 'copy', title: 'Copy message' },
+            { act: 'resend', icon: 'repeat', title: 'Load into composer' },
+            ...(callbacks.onTogglePin ? [{ act: 'pin', icon: 'compass', title: isPinned ? 'Unpin turn' : 'Pin turn' }] : []),
+          ]
           : [{ act: 'copy', icon: 'copy', title: 'Copy response' }]}
         onMenu={{
           Copy: () => callbacks.onCopy(entry.text),
-          ...(entry.role === 'user' ? { 'Load into composer': () => callbacks.onResend(entry.text) } : {}),
+          ...(entry.role === 'user' ? {
+            'Load into composer': () => callbacks.onResend(entry.text),
+            ...(callbacks.onTogglePin ? { [isPinned ? 'Unpin turn' : 'Pin turn']: () => callbacks.onTogglePin?.(entry.id) } : {}),
+          } : {}),
           'Export transcript': callbacks.onExport,
         }}
         onAction={{
           copy: () => callbacks.onCopy(entry.text),
           resend: () => callbacks.onResend(entry.text),
+          pin: () => callbacks.onTogglePin?.(entry.id),
         }}>
         {entry.images?.map((img, idx) => {
           const blob = callbacks.getBlob(`${entry.id}:img:${idx}`, img.data, img.mimeType);
@@ -581,7 +592,8 @@ export function Entry({ entry, continued, streaming, recent, turnNumber, callbac
         </row>}
       </message>;
       if (withDivider) {
-        const turnLabel = callbacks.prefs.showTimestamps && entry.time ? `Turn ${turnNumber} · ${entry.time}` : `Turn ${turnNumber}`;
+        const pinTag = isPinned ? ' [Pinned]' : '';
+        const turnLabel = callbacks.prefs.showTimestamps && entry.time ? `Turn ${turnNumber}${pinTag} · ${entry.time}` : `Turn ${turnNumber}${pinTag}`;
         return <col key={entry.id} gap="sm">
           <rule variant="note" label={turnLabel} />
           {msgNode}

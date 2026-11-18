@@ -451,18 +451,45 @@ describe('panel renderers & transcript view helpers', () => {
     expect(allJson).toContain('/tmp/another-repo (loads into current workspace)');
 
     const changesCtx = baseContext({ kind: 'changes' });
-    changesCtx.pickerTab = 'untracked';
+    changesCtx.pickerTab = 'git';
+    changesCtx.onStageGitPath = () => {};
+    changesCtx.onUnstageGitPath = () => {};
+    changesCtx.onDiscardGitPath = () => {};
     changesCtx.gitChanges = [
-      { status: 'M', path: 'src/ui.tsx' },
+      { status: 'M', path: 'src/ui.tsx', staged: true, unstaged: true },
       { status: '?', path: 'assets/new.png' },
     ];
+    const modifiedJson = JSON.stringify(renderActivePanel(changesCtx));
+    expect(modifiedJson).toContain('Staged');
+    expect(modifiedJson).toContain('Stage');
+    expect(modifiedJson).toContain('Unstage');
+    expect(modifiedJson).toContain('Discard');
+
+    changesCtx.pickerTab = 'untracked';
     const untrackedJson = JSON.stringify(renderActivePanel(changesCtx));
     expect(untrackedJson).toContain('assets/new.png');
     expect(untrackedJson).not.toContain('src/ui.tsx');
     expect(untrackedJson).toContain('Copy path');
 
+    const turnsCtx = baseContext({ kind: 'turns' });
+    turnsCtx.entries = [
+      { type: 'message', id: 'u1', role: 'user', text: 'Audit auth flow' },
+      { type: 'message', id: 'a1', role: 'agent', text: 'Auth looks clean.' },
+    ];
+    turnsCtx.pinnedTurnIds = new Set(['u1']);
+    const turnsJson = JSON.stringify(renderActivePanel(turnsCtx));
+    expect(turnsJson).toContain('Turn outline');
+    expect(turnsJson).toContain('Audit auth flow');
+    expect(turnsJson).toContain('Pinned');
+
+    const queueCtx = baseContext({ kind: 'queue' });
+    queueCtx.queuedPrompts = [{ id: 'q-1', text: 'Follow up test', files: ['src/ui.tsx'], dirs: [], images: [] }];
+    const queueJson = JSON.stringify(renderActivePanel(queueCtx));
+    expect(queueJson).toContain('Prompt queue');
+    expect(queueJson).toContain('Follow up test');
+
     const keysJson = JSON.stringify(renderActivePanel(baseContext({ kind: 'keys' })));
     expect(keysJson).toContain('Keyboard shortcuts');
-    expect(keysJson).toContain('Ctrl+K');
+    expect(keysJson).toContain('Ctrl+Tab');
   });
 });

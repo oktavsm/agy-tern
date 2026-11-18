@@ -62,6 +62,7 @@ import {
 import {
   atMentionQuery,
   detectGitStatus,
+  discardGitPath,
   extractInlineReferenceDecor,
   filterWorkspaceEntries,
   formatPromptWithAttachments,
@@ -80,11 +81,16 @@ import {
   replaceAtMentionWithInlineToken,
   resolvePastedImagePath,
   searchWorkspacePrefix,
+  stageGitPath,
+  unstageGitPath,
   writeTranscriptExport,
   type GitStatusEntry,
   type LoadedImageAttachment,
   type WorkspaceEntry,
 } from './files';
+import { AttachmentSizeCache, computeDraftContextBudget, formatCompactTokens } from './context-budget';
+import { buildTurnOutline, filterTurnOutline } from './turn-outline';
+import { cycleOpenSessionTab, recordOpenSessionTab, removeOpenSessionTab } from './ui-session-helpers';
 import {
   buildTaskDetailText,
   buildUnifiedDiffHunks,
@@ -428,6 +434,9 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
   let workspaceEntries: WorkspaceEntry[] = [];
   let ignoredPathsSet = new Set<string>();
   let gitChanges: GitStatusEntry[] = [];
+  let gitMutationBusy = false;
+  let openSessionTabs: string[] = [];
+  const attachmentSizes = new AttachmentSizeCache(() => { if (!quitting) render(); });
   const gitDiffCache = new Map<string, { status: 'loading' | 'ready'; hunks: DiffHunk[]; error?: string }>();
   let mcpServers: McpServerEntry[] = [];
   let pluginsList: PluginEntry[] = [];
@@ -1763,11 +1772,66 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     });
   }
 
+  function jumpToTurnEntry(entryId: string, turnNumber: number): void {
+    const activeConv = stateManager.getConversation();
+    const activeSt = stateManager.getActive();
+    const idx = activeConv.entries.findIndex(entry => entry.id === entryId);
+    if (idx >= 0) {
+      const needed = activeConv.entries.length - idx;
+      if (needed > activeSt.historyVisibleCount) activeSt.historyVisibleCount = needed + 20;
+    }
+    activeSt.focusedTurnIndex = Math.max(0, turnNumber - 1);
+    closePanel();
+    surface?.reveal(`main.conversation.${entryId}`, 'start');
+    showToast(`Turn ${turnNumber}`);
+  }
+
+  function mutateGitPath(action: 'stage' | 'unstage' | 'discard', filePath: string, status = ''): void {
+    if (gitMutationBusy || quitting) return;
+    gitMutationBusy = true;
+    render();
+    const task = action === 'stage'
+      ? stageGitPath(options.cwd, filePath)
+      : action === 'unstage'
+        ? unstageGitPath(options.cwd, filePath)
+        : discardGitPath(options.cwd, filePath, status);
+    void task.then(async () => {
+      if (quitting) return;
+      gitDiffCache.delete(filePath);
+      gitChanges = await detectGitStatus(options.cwd).catch(() => gitChanges);
+      showToast(
+        action === 'stage' ? 'Staged change' : action === 'unstage' ? 'Unstaged change' : 'Discarded change',
+        filePath,
+      );
+    }).catch(err => {
+      if (!quitting) {
+        showToast(`Git ${action} failed`, err instanceof Error ? err.message : String(err));
+      }
+    }).finally(() => {
+      gitMutationBusy = false;
+      if (!quitting) render();
+    });
+  }
+
+  function switchSessionTab(targetId: string): void {
+    if (!targetId || targetId === stateManager.activeSessionId) return;
+    const lock = configLockReason();
+    if (lock || !agent) {
+      showToast('Cannot switch session tab', lock ?? 'Wait until connected');
+      return;
+    }
+    const mode: 'load' | 'resume' = stateManager.hasCachedConversation(targetId) && agent.capabilities.resumeSession
+      ? 'resume'
+      : 'load';
+    openConversation(targetId, mode);
+  }
+
   function closeSavedSession(id: string): void {
     runSessionAction('Closing session', async connected => {
       if (!connected.closeSession) throw new Error('Antigravity ACP does not support closing sessions.');
       await connected.closeSession(id);
       stateManager.deleteSession(id);
+      openSessionTabs = removeOpenSessionTab(openSessionTabs, id);
       listedSessions = listedSessions.filter(row => row.sessionId !== id);
       pickerSelected = listedSessions[0]?.sessionId ?? '';
       showToast('Session closed on agy', sessionTitle(id));
@@ -1830,7 +1894,8 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       next.kind === 'mcp-add' || next.kind === 'plugin-install' ||
       (next.kind === 'config' && metadata.configOptions.find(candidate => candidate.id === next.id)?.type === 'boolean');
     const isPickerPanel = next.kind === 'commands' || next.kind === 'config' || next.kind === 'sessions' ||
-      next.kind === 'changes' || next.kind === 'find' || next.kind === 'tasks' || next.kind === 'mcp' || next.kind === 'plugins' ||
+      next.kind === 'changes' || next.kind === 'find' || next.kind === 'turns' || next.kind === 'queue' ||
+      next.kind === 'tasks' || next.kind === 'mcp' || next.kind === 'plugins' ||
       next.kind === 'agents' || next.kind === 'templates';
     const followUpFocus = next.kind === 'followup' ? followUpFocusTarget(followUpState) : null;
     const targetFocus = next.kind === 'settings' ? 'layer.prefs'
@@ -1971,6 +2036,13 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         case 'find':
           openPanel({ kind: 'find' });
           if (args) { panelDraft = { text: args, cursor: args.length }; render(); }
+          return;
+        case 'turns':
+          openPanel({ kind: 'turns' });
+          if (args) { panelDraft = { text: args, cursor: args.length }; render(); }
+          return;
+        case 'queue':
+          openPanel({ kind: 'queue' });
           return;
         case 'export': {
           closePanel();
@@ -2678,6 +2750,44 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       onSubmitFollowUp: submitFollowUp,
       onDeclineFollowUp: declineFollowUp,
       onCancelFollowUp: cancelFollowUp,
+      pinnedTurnIds: st.pinnedTurnIds,
+      queuedPrompts: st.queuedPrompts,
+      canSendQueueHead: !busy && !permissions.length && !changingConfig && !sessionOperation && !authBusy && !!agent && !disconnected,
+      gitMutationBusy,
+      onJumpToTurn: jumpToTurnEntry,
+      onTogglePinTurn: entryId => {
+        const pinned = stateManager.togglePinnedTurn(entryId);
+        showToast(pinned ? 'Turn pinned' : 'Turn unpinned');
+        render();
+      },
+      onReusePrompt: text => {
+        stateManager.getActive().draft = { text, cursor: text.length };
+        render();
+        surface?.focus(DOCK_DRAFT_ID);
+      },
+      onMoveQueued: (fromIdx, toIdx) => {
+        if (stateManager.moveQueued(fromIdx, toIdx)) render();
+      },
+      onPullQueued: idx => {
+        if (stateManager.pullQueuedAt(idx)) {
+          closePanel();
+          render();
+          surface?.focus(DOCK_DRAFT_ID);
+        }
+      },
+      onDropQueued: idx => {
+        if (stateManager.dropQueuedAt(idx)) render();
+      },
+      onSendQueuedHead: () => {
+        if (busy || permissions.length || changingConfig || sessionOperation || authBusy || !agent || disconnected) return;
+        const next = stateManager.pullQueuedAt(0);
+        if (!next) return;
+        closePanel();
+        submitPrompt(formatPromptWithAttachments(next.text, next.files, next.dirs), next.images, next.files, next.dirs);
+      },
+      onStageGitPath: filePath => mutateGitPath('stage', filePath),
+      onUnstageGitPath: filePath => mutateGitPath('unstage', filePath),
+      onDiscardGitPath: (filePath, status) => mutateGitPath('discard', filePath, status),
     });
   }
 
@@ -2706,6 +2816,17 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       ? resolveCommand(st.draft.text, availableCommands())
       : undefined;
     const hasAttachments = st.attachedFiles.length > 0 || st.attachedDirs.length > 0 || st.attachedImages.length > 0;
+    if (st.attachedFiles.length) attachmentSizes.warm(options.cwd, st.attachedFiles);
+    const draftBudget = hasAttachments
+      ? computeDraftContextBudget({
+        draftText: st.draft.text,
+        attachedFiles: st.attachedFiles,
+        attachedDirs: st.attachedDirs,
+        attachedImages: st.attachedImages,
+        fileSizes: attachmentSizes.snapshot,
+        usage: metadata.usage,
+      })
+      : undefined;
     const hasDraftContent = !!(st.draft.text.trim() || hasAttachments);
     const canSend = hasDraftContent && !busy && !changingConfig && !sessionOperation && !authBusy && !permission &&
       !!((agent && !disconnected) || (draftCommand && !hasAttachments));
@@ -2826,6 +2947,12 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         void loadDeeperBrainHistory();
       },
       onOpenFollowUp: openFollowUpModal,
+      pinnedTurnIds: st.pinnedTurnIds,
+      onTogglePin(entryId) {
+        const pinned = stateManager.togglePinnedTurn(entryId);
+        showToast(pinned ? 'Turn pinned' : 'Turn unpinned');
+        render();
+      },
     };
 
     const allEntries = conv.entries;
@@ -2861,7 +2988,8 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         : renderNow;
       const entryAgentStatus = entry.type === 'message' && entry.role === 'agent' ? agentStatus : '';
       const entryRecent = entry.type === 'tool' ? (recent ? 1 : 0) : 0;
-      const sig = `${conv.revisionOf(entry)}|${continued ? 1 : 0}|${streaming ? 1 : 0}|${entryRecent}|${turnNumber ?? ''}|${settled ? 1 : 0}|${foldKey}|${errorKey}|${entryAgentStatus}|${antigravityLogoBlob ? 1 : 0}|${userPrefs.diffMode}|${userPrefs.toolDisplay}|${Number(userPrefs.thoughtExpanded)}|${userPrefs.transcriptDensity}|${Number(userPrefs.showTimestamps)}|${layout.proseMaxW}|${pathPresenceCache.version}`;
+      const entryPinned = entry.type === 'message' && entry.role === 'user' && st.pinnedTurnIds.has(entry.id) ? 1 : 0;
+      const sig = `${conv.revisionOf(entry)}|${continued ? 1 : 0}|${streaming ? 1 : 0}|${entryRecent}|${turnNumber ?? ''}|${entryPinned}|${settled ? 1 : 0}|${foldKey}|${errorKey}|${entryAgentStatus}|${antigravityLogoBlob ? 1 : 0}|${userPrefs.diffMode}|${userPrefs.toolDisplay}|${Number(userPrefs.thoughtExpanded)}|${userPrefs.transcriptDensity}|${Number(userPrefs.showTimestamps)}|${layout.proseMaxW}|${pathPresenceCache.version}`;
       const record = rc.renderEntryMemoized(entry, { sig, settled }, () => (
         <Entry key={entry.id} entry={entry} continued={continued} streaming={streaming} recent={recent} turnNumber={turnNumber}
           callbacks={entryNow === renderNow ? entryCallbacks : { ...entryCallbacks, now: entryNow }} />
@@ -2872,6 +3000,22 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     const canSendQueueHead = !busy && !permission && !changingConfig && !sessionOperation && !authBusy && !!agent && !disconnected;
     const view: Renderable = {
       main: <col>
+        {openSessionTabs.length > 1 && rowsNow >= 18 && <row key="session-tabs" role="agy.tabs" gap="xs" align="center" wrap>
+          {openSessionTabs.map((tabId, idx) => {
+            const active = tabId === sid;
+            const label = sessionTitle(tabId);
+            const short = label.length > 20 ? `${label.slice(0, 17)}...` : label;
+            return <button key={`tab-${tabId}`} size="sm" variant={active ? 'default' : 'quiet'}
+              icon={active ? 'chat' : undefined}
+              title={`Switch to session "${label}" (Alt+${idx + 1} / Ctrl+Tab)`}
+              onClick={() => switchSessionTab(tabId)}>
+              {`${idx + 1}. ${short}`}
+            </button>;
+          })}
+          <button key="tab-new" size="sm" variant="quiet" icon="plus" title="Start new session (/new)"
+            disabled={(busy || !!permission || !!sessionOperation || !agent || disconnected) && 'Wait until current turn finishes'}
+            onClick={newConversation}>New</button>
+        </row>}
         <scroll key="conversation" bar="always" stick={visibleEntries.length ? 'end' : undefined}
           max={session?.caps.features.includes('styles') ? undefined : { h: layout.scrollMaxH }} gap="md" aria="Conversation">
           {hiddenCount > 0 && <row key="older-history" justify="between" align="center" gap="sm" wrap>
@@ -3022,11 +3166,6 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
                   <button size="sm" variant="quiet" onClick={() => {
                     const pulled = stateManager.pullQueuedAt(idx);
                     if (!pulled) return;
-                    const currentSt = stateManager.getActive();
-                    currentSt.draft = { text: pulled.text, cursor: pulled.text.length };
-                    currentSt.attachedFiles = [...pulled.files];
-                    currentSt.attachedDirs = [...pulled.dirs];
-                    currentSt.attachedImages = [...pulled.images];
                     render();
                     surface?.focus(DOCK_DRAFT_ID);
                   }}>Edit</button>
@@ -3034,6 +3173,8 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
                     stateManager.dropQueuedAt(idx);
                     render();
                   }}>Drop</button>
+                  {idx === 0 && st.queuedPrompts.length > 1 && <button size="sm" variant="quiet"
+                    onClick={() => openPanel({ kind: 'queue' })}>Manage</button>}
                 </row>
               </row>;
             })}
@@ -3084,6 +3225,23 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
                     remove: () => removeAttachment(file),
                   }} />;
               })}
+              {draftBudget && draftBudget.totalEstimatedTokens > 0 && <text key="budget"
+                hovercard={cachedHoverKv(
+                  'draft-budget',
+                  `${draftBudget.totalEstimatedTokens}|${draftBudget.remainingTokens ?? ''}|${draftBudget.entries.length}`,
+                  () => [
+                    { k: 'Estimated prompt', v: `~${formatCompactTokens(draftBudget.totalEstimatedTokens)} tokens` },
+                    { k: 'Draft text', v: `~${formatCompactTokens(draftBudget.draftTokens)} tokens` },
+                    { k: 'Attachments', v: `~${formatCompactTokens(draftBudget.attachmentTokens)} tokens (${draftBudget.entries.length})` },
+                    ...(draftBudget.remainingTokens !== undefined
+                      ? [{ k: 'Remaining window', v: `${draftBudget.remainingTokens.toLocaleString()} tokens (${draftBudget.percentOfRemaining ?? 0}%)` }]
+                      : []),
+                  ],
+                )}>
+                <span s={draftBudget.level === 'tight' ? 'error' : draftBudget.level === 'warn' ? 'warning' : 'muted'}>
+                  {`Est. ~${formatCompactTokens(draftBudget.totalEstimatedTokens)} tok${draftBudget.percentOfRemaining !== undefined ? ` (${draftBudget.percentOfRemaining}% left)` : ''}`}
+                </span>
+              </text>}
             </row>}
             <row key="line" role="omp.composer.line" align="start" gap="sm">
               <editor key="draft" role={busy ? 'agy.draft.busy' : undefined}
@@ -3406,6 +3564,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
           const switched = stateManager.switchSession(id, {
             freshConversation: prevId !== id && replayCoordinator.isReplaying && replayCoordinator.currentPhase !== 'idle',
           });
+          openSessionTabs = recordOpenSessionTab(openSessionTabs, id);
           if (prevId && prevId !== id && switched) {
             gitDiffCache.clear();
             cachedDiffCountConversation = undefined;
@@ -3550,6 +3709,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         metadata = connected.metadata;
         if (stateManager.activeSessionId !== connected.sessionId) {
           stateManager.switchSession(connected.sessionId);
+          openSessionTabs = recordOpenSessionTab(openSessionTabs, connected.sessionId);
         }
         const targetId = resumeId ?? launch?.conversationId;
         const loadingExisting = Boolean((targetId && targetId !== connected.sessionId) || (!resumeId && launch?.continueLast));
@@ -3661,6 +3821,20 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         if (panel?.kind === 'commands') closePanel();
         else openPanel({ kind: 'commands' });
         continue;
+      }
+      if (!panel && !permissions.length && !authBusy) {
+        if (key.ctrl && !key.alt && !key.meta && key.name === 'tab') {
+          const nextTab = cycleOpenSessionTab(openSessionTabs, stateManager.activeSessionId, key.shift ? -1 : 1);
+          if (nextTab) switchSessionTab(nextTab);
+          continue;
+        }
+        if (key.alt && !key.ctrl && !key.meta && /^[1-6]$/.test(key.name)) {
+          const targetTab = openSessionTabs[Number(key.name) - 1];
+          if (targetTab) {
+            switchSessionTab(targetTab);
+            continue;
+          }
+        }
       }
       if (key.name === 'escape') {
         if (panel) stepBackPanel();
@@ -3884,8 +4058,9 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         }
         const configOpt = current.kind === 'config' ? metadata.configOptions.find(candidate => candidate.id === current.id) : undefined;
         if (current.kind === 'commands' || current.kind === 'mcp' || current.kind === 'plugins' || current.kind === 'agents' ||
-          current.kind === 'templates' || current.kind === 'find' || current.kind === 'tasks' || current.kind === 'changes' ||
-          current.kind === 'sessions' || (current.kind === 'config' && configOpt?.type === 'select')) {
+          current.kind === 'templates' || current.kind === 'find' || current.kind === 'turns' || current.kind === 'queue' ||
+          current.kind === 'tasks' || current.kind === 'changes' || current.kind === 'sessions' ||
+          (current.kind === 'config' && configOpt?.type === 'select')) {
           let tabIds: string[] = [];
           let visibleIds: string[] = [];
           let activate: (chosenId: string) => void = () => {};
@@ -3939,6 +4114,36 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
             activate = chosenId => {
               const match = matches.find(m => m.id === chosenId);
               if (match) inspectFindMatch(match);
+            };
+          } else if (current.kind === 'turns') {
+            tabIds = ['all', 'pinned'];
+            const activeSt = stateManager.getActive();
+            const matches = filterTurnOutline(
+              buildTurnOutline(stateManager.getConversation().entries, activeSt.pinnedTurnIds),
+              pickerTab,
+              panelDraft.text,
+            );
+            visibleIds = matches.map(item => item.entryId);
+            activate = chosenId => {
+              const item = matches.find(entry => entry.entryId === chosenId);
+              if (item) jumpToTurnEntry(item.entryId, item.turnNumber);
+            };
+          } else if (current.kind === 'queue') {
+            tabIds = [];
+            const queue = stateManager.getActive().queuedPrompts;
+            const needle = panelDraft.text.trim().toLowerCase();
+            const matches = needle
+              ? queue.map((item, idx) => ({ item, idx })).filter(({ item, idx }) => `#${idx + 1} ${item.text}`.toLowerCase().includes(needle))
+              : queue.map((item, idx) => ({ item, idx }));
+            visibleIds = matches.map(({ item }) => item.id);
+            activate = chosenId => {
+              const hit = matches.find(({ item }) => item.id === chosenId);
+              if (!hit) return;
+              if (stateManager.pullQueuedAt(hit.idx)) {
+                closePanel();
+                render();
+                surface?.focus(DOCK_DRAFT_ID);
+              }
             };
           } else if (current.kind === 'tasks') {
             const needle = panelDraft.text.trim().toLowerCase();

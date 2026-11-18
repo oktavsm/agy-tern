@@ -5,6 +5,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   atMentionQuery,
+  detectGitStatus,
+  discardGitPath,
   extractInlineReferenceDecor,
   filterWorkspaceEntries,
   filterWorkspaceFiles,
@@ -25,7 +27,9 @@ import {
   replaceAtMentionWithInlineToken,
   resolvePastedImagePath,
   searchWorkspacePrefix,
+  stageGitPath,
   stripAtMention,
+  unstageGitPath,
   writeTranscriptExport,
 } from '../src/files';
 
@@ -276,5 +280,36 @@ describe('workspace @file mention helpers', () => {
 
     const removed = removeInlineToken(withImg, inlineAttachmentToken('src/ui.tsx', 'file'));
     expect(removed.text).toBe('check [Image: clip-1.png] here');
+  });
+
+  test('stages, unstages, and discards git changes cleanly while blocking workspace escapes', async () => {
+    const dir = await tempDir();
+    spawnSync('git', ['init'], { cwd: dir });
+    spawnSync('git', ['config', 'user.email', 'test@example.com'], { cwd: dir });
+    spawnSync('git', ['config', 'user.name', 'Test User'], { cwd: dir });
+    await writeFile(join(dir, 'tracked.txt'), 'v1\n', 'utf8');
+    spawnSync('git', ['add', 'tracked.txt'], { cwd: dir });
+    spawnSync('git', ['commit', '-m', 'init'], { cwd: dir });
+
+    await writeFile(join(dir, 'tracked.txt'), 'v2\n', 'utf8');
+    await writeFile(join(dir, 'scratch.txt'), 'temp\n', 'utf8');
+
+    const before = await detectGitStatus(dir);
+    expect(before.find(entry => entry.path === 'tracked.txt')).toMatchObject({ staged: false, unstaged: true });
+
+    await stageGitPath(dir, 'tracked.txt');
+    const staged = await detectGitStatus(dir);
+    expect(staged.find(entry => entry.path === 'tracked.txt')).toMatchObject({ staged: true, unstaged: false });
+
+    await unstageGitPath(dir, 'tracked.txt');
+    const unstaged = await detectGitStatus(dir);
+    expect(unstaged.find(entry => entry.path === 'tracked.txt')).toMatchObject({ staged: false, unstaged: true });
+
+    await discardGitPath(dir, 'tracked.txt', 'M');
+    await discardGitPath(dir, 'scratch.txt', '?');
+    expect(await detectGitStatus(dir)).toEqual([]);
+
+    await expect(stageGitPath(dir, '../outside.txt')).rejects.toThrow('active workspace');
+    await expect(discardGitPath(dir, '-rf', '?')).rejects.toThrow('active workspace');
   });
 });

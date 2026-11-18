@@ -2,6 +2,19 @@
 
 All notable changes to `agy-tern` are documented in this file.
 
+## [0.3.0] - 2026-11-18
+
+### Added
+- Multi-session open tab strip and fast tab switching (`Ctrl+Tab`, `Alt+1`..`Alt+6`) with an expanded 6-session in-memory LRU cache (`DEFAULT_MAX_IN_MEMORY_CONVERSATIONS = 6`).
+- Turn Outline Navigator (`/turns`, aliases `outline`, `jump`) with turn search, `Pinned` filter tab, turn pinning from transcript messages (`Pin turn` / `Unpin turn` + `[Pinned]` badges), and direct jump/reuse actions.
+- Interactive Git Workbench inside `/changes`: `Stage`, `Unstage`, and confirmation-guarded `Discard` actions for working-tree and untracked paths (`stageGitPath`, `unstageGitPath`, `discardGitPath`), plus `Staged` badges from `git status`.
+- Prompt Queue Manager (`/queue`, alias `queued`) with `Move up`, `Move down`, `Send #1`, `Edit in draft`, and `Drop` controls for queued follow-up prompts.
+- Pre-send context budget estimator (`src/context-budget.ts`) showing `Est. ~X tok` and remaining window percentage with hover breakdown beside attached `@file`, `@dir/`, and image chips.
+- Cached tier and tightest quota summary snapshot inside `/account` alongside the existing official sign-in flow (`logout` + `agy acp --sandbox --login`).
+
+### Changed
+- Extracted `src/context-budget.ts`, `src/turn-outline.ts`, and `src/ui-session-helpers.ts` for cleaner UI modularity and unit testability, and simplified composer queue editing to reuse `SessionStateManager.pullQueuedAt`.
+
 ## [0.2.4] - 2026-11-18
 
 ### Added

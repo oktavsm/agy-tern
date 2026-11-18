@@ -1,6 +1,6 @@
 import type { AvailableCommand, SessionConfigOption, SessionConfigSelectOption } from '@agentclientprotocol/sdk';
 
-export type LocalCommand = 'help' | 'keys' | 'update' | 'model' | 'settings' | 'usage' | 'credits' | 'changelog' | 'permissions' | 'sessions' | 'new' | 'rename' | 'account' | 'switch-account' | 'login' | 'changes' | 'find' | 'tasks' | 'paste-image' | 'export' | 'expand' | 'collapse' | 'mcp' | 'plugins' | 'agents' | 'templates' | 'exit';
+export type LocalCommand = 'help' | 'keys' | 'update' | 'model' | 'settings' | 'usage' | 'credits' | 'changelog' | 'permissions' | 'sessions' | 'turns' | 'queue' | 'new' | 'rename' | 'account' | 'switch-account' | 'login' | 'changes' | 'find' | 'tasks' | 'paste-image' | 'export' | 'expand' | 'collapse' | 'mcp' | 'plugins' | 'agents' | 'templates' | 'exit';
 export type CommandCategory = 'frontend' | 'workflow' | 'skill';
 
 const CORE_WORKFLOWS = new Set([
@@ -23,6 +23,8 @@ const LOCAL: readonly Command[] = [
   { name: 'tasks', local: 'tasks', description: 'Inspect running tools and cancel active turn tasks' },
   { name: 'paste-image', local: 'paste-image', description: 'Attach a screenshot or image directly from system clipboard' },
   { name: 'find', local: 'find', description: 'Search messages, tools, thoughts, and diffs in this conversation', hint: 'query' },
+  { name: 'turns', local: 'turns', description: 'Browse conversation turns, jump to any prompt, or view pinned turns', hint: 'query' },
+  { name: 'queue', local: 'queue', description: 'Inspect, reorder, edit, or drop queued follow-up prompts' },
   { name: 'export', local: 'export', description: 'Save current conversation transcript to Markdown or JSON in workspace', hint: 'file.md|json' },
   { name: 'templates', local: 'templates', description: 'Save, browse, and insert reusable prompt templates for this workspace' },
   { name: 'expand', local: 'expand', description: 'Expand all thought and tool cards in the conversation' },
@@ -43,7 +45,7 @@ const LOCAL: readonly Command[] = [
   { name: 'exit', local: 'exit', description: 'Close this frontend and its agy session' },
 ];
 const ALIASES: Readonly<Record<string, string>> = {
-  quota: 'usage', config: 'settings', preferences: 'settings', prefs: 'settings', quit: 'exit', commands: 'help', palette: 'help', shortcuts: 'keys', hotkeys: 'keys', upgrade: 'update', resume: 'sessions', conversation: 'sessions', switch: 'sessions', reauth: 'switch-account', diff: 'changes', search: 'find', skills: 'plugins', agent: 'agents', snippets: 'templates', running: 'tasks', ps: 'tasks', clip: 'paste-image',
+  quota: 'usage', config: 'settings', preferences: 'settings', prefs: 'settings', quit: 'exit', commands: 'help', palette: 'help', shortcuts: 'keys', hotkeys: 'keys', upgrade: 'update', resume: 'sessions', conversation: 'sessions', switch: 'sessions', reauth: 'switch-account', diff: 'changes', search: 'find', outline: 'turns', jump: 'turns', queued: 'queue', skills: 'plugins', agent: 'agents', snippets: 'templates', running: 'tasks', ps: 'tasks', clip: 'paste-image',
 };
 const ALIAS_PATTERN = new RegExp(`^\\/(${Object.keys(ALIASES).join('|')})(?=\\s|$)`);
 

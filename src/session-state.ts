@@ -4,7 +4,7 @@ import type { LoadedImageAttachment } from './files';
 import { Conversation, type TranscriptEntry } from './model';
 
 export const DEFAULT_HISTORY_VISIBLE = 30;
-export const DEFAULT_MAX_IN_MEMORY_CONVERSATIONS = 3;
+export const DEFAULT_MAX_IN_MEMORY_CONVERSATIONS = 6;
 
 export const REPLAY_INITIAL_GRACE_MS = 250;
 export const REPLAY_SETTLE_MS = 350;
@@ -37,6 +37,7 @@ export interface SessionUiState {
   focusedTurnIndex: number | undefined;
   historyVisibleCount: number;
   previewedMedia: Set<string>;
+  pinnedTurnIds: Set<string>;
 }
 
 export function createSessionUiState(sessionId: string, initialDraft?: Draft): SessionUiState {
@@ -59,6 +60,7 @@ export function createSessionUiState(sessionId: string, initialDraft?: Draft): S
     focusedTurnIndex: undefined,
     historyVisibleCount: DEFAULT_HISTORY_VISIBLE,
     previewedMedia: new Set<string>(),
+    pinnedTurnIds: new Set<string>(),
   };
 }
 
@@ -257,6 +259,25 @@ export class SessionStateManager {
 
   dropQueuedAt(idx: number): QueuedPrompt | undefined {
     return this._activeState.queuedPrompts.splice(idx, 1)[0];
+  }
+
+  moveQueued(fromIdx: number, toIdx: number): boolean {
+    const queue = this._activeState.queuedPrompts;
+    if (fromIdx < 0 || fromIdx >= queue.length || toIdx < 0 || toIdx >= queue.length || fromIdx === toIdx) return false;
+    const [item] = queue.splice(fromIdx, 1);
+    if (!item) return false;
+    queue.splice(toIdx, 0, item);
+    return true;
+  }
+
+  togglePinnedTurn(entryId: string): boolean {
+    const pins = this._activeState.pinnedTurnIds;
+    if (pins.has(entryId)) {
+      pins.delete(entryId);
+      return false;
+    }
+    pins.add(entryId);
+    return true;
   }
 
   setRetryPayload(

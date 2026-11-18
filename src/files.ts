@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { statSync } from 'node:fs';
-import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import type { ImageAttachment, ResourceAttachment } from './contracts';
@@ -153,6 +153,8 @@ export async function readClipboardImage(
 export interface GitStatusEntry {
   status: string;
   path: string;
+  staged?: boolean;
+  unstaged?: boolean;
 }
 
 /** Read a workspace image file safely for ACP image prompt blocks. */
@@ -181,9 +183,14 @@ export async function detectGitStatus(cwd: string, limit = 100): Promise<GitStat
   const entries: GitStatusEntry[] = [];
   for (const rawLine of out.split(/\r?\n/)) {
     if (rawLine.length < 4) continue;
+    const x = rawLine[0] ?? ' ';
+    const y = rawLine[1] ?? ' ';
     const status = rawLine.slice(0, 2).trim() || '?';
     const path = rawLine.slice(3).trim();
-    if (path) entries.push({ status, path });
+    const untracked = x === '?' || y === '?';
+    const staged = !untracked && x !== ' ';
+    const unstaged = !untracked && y !== ' ';
+    if (path) entries.push({ status, path, staged, unstaged });
     if (entries.length >= limit) break;
   }
   return entries;
@@ -915,16 +922,75 @@ async function runGitCommand(
   });
 }
 
-/** Read working-tree or staged git diff for a workspace-relative path. */
-export async function readGitFileDiff(cwd: string, filePath: string): Promise<string> {
+function resolveSafeWorkspaceRelPath(
+  cwd: string,
+  filePath: string,
+): { root: string; abs: string; rel: string } | undefined {
   const cleaned = filePath.trim();
-  if (!cleaned || cleaned.startsWith('-') || /[\0-\u001f\u007f]/.test(cleaned)) return '';
+  if (!cleaned || cleaned.startsWith('-') || /[\0-\u001f\u007f]/.test(cleaned)) return undefined;
   const root = resolve(cwd);
   const abs = isAbsolute(cleaned) ? resolve(cleaned) : resolve(root, cleaned);
   const rel = relative(root, abs);
-  if (!rel || rel.startsWith('..') || isAbsolute(rel)) return '';
-  const unstaged = await runGitCommand(root, ['diff', '--no-color', '--', rel]);
+  if (!rel || rel.startsWith('..') || isAbsolute(rel)) return undefined;
+  return { root, abs, rel };
+}
+
+async function runGitMutation(cwd: string, args: string[], actionLabel: string): Promise<void> {
+  return new Promise((resolvePromise, rejectPromise) => {
+    const child = spawn('git', args, { cwd, stdio: ['ignore', 'ignore', 'pipe'] });
+    let err = '';
+    const timer = setTimeout(() => {
+      child.kill('SIGTERM');
+      rejectPromise(new Error(`Timed out trying to ${actionLabel}.`));
+    }, 3_000);
+    child.stderr?.on('data', chunk => {
+      if (err.length < 4096) err += String(chunk);
+    });
+    child.once('error', cause => { clearTimeout(timer); rejectPromise(cause); });
+    child.once('close', code => {
+      clearTimeout(timer);
+      if (code === 0) resolvePromise();
+      else rejectPromise(new Error(err.trim() || `git ${args[0] ?? ''} exited with code ${code ?? 'unknown'}`));
+    });
+  });
+}
+
+/** Read working-tree or staged git diff for a workspace-relative path. */
+export async function readGitFileDiff(cwd: string, filePath: string): Promise<string> {
+  const target = resolveSafeWorkspaceRelPath(cwd, filePath);
+  if (!target) return '';
+  const unstaged = await runGitCommand(target.root, ['diff', '--no-color', '--', target.rel]);
   if (unstaged?.trim()) return unstaged;
-  const staged = await runGitCommand(root, ['diff', '--cached', '--no-color', '--', rel]);
+  const staged = await runGitCommand(target.root, ['diff', '--cached', '--no-color', '--', target.rel]);
   return staged ?? '';
+}
+
+/** Stage a modified or untracked workspace path safely via git. */
+export async function stageGitPath(cwd: string, filePath: string): Promise<void> {
+  const target = resolveSafeWorkspaceRelPath(cwd, filePath);
+  if (!target) throw new Error('Target path must stay inside the active workspace.');
+  await runGitMutation(target.root, ['add', '--', target.rel], `stage ${target.rel}`);
+}
+
+/** Unstage a staged workspace path safely via git index reset. */
+export async function unstageGitPath(cwd: string, filePath: string): Promise<void> {
+  const target = resolveSafeWorkspaceRelPath(cwd, filePath);
+  if (!target) throw new Error('Target path must stay inside the active workspace.');
+  await runGitMutation(target.root, ['reset', '-q', 'HEAD', '--', target.rel], `unstage ${target.rel}`);
+}
+
+/** Discard working-tree or untracked changes for a single workspace path after confirmation. */
+export async function discardGitPath(cwd: string, filePath: string, status: string): Promise<void> {
+  const target = resolveSafeWorkspaceRelPath(cwd, filePath);
+  if (!target) throw new Error('Target path must stay inside the active workspace.');
+  if (status === '?' || status === '??') {
+    await rm(target.abs, { recursive: true, force: true });
+    return;
+  }
+  await runGitMutation(target.root, ['reset', '-q', 'HEAD', '--', target.rel], `unstage ${target.rel}`).catch(() => {});
+  if (status === 'A') {
+    await rm(target.abs, { recursive: true, force: true });
+    return;
+  }
+  await runGitMutation(target.root, ['checkout', '--', target.rel], `discard ${target.rel}`);
 }

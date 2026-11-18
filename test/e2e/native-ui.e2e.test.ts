@@ -275,6 +275,29 @@ describe('agy-tern native Tern E2E smoke', () => {
     }
     expect(harness.findById('layer.panel')).toBeUndefined();
 
+    // Verify /turns Turn Outline Navigator and /queue manager overlays render cleanly.
+    harness.sendText('/turns');
+    harness.sendKey('enter');
+    await harness.waitForText('Turn outline', 'layer', 5_000);
+    harness.assertWireInvariants();
+    harness.sendKey('esc');
+    const turnsDeadline = Date.now() + 4_000;
+    while (harness.findById('layer.picker') && Date.now() < turnsDeadline) {
+      await new Promise(resolveDelay => setTimeout(resolveDelay, 25));
+    }
+    expect(harness.findById('layer.picker')).toBeUndefined();
+
+    harness.sendText('/queue');
+    harness.sendKey('enter');
+    await harness.waitForText('Prompt queue', 'layer', 5_000);
+    harness.assertWireInvariants();
+    harness.sendKey('esc');
+    const queueDeadline = Date.now() + 4_000;
+    while (harness.findById('layer.picker') && Date.now() < queueDeadline) {
+      await new Promise(resolveDelay => setTimeout(resolveDelay, 25));
+    }
+    expect(harness.findById('layer.picker')).toBeUndefined();
+
     // Verify multiline @file popup keeps mode="insert", allows Up/Down navigation without cursor escaping, and inserts inline @path + decor.
     harness.sendText('line one');
     harness.sendKey('shift+enter');
@@ -302,6 +325,8 @@ describe('agy-tern native Tern E2E smoke', () => {
       },
       4_000,
     );
+    // Pre-send context budget indicator renders cleanly beside attachment chips.
+    await harness.waitForText('Est. ~', 'dock', 4_000);
     harness.assertWireInvariants();
 
     // Quit cleanly with Ctrl+Q.

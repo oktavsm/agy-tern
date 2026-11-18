@@ -10,7 +10,10 @@ import type { AgentEntry, McpServerEntry, PluginEntry } from './extensions';
 import type { OfficialReport } from './reports';
 import { parseQuotaReport } from './reports';
 import type { SessionPreview } from './history';
+import type { QueuedPrompt } from './session-state';
 import type { PromptTemplate } from './templates';
+import { buildTurnOutline, filterTurnOutline } from './turn-outline';
+import { formatAccountSnapshot } from './ui-session-helpers';
 import {
   DEFAULT_MODEL_ID,
   DEFAULT_PREFS,
@@ -78,6 +81,8 @@ export type Panel =
   | { kind: 'account-switch' }
   | { kind: 'changes' }
   | { kind: 'find' }
+  | { kind: 'turns' }
+  | { kind: 'queue' }
   | { kind: 'tasks' }
   | { kind: 'mcp' }
   | { kind: 'plugins' }
@@ -201,11 +206,26 @@ export interface PanelRenderContext {
   onCopy(text: string): void;
   onStopTurn(): void;
   onLoadReport(report: OfficialReport): void;
+  onOpenFollowUp?(title: string, message: string, fields: unknown): void;
   followUp?: FollowUpSessionState;
   onUpdateFollowUp?(updater: (state: FollowUpSessionState) => void): void;
   onSubmitFollowUp?(): void;
   onDeclineFollowUp?(): void;
   onCancelFollowUp?(): void;
+  pinnedTurnIds?: ReadonlySet<string>;
+  queuedPrompts?: readonly QueuedPrompt[];
+  canSendQueueHead?: boolean;
+  gitMutationBusy?: boolean;
+  onJumpToTurn?(entryId: string, turnNumber: number): void;
+  onTogglePinTurn?(entryId: string): void;
+  onReusePrompt?(text: string): void;
+  onMoveQueued?(fromIdx: number, toIdx: number): void;
+  onPullQueued?(idx: number): void;
+  onDropQueued?(idx: number): void;
+  onSendQueuedHead?(): void;
+  onStageGitPath?(filePath: string): void;
+  onUnstageGitPath?(filePath: string): void;
+  onDiscardGitPath?(filePath: string, status: string): void;
 }
 
 function renderPrefsPanel(ctx: PanelRenderContext): JSX.Element {
@@ -563,10 +583,13 @@ function renderChangesPicker(ctx: PanelRenderContext): JSX.Element {
       id: `git:${entry.path}`,
       label: basename(entry.path),
       detail: entry.path,
-      badges: [{
-        text: entry.status,
-        tone: entry.status === 'D' ? 'error' as const : entry.status === '?' || entry.status === 'A' ? 'success' as const : 'accent' as const,
-      }],
+      badges: [
+        ...(entry.staged ? [{ text: 'Staged', tone: 'success' as const }] : []),
+        {
+          text: entry.status,
+          tone: entry.status === 'D' ? 'error' as const : entry.status === '?' || entry.status === 'A' ? 'success' as const : 'accent' as const,
+        },
+      ],
       node: 'pv',
     }))
     : filteredEdits.map(item => ({
@@ -579,6 +602,10 @@ function renderChangesPicker(ctx: PanelRenderContext): JSX.Element {
       ],
       node: 'pv',
     }));
+
+  const canStage = !!highlightedGit && (!highlightedGit.staged || !!highlightedGit.unstaged || highlightedGit.status === '?') && !!ctx.onStageGitPath && !ctx.gitMutationBusy;
+  const canUnstage = !!highlightedGit && !!highlightedGit.staged && !!ctx.onUnstageGitPath && !ctx.gitMutationBusy;
+  const canDiscard = !!highlightedGit && !!ctx.onDiscardGitPath && !ctx.gitMutationBusy;
 
   return <picker key="picker" size={ctx.rLayout.panelSize} title="Changes" icon="diff"
     subtitle="Session edits, modified tracked files, and untracked paths"
@@ -600,6 +627,11 @@ function renderChangesPicker(ctx: PanelRenderContext): JSX.Element {
     preview={highlightedPath ? 'below' : 'none'}
     actions={[
       { id: 'refresh', label: 'Refresh' },
+      ...(usingGit ? [
+        ...(canUnstage ? [{ id: 'unstage', label: 'Unstage' }] : []),
+        ...(canStage ? [{ id: 'stage', label: 'Stage' }] : []),
+        { id: 'discard', label: 'Discard', disabled: !canDiscard ? (true as const) : undefined },
+      ] : []),
       { id: 'copy-diff', label: activeDiffText ? 'Copy diff' : 'Copy path', disabled: !highlightedPath ? (true as const) : undefined },
       { id: 'inspect', label: 'Fullscreen', disabled: !highlightedPath ? (true as const) : undefined },
       { id: 'split', label: 'Tern split',
@@ -618,6 +650,26 @@ function renderChangesPicker(ctx: PanelRenderContext): JSX.Element {
         if (typeof event.value === 'string') ctx.onSetPickerTab(event.value, true);
       },
       refresh: ctx.onRefreshGitChanges,
+      stage: () => {
+        if (highlightedGit && ctx.onStageGitPath) ctx.onStageGitPath(highlightedGit.path);
+      },
+      unstage: () => {
+        if (highlightedGit && ctx.onUnstageGitPath) ctx.onUnstageGitPath(highlightedGit.path);
+      },
+      discard: () => {
+        if (!highlightedGit || !ctx.onDiscardGitPath) return;
+        const target = highlightedGit;
+        ctx.onOpenPanel({
+          kind: 'confirm',
+          title: target.status === '?' ? 'Delete untracked file?' : 'Discard git changes?',
+          detail: target.status === '?'
+            ? `Permanently deletes untracked path "${target.path}" from workspace.`
+            : `Reverts working-tree modifications in "${target.path}" to HEAD.`,
+          actionLabel: target.status === '?' ? 'Delete file' : 'Discard changes',
+          returnTo: { kind: 'changes' },
+          onConfirm: () => ctx.onDiscardGitPath?.(target.path, target.status),
+        });
+      },
       'copy-diff': () => {
         if (activeDiffText) ctx.onCopy(activeDiffText);
         else if (highlightedPath) ctx.onCopy(highlightedPath);
@@ -725,6 +777,155 @@ function renderFindPicker(ctx: PanelRenderContext): JSX.Element {
       <text><span s="muted">{highlighted.detail}</span></text>
       {hlImgPath && <col align="center"><media path={hlImgPath} /></col>}
       <md>{(highlighted.preview || highlighted.detail).slice(0, 1200)}</md>
+    </col>}
+  </picker>;
+}
+
+function renderTurnsPicker(ctx: PanelRenderContext): JSX.Element {
+  const allTurns = buildTurnOutline(ctx.entries, ctx.pinnedTurnIds);
+  const tab = ctx.pickerTab === 'pinned' ? 'pinned' : 'all';
+  const filtered = filterTurnOutline(allTurns, tab, ctx.panelDraft.text);
+  const order = filtered.map(item => item.entryId);
+  const selectedId = order.includes(ctx.pickerSelected) ? ctx.pickerSelected : (order[0] ?? '');
+  const highlighted = filtered.find(item => item.entryId === selectedId);
+  const pinnedCount = allTurns.filter(item => item.pinned).length;
+
+  const items: PickerItem[] = filtered.map(item => ({
+    id: item.entryId,
+    label: `#${item.turnNumber} ${item.promptPreview}`,
+    detail: item.replyPreview ?? 'Awaiting or no text reply',
+    badges: [
+      ...(item.pinned ? [{ text: 'Pinned', tone: 'accent' as const }] : []),
+      ...(item.toolCount ? [{ text: `${item.toolCount} tools`, tone: 'info' as const }] : []),
+      ...(item.hasError ? [{ text: 'Error', tone: 'error' as const }] : []),
+    ],
+    node: 'pv',
+  }));
+
+  return <picker key="picker" size={ctx.rLayout.panelSize} title="Turn outline" icon="history"
+    subtitle="Jump to any prompt turn, filter pinned turns, or reuse a prompt"
+    placeholder="Filter turns by #N, prompt, or reply..."
+    query={ctx.panelDraft.text} cursor={ctx.panelDraft.cursor} onEdit={ctx.onEditPanelDraft}
+    tabs={[
+      { id: 'all', label: 'All turns', count: allTurns.length },
+      { id: 'pinned', label: 'Pinned', count: pinnedCount },
+    ]}
+    tab={tab}
+    order={order} items={items} selected={selectedId}
+    state="ready"
+    empty={tab === 'pinned' ? 'No pinned turns yet.' : 'No prompt turns in this conversation yet.'}
+    preview={highlighted ? 'below' : 'none'}
+    actions={[
+      { id: 'pin', label: highlighted?.pinned ? 'Unpin' : 'Pin turn', disabled: !highlighted ? (true as const) : undefined },
+      { id: 'reuse', label: 'Reuse prompt', disabled: !highlighted ? (true as const) : undefined },
+      { id: 'close', label: 'Close', keys: ['esc'] },
+      { id: 'jump', label: 'Jump to turn', primary: true, keys: ['enter'], disabled: !highlighted ? (true as const) : undefined },
+    ]}
+    onSelect={event => ctx.onSetPickerSelected(event.item)}
+    onActivate={() => {
+      if (highlighted) ctx.onJumpToTurn?.(highlighted.entryId, highlighted.turnNumber);
+    }}
+    onAction={{
+      close: ctx.onClosePanel,
+      tab: event => {
+        if (typeof event.value === 'string') ctx.onSetPickerTab(event.value, true);
+      },
+      pin: () => {
+        if (highlighted) ctx.onTogglePinTurn?.(highlighted.entryId);
+      },
+      reuse: () => {
+        if (highlighted) {
+          ctx.onClosePanel();
+          ctx.onReusePrompt?.(highlighted.promptText);
+        }
+      },
+      jump: () => {
+        if (highlighted) ctx.onJumpToTurn?.(highlighted.entryId, highlighted.turnNumber);
+      },
+    }}>
+    {highlighted && <col key="pv" gap="xs">
+      <kv items={[
+        { k: 'Turn', v: `#${highlighted.turnNumber}${highlighted.pinned ? ' [Pinned]' : ''}${highlighted.time ? ` · ${highlighted.time}` : ''}` },
+        { k: 'Activity', v: `${highlighted.toolCount} tool(s), ${highlighted.thoughtCount} thought(s)${highlighted.hasError ? ', error notice' : ''}` },
+      ]} />
+      <md>{highlighted.promptText.slice(0, 900)}</md>
+      {highlighted.replyPreview && <text wrap="word"><span s="muted">Reply: {highlighted.replyPreview}</span></text>}
+    </col>}
+  </picker>;
+}
+
+function renderQueuePicker(ctx: PanelRenderContext): JSX.Element {
+  const queue = ctx.queuedPrompts ?? [];
+  const query = ctx.panelDraft.text.trim().toLowerCase();
+  const indexed = queue.map((item, idx) => ({ item, idx }));
+  const filtered = query
+    ? indexed.filter(({ item, idx }) => `#${idx + 1} ${item.text} ${item.files.join(' ')} ${item.dirs.join(' ')}`.toLowerCase().includes(query))
+    : indexed;
+  const order = filtered.map(({ item }) => item.id);
+  const selectedId = order.includes(ctx.pickerSelected) ? ctx.pickerSelected : (order[0] ?? '');
+  const highlightedEntry = filtered.find(({ item }) => item.id === selectedId);
+  const highlightedIdx = highlightedEntry?.idx ?? -1;
+  const highlighted = highlightedEntry?.item;
+
+  const items: PickerItem[] = filtered.map(({ item, idx }) => {
+    const snippet = item.text.trim().replace(/\s+/g, ' ').slice(0, 64) || '(attachments only)';
+    return {
+      id: item.id,
+      label: `#${idx + 1} ${snippet}`,
+      detail: `${item.files.length} file(s), ${item.dirs.length} dir(s), ${item.images.length} image(s)`,
+      badges: idx === 0 ? [{ text: 'Next', tone: 'accent' as const }] : undefined,
+      node: 'pv',
+    };
+  });
+
+  return <picker key="picker" size={ctx.rLayout.panelSize} title="Prompt queue" icon="edit"
+    subtitle="Reorder, edit in draft, or remove queued follow-up prompts"
+    placeholder="Filter queued prompts..."
+    query={ctx.panelDraft.text} cursor={ctx.panelDraft.cursor} onEdit={ctx.onEditPanelDraft}
+    order={order} items={items} selected={selectedId}
+    state="ready"
+    empty="No prompts queued. Press Enter while busy to queue a follow-up prompt."
+    preview={highlighted ? 'below' : 'none'}
+    actions={[
+      ...(ctx.canSendQueueHead && queue.length > 0 ? [{ id: 'send', label: 'Send #1' }] : []),
+      { id: 'up', label: 'Move up', disabled: highlightedIdx <= 0 ? (true as const) : undefined },
+      { id: 'down', label: 'Move down', disabled: highlightedIdx < 0 || highlightedIdx >= queue.length - 1 ? (true as const) : undefined },
+      { id: 'drop', label: 'Drop', disabled: highlightedIdx < 0 ? (true as const) : undefined },
+      { id: 'close', label: 'Close', keys: ['esc'] },
+      { id: 'edit', label: 'Edit in draft', primary: true, keys: ['enter'], disabled: highlightedIdx < 0 ? (true as const) : undefined },
+    ]}
+    onSelect={event => ctx.onSetPickerSelected(event.item)}
+    onActivate={() => {
+      if (highlightedIdx >= 0) ctx.onPullQueued?.(highlightedIdx);
+    }}
+    onAction={{
+      close: ctx.onClosePanel,
+      send: () => ctx.onSendQueuedHead?.(),
+      up: () => {
+        if (highlightedIdx > 0 && highlighted) {
+          ctx.onMoveQueued?.(highlightedIdx, highlightedIdx - 1);
+          ctx.onSetPickerSelected(highlighted.id);
+        }
+      },
+      down: () => {
+        if (highlightedIdx >= 0 && highlightedIdx < queue.length - 1 && highlighted) {
+          ctx.onMoveQueued?.(highlightedIdx, highlightedIdx + 1);
+          ctx.onSetPickerSelected(highlighted.id);
+        }
+      },
+      drop: () => {
+        if (highlightedIdx >= 0) ctx.onDropQueued?.(highlightedIdx);
+      },
+      edit: () => {
+        if (highlightedIdx >= 0) ctx.onPullQueued?.(highlightedIdx);
+      },
+    }}>
+    {highlighted && <col key="pv" gap="xs">
+      <kv items={[
+        { k: 'Position', v: `#${highlightedIdx + 1} of ${queue.length}` },
+        { k: 'Attachments', v: `${highlighted.files.length} file(s), ${highlighted.dirs.length} dir(s), ${highlighted.images.length} image(s)` },
+      ]} />
+      <md>{highlighted.text.slice(0, 900) || '(attachments only)'}</md>
     </col>}
   </picker>;
 }
@@ -1538,7 +1739,9 @@ function renderKeysOverlay(ctx: PanelRenderContext): JSX.Element {
         <section head="Navigation & Quick Panels">
           <kv items={[
             { k: 'Ctrl+K', v: 'Open Commands & Quick Switcher palette' },
+            { k: 'Ctrl+Tab / Alt+1..6', v: 'Cycle or jump between open session tabs' },
             { k: 'Ctrl+Up / Ctrl+Down', v: 'Jump to previous / next user turn in transcript' },
+            { k: '/turns · /queue', v: 'Open Turn Outline Navigator or Prompt Queue Manager' },
             { k: 'PageUp / PageDown', v: 'Scroll conversation or active modal overlay' },
             { k: 'Esc', v: 'Step back from sub-panel, dismiss popup, or cancel active turn' },
             { k: 'Ctrl+C / Ctrl+Q', v: 'Quit agy-tern safely and close ACP session' },
@@ -1573,6 +1776,8 @@ export function renderActivePanel(ctx: PanelRenderContext): JSX.Element {
   if (currentPanel.kind === 'sessions') return renderSessionsPicker(ctx);
   if (currentPanel.kind === 'changes') return renderChangesPicker(ctx);
   if (currentPanel.kind === 'find') return renderFindPicker(ctx);
+  if (currentPanel.kind === 'turns') return renderTurnsPicker(ctx);
+  if (currentPanel.kind === 'queue') return renderQueuePicker(ctx);
   if (currentPanel.kind === 'tasks') return renderTasksPicker(ctx);
   if (currentPanel.kind === 'inspect') return renderInspectOverlay(ctx, currentPanel);
 
@@ -1684,12 +1889,16 @@ export function renderActivePanel(ctx: PanelRenderContext): JSX.Element {
     </> : <>
       {currentPanel.kind === 'account' && <scroll key="overlay-scroll" bar="always" max={{ h: ctx.rLayout.inspectBodyMaxH }}>
         <col gap="xs">
-          <kv items={[
-            { k: 'ACP connection', v: ctx.disconnected ? 'Disconnected' : ctx.agent ? 'Connected; model access not guaranteed' : 'Connecting' },
-            { k: 'Subscription tier', v: ctx.metadata.tier ? ctx.metadata.tier.name : 'Not reported by ACP' },
-            { k: 'Account identity', v: 'Not exposed by this ACP connection' },
-            { k: 'Credential owner', v: 'Official agy shared authentication' },
-          ]} />
+          {(() => {
+            const snapshot = formatAccountSnapshot(ctx.metadata, ctx.reportText);
+            return <kv items={[
+              { k: 'ACP connection', v: ctx.disconnected ? 'Disconnected' : ctx.agent ? 'Connected; model access not guaranteed' : 'Connecting' },
+              { k: 'Subscription tier', v: ctx.metadata.tier ? ctx.metadata.tier.name : 'Not reported by ACP' },
+              ...(snapshot ? [{ k: 'Cached snapshot', v: snapshot }] : []),
+              { k: 'Account identity', v: 'Not exposed by this ACP connection' },
+              { k: 'Credential owner', v: 'Official agy shared authentication' },
+            ]} />;
+          })()}
           <text wrap="word">Sign in through agy’s interactive flow. This frontend stores no accounts or tokens. Switching requires signing in again, not selecting a saved-account pool. Login reconnects a fresh session and keeps your unsent draft.</text>
           {!ctx.authenticationKnown && <text wrap="word">{ctx.disconnected ? 'No login descriptor received. Use the official CLI terminal login from your shell.' : 'Waiting for agy to advertise sign-in options.'}</text>}
           {ctx.authenticationKnown && !method && <text>agy did not advertise terminal sign-in support.</text>}

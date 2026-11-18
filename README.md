@@ -154,6 +154,7 @@ agy-tern --doctor                                 # Verify agy, tern, Bun, and c
 **Keyboard Controls**:
 - **Send / Queue**: `Enter` sends (or queues follow-up prompts while busy); `Shift+Enter` inserts a newline; multiline pastes stay in the draft.
 - **Composer Editing**: `Ctrl+A` / `Ctrl+E` (line start/end), `Ctrl+Left`/`Right` or `Alt+B`/`F` (word jump), `Up`/`Down` (wrapped lines or prompt history `History i/N`), `Ctrl+W`/`U`/`K`, `Ctrl+Z` (undo).
+- **Quick Panels & Session Tabs**: `Ctrl+K` opens the command palette, `Ctrl+Tab` / `Alt+1..6` switch between open session tabs, and `/keys` shows the full shortcut reference.
 - **Modals & Turns**: `Esc` closes overlays without cancelling a running turn; during an active turn with no modal open, `Esc` cancels the turn. `Ctrl+Q` quits cleanly.
 - **Transcript & Inspector**: `PgUp` / `PgDn` or mouse wheel / scrollbar drag scroll history; inside `InspectOverlay`, use `Up`/`Down`/`PgUp`/`PgDn`/`Home`/`End` to scroll, `c` to copy, `l` to toggle diff layout, `a` to attach, `s` to open in Tern split, and `u`/`Backspace` to go up a directory.
 
@@ -162,11 +163,13 @@ agy-tern --doctor                                 # Verify agy, tern, Bun, and c
 | Command | Behavior |
 | --- | --- |
 | `/sessions`, `/resume`, `/switch` | Browse `This folder`, `All workspaces`, and `Local named` sessions; search by title, folder, ID, or chat text; load, fast-resume, rename, or close |
+| `/turns`, `/outline` | Browse conversation turns, filter pinned turns, reuse prompts, or jump directly to any turn |
+| `/queue` | Inspect, reorder (`Move up`/`Move down`), edit in draft, or drop queued follow-up prompts |
 | `/usage`, `/quota` | Official `/usage` quota table, ACP context telemetry, and **`Details`** account/runtime view |
 | `/model [id\|name]` | Switch active ACP model |
 | `/settings`, `/config` | Open 4-page `<prefs>` modal persisted in `$XDG_STATE_HOME/agy-tern/prefs.json` |
 | `/find [query]`, `/search [query]` | Search transcript messages, thoughts, tools, diffs, plans, and notices |
-| `/changes`, `/diff` | Inspect session edits and workspace `git status` diffs with `Tern split` |
+| `/changes`, `/diff` | Inspect session edits and workspace `git status` diffs; stage, unstage, discard (confirmed), copy diff, or open in `Tern split` |
 | `/tasks`, `/running`, `/ps` | Inspect active and completed session tools or stop the active turn |
 | `/templates [query]` | Save, search, insert, or delete workspace prompt templates |
 | `/mcp`, `/plugins`, `/agents` | Manage `agy` MCP servers, plugins/skills, and custom agent profiles |
@@ -214,7 +217,7 @@ Core module map:
 - `src/contracts.ts`, `src/agent.ts`, `src/auth.ts`, `src/reports.ts`: Official ACP stdio boundary, login lifecycle, and CLI reports.
 - `src/model.ts`, `src/history.ts`, `src/session-state.ts`, `src/draft.ts`, `src/files.ts`, `src/prefs.ts`, `src/session-names.ts`, `src/templates.ts`: Transcript hydration, local XDG stores, composer input, and `@file` indexing.
 - `src/cli-args.ts`, `src/cli.tsx`, `src/updater.ts`, `src/commands.ts`, `src/extensions.ts`, `src/tern-window.ts`: CLI flag parsing, `update` & passive check, extension managers, `tern open` splits, and OSC 9 attention alerts.
-- `src/tern-render.ts`, `src/ui-format.ts`, `src/picker-nav.ts`, `src/transcript-view.tsx`, `src/panels.tsx`, `src/ui.tsx`: Adaptive Tern render controller, modal pickers, inspector overlays, composer card, and keyboard/pointer orchestration.
+- `src/tern-render.ts`, `src/ui-format.ts`, `src/context-budget.ts`, `src/turn-outline.ts`, `src/ui-session-helpers.ts`, `src/picker-nav.ts`, `src/transcript-view.tsx`, `src/panels.tsx`, `src/ui.tsx`: Adaptive Tern render controller, pre-send context estimator, turn outline, modal pickers, inspector overlays, composer card, and keyboard/pointer orchestration.
 
 ---
 
