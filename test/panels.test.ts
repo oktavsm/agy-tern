@@ -146,6 +146,7 @@ describe('panel renderers & transcript view helpers', () => {
       { kind: 'tasks' },
       { kind: 'find' },
       { kind: 'changes' },
+      { kind: 'keys' },
       { kind: 'report', report: 'usage' },
       { kind: 'inspect', title: 'snippet.ts', item: { type: 'file', path: 'snippet.ts', content: 'export const x = 1;' } },
     ];
@@ -448,5 +449,20 @@ describe('panel renderers & transcript view helpers', () => {
     expect(allJson).toContain('another-repo');
     expect(allJson).toContain('Chat match');
     expect(allJson).toContain('/tmp/another-repo (loads into current workspace)');
+
+    const changesCtx = baseContext({ kind: 'changes' });
+    changesCtx.pickerTab = 'untracked';
+    changesCtx.gitChanges = [
+      { status: 'M', path: 'src/ui.tsx' },
+      { status: '?', path: 'assets/new.png' },
+    ];
+    const untrackedJson = JSON.stringify(renderActivePanel(changesCtx));
+    expect(untrackedJson).toContain('assets/new.png');
+    expect(untrackedJson).not.toContain('src/ui.tsx');
+    expect(untrackedJson).toContain('Copy path');
+
+    const keysJson = JSON.stringify(renderActivePanel(baseContext({ kind: 'keys' })));
+    expect(keysJson).toContain('Keyboard shortcuts');
+    expect(keysJson).toContain('Ctrl+K');
   });
 });

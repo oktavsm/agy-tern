@@ -87,6 +87,7 @@ export interface FollowUpSessionState {
   customDrafts: Record<string, string>;
   freeNote: string;
   draftCursors?: Record<string, { cursor: number; anchor?: number }>;
+  optionCursors?: Record<string, number>;
   error?: string;
 }
 
@@ -276,6 +277,7 @@ export function createFollowUpSessionState(
     customDrafts,
     freeNote: '',
     draftCursors: {},
+    optionCursors: {},
   };
 }
 

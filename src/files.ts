@@ -235,6 +235,102 @@ export function stripAtMention(draft: Draft, mention: AtMention): Draft {
   return { text, cursor: mention.start };
 }
 
+/** Build the inline composer token displayed for an attached workspace path or image. */
+export function inlineAttachmentToken(pathValue: string, kind: 'file' | 'dir' | 'image'): string {
+  if (kind === 'image') return `[Image: ${basename(pathValue)}]`;
+  return kind === 'dir' ? `@${ensureTrailingSlash(pathValue)}` : `@${pathValue}`;
+}
+
+/** Replace the active `@query` span with an inline token and trailing space. */
+export function replaceAtMentionWithInlineToken(draft: Draft, mention: AtMention, token: string): Draft {
+  const before = draft.text.slice(0, mention.start);
+  const after = draft.text.slice(mention.end);
+  const prefix = before && !/[\s(]$/.test(before) ? ' ' : '';
+  const suffix = after.startsWith(' ') || after.startsWith('\n') ? '' : ' ';
+  const inserted = `${prefix}${token}${suffix}`;
+  const cursor = mention.start + inserted.length + (after.startsWith(' ') ? 1 : 0);
+  return {
+    text: `${before}${inserted}${after}`,
+    cursor: Math.min(before.length + inserted.length + after.length, cursor),
+  };
+}
+
+/** Insert an inline attachment token cleanly at the current composer caret. */
+export function insertInlineTokenAtCursor(draft: Draft, token: string): Draft {
+  const safeCursor = Math.max(0, Math.min(draft.cursor, draft.text.length));
+  const before = draft.text.slice(0, safeCursor);
+  const after = draft.text.slice(safeCursor);
+  const prefix = before && !/[\s(\n]$/.test(before) ? ' ' : '';
+  const suffix = after.startsWith(' ') || after.startsWith('\n') ? '' : ' ';
+  const inserted = `${prefix}${token}${suffix}`;
+  return {
+    text: `${before}${inserted}${after}`,
+    cursor: safeCursor + inserted.length,
+  };
+}
+
+/** Remove a previously inserted inline attachment token when its chip is dismissed. */
+export function removeInlineToken(draft: Draft, token: string): Draft {
+  if (!token) return draft;
+  const idx = draft.text.indexOf(token);
+  if (idx < 0) return draft;
+  let start = idx;
+  let end = idx + token.length;
+  if (end < draft.text.length && draft.text[end] === ' ') end++;
+  else if (start > 0 && draft.text[start - 1] === ' ') start--;
+  const nextText = `${draft.text.slice(0, start)}${draft.text.slice(end)}`;
+  const removedLen = end - start;
+  const nextCursor = draft.cursor <= start
+    ? draft.cursor
+    : draft.cursor >= end
+      ? draft.cursor - removedLen
+      : start;
+  return {
+    text: nextText,
+    cursor: Math.max(0, Math.min(nextCursor, nextText.length)),
+  };
+}
+
+function findInlineTokenRanges(text: string, needle: string): Array<{ from: number; to: number }> {
+  if (!text || !needle) return [];
+  const ranges: Array<{ from: number; to: number }> = [];
+  let pos = 0;
+  while (pos < text.length) {
+    const idx = text.indexOf(needle, pos);
+    if (idx < 0) break;
+    const before = idx > 0 ? text[idx - 1]! : '';
+    const after = idx + needle.length < text.length ? text[idx + needle.length]! : '';
+    const boundaryBefore = !before || /[\s(\n]/.test(before);
+    const boundaryAfter = !after || /[\s),.:;!?\n]/.test(after);
+    if (boundaryBefore && boundaryAfter) {
+      ranges.push({ from: idx, to: idx + needle.length });
+    }
+    pos = idx + needle.length;
+  }
+  return ranges;
+}
+
+/** Compute editor highlight ranges (`Decor[]`) for inline `@file`, `@dir/`, and `[Image: ...]` tokens. */
+export function extractInlineReferenceDecor(
+  text: string,
+  attachedFiles: readonly string[],
+  attachedDirs: readonly string[],
+  attachedImages: readonly { path: string }[],
+): Array<{ from: number; to: number; s: 'accent' | 'info' }> {
+  if (!text) return [];
+  const ranges: Array<{ from: number; to: number; s: 'accent' | 'info' }> = [];
+  const collect = (needle: string, s: 'accent' | 'info'): void => {
+    for (const range of findInlineTokenRanges(text, needle)) {
+      ranges.push({ ...range, s });
+    }
+  };
+  for (const file of attachedFiles) collect(inlineAttachmentToken(file, 'file'), 'accent');
+  for (const dir of attachedDirs) collect(inlineAttachmentToken(dir, 'dir'), 'accent');
+  for (const img of attachedImages) collect(inlineAttachmentToken(img.path, 'image'), 'info');
+  ranges.sort((a, b) => a.from - b.from || a.to - b.to);
+  return ranges;
+}
+
 function ensureTrailingSlash(pathValue: string): string {
   return pathValue.endsWith('/') ? pathValue : `${pathValue}/`;
 }
@@ -332,7 +428,7 @@ export function filterWorkspaceFiles(files: readonly string[], query: string, li
   ).map(entry => entry.path);
 }
 
-/** Format attached workspace file and directory tags cleanly ahead of the user prompt text. */
+/** Format attached workspace file and directory tags cleanly ahead of the user prompt when not already inline. */
 export function formatPromptWithAttachments(
   text: string,
   attachments: readonly string[],
@@ -342,7 +438,8 @@ export function formatPromptWithAttachments(
   const tags = [
     ...attachments.map(file => `@${file}`),
     ...directories.map(dir => `@${ensureTrailingSlash(dir)}`),
-  ];
+  ].filter(tag => findInlineTokenRanges(text, tag).length === 0);
+  if (!tags.length) return text.trim() || text;
   const header = tags.join(' ');
   const body = text.trim();
   return body ? `${header}\n\n${body}` : header;

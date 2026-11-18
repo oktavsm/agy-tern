@@ -5,10 +5,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   atMentionQuery,
+  extractInlineReferenceDecor,
   filterWorkspaceEntries,
   filterWorkspaceFiles,
   formatPromptWithAttachments,
   imageMimeType,
+  inlineAttachmentToken,
+  insertInlineTokenAtCursor,
   listDirectoryEntriesPreview,
   listWorkspaceEntries,
   listWorkspaceFiles,
@@ -18,6 +21,8 @@ import {
   readGitFileDiff,
   readImageAttachment,
   readWorkspaceTextPreview,
+  removeInlineToken,
+  replaceAtMentionWithInlineToken,
   resolvePastedImagePath,
   searchWorkspacePrefix,
   stripAtMention,
@@ -237,5 +242,39 @@ describe('workspace @file mention helpers', () => {
       platform: 'darwin',
       hasCommand: () => false,
     })).rejects.toThrow('install pngpaste');
+  });
+
+  test('inserts, highlights, formats, and removes inline attachment tokens without duplicating context', () => {
+    const mention = atMentionQuery('check @src/u here', 12)!;
+    const replaced = replaceAtMentionWithInlineToken(
+      { text: 'check @src/u here', cursor: 12 },
+      mention,
+      inlineAttachmentToken('src/ui.tsx', 'file'),
+    );
+    expect(replaced).toEqual({ text: 'check @src/ui.tsx here', cursor: 18 });
+
+    const withImg = insertInlineTokenAtCursor(replaced, inlineAttachmentToken('clip-1.png', 'image'));
+    expect(withImg.text).toBe('check @src/ui.tsx [Image: clip-1.png] here');
+
+    const decor = extractInlineReferenceDecor(
+      withImg.text,
+      ['src/ui.tsx'],
+      [],
+      [{ path: 'clip-1.png' }],
+    );
+    expect(decor).toEqual([
+      { from: 6, to: 17, s: 'accent' },
+      { from: 18, to: 37, s: 'info' },
+    ]);
+
+    expect(formatPromptWithAttachments('check @src/ui.tsx now', ['src/ui.tsx'], ['src/'])).toBe(
+      '@src/\n\ncheck @src/ui.tsx now',
+    );
+    expect(formatPromptWithAttachments('check @src/ui.tsx in @src/', ['src/ui.tsx'], ['src/'])).toBe(
+      'check @src/ui.tsx in @src/',
+    );
+
+    const removed = removeInlineToken(withImg, inlineAttachmentToken('src/ui.tsx', 'file'));
+    expect(removed.text).toBe('check [Image: clip-1.png] here');
   });
 });

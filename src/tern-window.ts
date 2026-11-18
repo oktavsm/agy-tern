@@ -1,6 +1,9 @@
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { isAbsolute, resolve } from 'node:path';
+import { promisify } from 'node:util';
+
+const execFileAsync = promisify(execFile);
 
 export interface TernOpenResult {
   ok: boolean;
@@ -126,4 +129,43 @@ export function sendTerminalAttention(
   if (!seq) return false;
   stream.write(seq);
   return true;
+}
+
+export type DesktopExecFn = (cmd: string, args: readonly string[]) => Promise<void>;
+
+/** Best-effort OS desktop notification when the terminal pane is unfocused; never throws. */
+export async function sendDesktopNotification(
+  title: string,
+  body?: string,
+  options: {
+    platform?: NodeJS.Platform;
+    hasCommand?: (cmd: string) => boolean;
+    exec?: DesktopExecFn;
+  } = {},
+): Promise<boolean> {
+  const cleanTitle = sanitizeOscText(title) || 'agy-tern';
+  const cleanBody = sanitizeOscText(body ?? '') || 'Attention requested';
+  const platform = options.platform ?? process.platform;
+  const hasCmd = options.hasCommand ?? ((cmd: string) => !!Bun.which(cmd));
+  const exec = options.exec ?? (async (cmd: string, args: readonly string[]) => {
+    await execFileAsync(cmd, [...args], { timeout: 2_000, windowsHide: true });
+  });
+
+  try {
+    if (platform === 'darwin') {
+      if (!hasCmd('osascript')) return false;
+      await exec('osascript', [
+        '-e',
+        'on run argv\ndisplay notification (item 1 of argv) with title (item 2 of argv)\nend run',
+        cleanBody,
+        cleanTitle,
+      ]);
+      return true;
+    }
+    if (!hasCmd('notify-send')) return false;
+    await exec('notify-send', ['-a', 'agy-tern', cleanTitle, cleanBody]);
+    return true;
+  } catch {
+    return false;
+  }
 }

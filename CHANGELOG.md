@@ -2,6 +2,20 @@
 
 All notable changes to `agy-tern` are documented in this file.
 
+## [0.2.4] - 2026-11-18
+
+### Added
+- Quick command palette (`Ctrl+K`) opening the searchable `/commands` overlay and a dedicated `/keys` (`/shortcuts`, `/hotkeys`) keyboard shortcuts reference modal.
+- Interactive `/update` (`/upgrade`) command that checks GitHub releases against `CURRENT_VERSION`, inspects git/install location, and presents a confirmation modal for self-update or up-to-date status.
+- Multi-tab `/changes` picker (`Session edits`, `Modified`, `Untracked`) with quick `Copy path` / `Copy diff` clipboard actions and `@path` insertion.
+- Live streaming output rate (`<rate unit="ch/s">`) in the active-turn HUD and circular `<meter style="ring">` gauges for context usage and tightest quota in `/usage` Overview.
+- Desktop attention notification fallback (`notify-send` on Linux, `osascript` on macOS) when the Tern surface is hidden (`!visible`) on approvals, follow-up modals, or long turns (`>= 8000ms`), controlled by `notifyOnTurnComplete`.
+- Keyboard navigation parity inside follow-up modals: `Up`/`Down` moves `optionCursors`, `Space` toggles `multi-select` checkboxes, and `Left`/`Right` toggles `boolean` fields.
+
+### Fixed
+- Fixed multiline `@file` / `@dir` and `/` command popup `Up`/`Down` arrow navigation on line 2+ of `<editor key="draft">` by switching the composer into `mode="insert"` while a popup list is visible (paired with `.sf-ed-mode[data-mode='insert'] { display: none; }` and `Ctrl+P`/`Ctrl+N` aliases).
+- Inserted `@file`, `@dir/`, and `[Image: name]` tokens inline at the mention/caret inside the draft editor with Tern `Decor[]` highlighting (`accent` / `info`), removing inline tokens on chip dismiss and using boundary-checked token matching in `formatPromptWithAttachments` so context is neither duplicated nor missed.
+
 ## [0.2.3] - 2026-11-18
 
 ### Fixed

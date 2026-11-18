@@ -14,7 +14,13 @@ afterEach(async () => {
 
 describe('agy-tern native Tern E2E smoke', () => {
   test('renders composer bar, starburst spinner, settle ops, server permission filtering, and /settings controls', async () => {
-    const iso: IsolatedEnv = await createIsolatedEnv({ prefix: 'agy-e2e-smoke-' });
+    const iso: IsolatedEnv = await createIsolatedEnv({
+      prefix: 'agy-e2e-smoke-',
+      seedFiles: {
+        'src/app.ts': 'export const ok = true;\n',
+        'README.md': '# Demo\n',
+      },
+    });
     cleanups.push(() => iso.cleanup());
 
     const harness = await TspHarness.launch({
@@ -247,6 +253,56 @@ describe('agy-tern native Tern E2E smoke', () => {
       await new Promise(resolveDelay => setTimeout(resolveDelay, 25));
     }
     expect(harness.findById('layer.panel')).toBeUndefined();
+
+    // Verify Ctrl+K opens command palette and /keys opens keyboard shortcuts overlay.
+    harness.sendKey('ctrl+k');
+    await harness.waitForText('Commands & skills', 'layer', 5_000);
+    harness.sendKey('esc');
+    const kDeadline = Date.now() + 4_000;
+    while (harness.findById('layer.picker') && Date.now() < kDeadline) {
+      await new Promise(resolveDelay => setTimeout(resolveDelay, 25));
+    }
+    expect(harness.findById('layer.picker')).toBeUndefined();
+
+    harness.sendText('/keys');
+    harness.sendKey('enter');
+    await harness.waitForText('Keyboard shortcuts', 'layer', 5_000);
+    harness.assertWireInvariants();
+    harness.sendKey('esc');
+    const keysDeadline = Date.now() + 4_000;
+    while (harness.findById('layer.panel') && Date.now() < keysDeadline) {
+      await new Promise(resolveDelay => setTimeout(resolveDelay, 25));
+    }
+    expect(harness.findById('layer.panel')).toBeUndefined();
+
+    // Verify multiline @file popup keeps mode="insert", allows Up/Down navigation without cursor escaping, and inserts inline @path + decor.
+    harness.sendText('line one');
+    harness.sendKey('shift+enter');
+    harness.sendText('check @');
+    const filePopup = await harness.waitForNode(node => node.id === 'dock.shell.files', 5_000);
+    expect(filePopup).toBeDefined();
+    expect(harness.findById('dock.shell.composer.line.draft')?.p['mode']).toBe('insert');
+    const initialSelected = String(filePopup.p['selected'] ?? '');
+    harness.sendKey('down');
+    await harness.waitForNode(
+      node => node.id === 'dock.shell.files' && node.p['selected'] !== initialSelected,
+      4_000,
+    );
+    harness.sendKey('up');
+    await harness.waitForNode(
+      node => node.id === 'dock.shell.files' && node.p['selected'] === initialSelected,
+      4_000,
+    );
+    harness.sendKey('enter');
+    await harness.waitForNode(
+      node => {
+        if (node.id !== 'dock.shell.composer.line.draft') return false;
+        const text = String(node.p['text'] ?? '');
+        return text.includes('line one') && /@\S+/.test(text) && Array.isArray(node.p['decor']) && node.p['decor'].length > 0;
+      },
+      4_000,
+    );
+    harness.assertWireInvariants();
 
     // Quit cleanly with Ctrl+Q.
     harness.sendKey('ctrl+q');

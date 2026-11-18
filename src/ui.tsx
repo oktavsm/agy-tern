@@ -49,7 +49,7 @@ import {
 } from './history';
 import { SessionNames } from './session-names';
 import { PromptTemplatesStore, type PromptTemplate } from './templates';
-import { openInTernSplit, runCommandInTernSplit, sendTerminalAttention } from './tern-window';
+import { openInTernSplit, runCommandInTernSplit, sendDesktopNotification, sendTerminalAttention } from './tern-window';
 import {
   DEFAULT_MODEL_ID,
   DEFAULT_PREFS,
@@ -62,9 +62,12 @@ import {
 import {
   atMentionQuery,
   detectGitStatus,
+  extractInlineReferenceDecor,
   filterWorkspaceEntries,
   formatPromptWithAttachments,
   imageMimeType,
+  inlineAttachmentToken,
+  insertInlineTokenAtCursor,
   listDirectoryEntriesPreview,
   listWorkspaceEntries,
   loadDirectorySummaryResources,
@@ -73,9 +76,10 @@ import {
   readImageAttachment,
   readGitFileDiff,
   readWorkspaceTextPreview,
+  removeInlineToken,
+  replaceAtMentionWithInlineToken,
   resolvePastedImagePath,
   searchWorkspacePrefix,
-  stripAtMention,
   writeTranscriptExport,
   type GitStatusEntry,
   type LoadedImageAttachment,
@@ -196,6 +200,9 @@ const COMPOSER_LAYOUT_CSS = [
   '}',
   ".sf-col[data-role='agy.dock.center'] .sf-text[data-role='agy.dock.keys'] {",
   '  text-align: center;',
+  '}',
+  ".sf-col[data-role='agy.dock.center'] .sf-ed-mode[data-mode='insert'] {",
+  '  display: none;',
   '}',
   '.sf-scroll.scroll {',
   '  flex: 1 1 0 !important;',
@@ -449,6 +456,15 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
   let cachedDiffsConversation: Conversation | undefined;
   let cachedDiffsRev = -1;
   let cachedSessionDiffs: SessionDiffItem[] = [];
+  let turnStreamChars = 0;
+  let turnFirstChunkAt: number | undefined;
+
+  function notifyAttention(title: string, body: string): void {
+    sendTerminalAttention(title, body);
+    if (renderController && !renderController.visible) {
+      void sendDesktopNotification(title, body);
+    }
+  }
 
   function getSessionDiffs(): SessionDiffItem[] {
     const activeConv = stateManager.getConversation();
@@ -574,9 +590,10 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     });
   }
 
-  function checkUpdatesManually(): void {
+  function checkUpdatesManually(promptInstall = false): void {
     if (quitting || updateStatus?.checking) return;
     updateStatus = { checking: true };
+    if (promptInstall) closePanel();
     render();
     void import('./updater')
       .then(async m => {
@@ -584,9 +601,46 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         const updateAvailable = m.compareSemver(latestTag, m.CURRENT_VERSION) > 0;
         if (quitting) return;
         updateStatus = { checking: false, latestTag, updateAvailable };
+        if (promptInstall && updateAvailable) {
+          const loc = m.detectInstallLocation();
+          if (loc.kind === 'release') {
+            openPanel({
+              kind: 'confirm',
+              title: `Update agy-tern to ${latestTag}?`,
+              detail: `Downloads SHA-256 verified release archive into ${loc.dataDir}. Restart agy-tern after updating.`,
+              actionLabel: `Install ${latestTag}`,
+              onConfirm: () => {
+                if (extLoading || quitting) return;
+                extLoading = true;
+                panelError = '';
+                render();
+                void m.runSelfUpdate({ targetVersion: latestTag, force: true, log: () => {} })
+                  .then(() => {
+                    if (quitting) return;
+                    closePanel();
+                    showToast(`Updated to ${latestTag}`, 'Restart agy-tern to run the new version');
+                  })
+                  .catch(err => {
+                    if (!quitting) {
+                      panelError = err instanceof Error ? err.message : String(err);
+                      render();
+                    }
+                  })
+                  .finally(() => {
+                    extLoading = false;
+                    if (!quitting) render();
+                  });
+              },
+            });
+            return;
+          }
+          showToast(`Update available: ${latestTag}`, `Git checkout at ${loc.rootDir}; run agy-tern update`);
+          render();
+          return;
+        }
         showToast(
           updateAvailable ? `Update available: ${latestTag}` : `Up to date (v${m.CURRENT_VERSION})`,
-          updateAvailable ? 'Run `agy-tern update` in your terminal to upgrade' : undefined,
+          updateAvailable ? 'Run /update or `agy-tern update` to upgrade' : undefined,
         );
         render();
       })
@@ -1194,7 +1248,8 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
   function availableCommands(): Command[] {
     const commands = commandCatalog(metadata.availableCommands);
     return agent && !disconnected ? commands : commands.filter(command =>
-      command.local === 'account' || command.local === 'login' || command.local === 'help' || command.local === 'exit');
+      command.local === 'account' || command.local === 'login' || command.local === 'help' ||
+      command.local === 'keys' || command.local === 'update' || command.local === 'exit');
   }
 
   function loginMethod(): AuthMethodTerminal | undefined {
@@ -1871,6 +1926,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       const st = stateManager.getActive();
       if (!st.attachedImages.some(item => item.path === loaded.path)) {
         st.attachedImages = [...st.attachedImages, loaded];
+        st.draft = insertInlineTokenAtCursor(st.draft, inlineAttachmentToken(loaded.path, 'image'));
       }
       showToast('Attached clipboard image', `${loaded.mimeType} (${Math.max(1, Math.round(loaded.size / 1024))} KB)`);
       render();
@@ -1902,6 +1958,8 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
           openPanel({ kind: 'commands' });
           if (args) { panelDraft = { text: args, cursor: args.length }; render(); }
           return;
+        case 'keys': openPanel({ kind: 'keys' }); return;
+        case 'update': checkUpdatesManually(true); return;
         case 'account':
         case 'login': openPanel({ kind: 'account' }); return;
         case 'switch-account': openPanel({ kind: 'account-switch' }); return;
@@ -1990,11 +2048,16 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     busy = true;
     stateManager.getActive().focusedTurnIndex = undefined;
     turnStartedAt = Date.now();
+    turnStreamChars = 0;
+    turnFirstChunkAt = undefined;
     cancelling = false;
     autocompleteDismissed = true;
     phase = 'Working';
-    const transcriptText = images.length
-      ? `${images.map(image => `[Image: ${image.path}]`).join(' ')}${text ? `\n\n${text}` : ''}`
+    const missingImageTokens = images
+      .map(image => inlineAttachmentToken(image.path, 'image'))
+      .filter(token => !text.includes(token));
+    const transcriptText = missingImageTokens.length
+      ? `${missingImageTokens.join(' ')}${text ? `\n\n${text}` : ''}`
       : text;
     activeConv.startPrompt(transcriptText, clockTime());
     render();
@@ -2030,10 +2093,12 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       }
       busy = false;
       turnStartedAt = undefined;
+      turnStreamChars = 0;
+      turnFirstChunkAt = undefined;
       cancelling = false;
       clearPermissions();
       if (!quitting && userPrefs.notifyOnTurnComplete && elapsed >= 8_000) {
-        sendTerminalAttention('agy-tern', completedNormally ? 'Turn complete' : phase);
+        notifyAttention('agy-tern', completedNormally ? 'Turn complete' : phase);
       }
       const touchedWorkspace = activeConv.entries.slice(entryCountBeforePrompt).some(entry =>
         entry.type === 'tool' && (entry.call.kind === 'edit' || entry.call.kind === 'execute' ||
@@ -2219,12 +2284,15 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       : target;
     const st = stateManager.getActive();
     const mention = activeAtMention();
-    if (mention) st.draft = stripAtMention(st.draft, mention);
+    const applyInline = (draft: Draft, token: string): Draft =>
+      mention ? replaceAtMentionWithInlineToken(draft, mention, token) : insertInlineTokenAtCursor(draft, token);
     fileSelection = 0;
     autocompleteDismissed = true;
     if (entry.kind === 'dir') {
       const dirPath = entry.path.endsWith('/') ? entry.path : `${entry.path}/`;
       if (!st.attachedDirs.includes(dirPath)) st.attachedDirs = [...st.attachedDirs, dirPath];
+      const inlineTok = inlineAttachmentToken(dirPath, 'dir');
+      if (mention || !st.draft.text.includes(inlineTok)) st.draft = applyInline(st.draft, inlineTok);
       render();
       surface?.focus(DOCK_DRAFT_ID);
       return;
@@ -2237,6 +2305,8 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         surface?.focus(DOCK_DRAFT_ID);
         return;
       }
+      const inlineTok = inlineAttachmentToken(filePath, 'image');
+      if (mention || !st.draft.text.includes(inlineTok)) st.draft = applyInline(st.draft, inlineTok);
       render();
       void readImageAttachment(options.cwd, filePath).then(loaded => {
         const currentSt = stateManager.getActive();
@@ -2246,11 +2316,17 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         render();
         surface?.focus(DOCK_DRAFT_ID);
       }).catch(error => {
-        if (!quitting) showToast('Could not attach image', error instanceof Error ? error.message : String(error));
+        if (!quitting) {
+          stateManager.getActive().draft = removeInlineToken(stateManager.getActive().draft, inlineTok);
+          showToast('Could not attach image', error instanceof Error ? error.message : String(error));
+          render();
+        }
       });
       return;
     }
     if (!st.attachedFiles.includes(filePath)) st.attachedFiles = [...st.attachedFiles, filePath];
+    const inlineTok = inlineAttachmentToken(filePath, 'file');
+    if (mention || !st.draft.text.includes(inlineTok)) st.draft = applyInline(st.draft, inlineTok);
     render();
     surface?.focus(DOCK_DRAFT_ID);
   }
@@ -2258,6 +2334,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
   function removeAttachment(filePath: string): void {
     const st = stateManager.getActive();
     st.attachedFiles = st.attachedFiles.filter(item => item !== filePath);
+    st.draft = removeInlineToken(st.draft, inlineAttachmentToken(filePath, 'file'));
     render();
     surface?.focus(DOCK_DRAFT_ID);
   }
@@ -2265,6 +2342,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
   function removeDirAttachment(dirPath: string): void {
     const st = stateManager.getActive();
     st.attachedDirs = st.attachedDirs.filter(item => item !== dirPath);
+    st.draft = removeInlineToken(st.draft, inlineAttachmentToken(dirPath, 'dir'));
     render();
     surface?.focus(DOCK_DRAFT_ID);
   }
@@ -2272,6 +2350,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
   function removeImageAttachment(filePath: string): void {
     const st = stateManager.getActive();
     st.attachedImages = st.attachedImages.filter(item => item.path !== filePath);
+    st.draft = removeInlineToken(st.draft, inlineAttachmentToken(filePath, 'image'));
     render();
     surface?.focus(DOCK_DRAFT_ID);
   }
@@ -2666,6 +2745,10 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       activeToolTop ? `hud:${activeToolTop.id}` : startupBusy ? 'hud:startup' : 'hud:turn',
       activeToolTop?.startedAt ?? (startupBusy ? connectStartedAt : turnStartedAt),
     );
+    const streamRate = busy && turnStreamChars > 0 && turnFirstChunkAt
+      ? Math.max(1, Math.round(turnStreamChars / Math.max(0.25, (renderNow - turnFirstChunkAt) / 1000)))
+      : undefined;
+    const draftDecor = extractInlineReferenceDecor(st.draft.text, st.attachedFiles, st.attachedDirs, st.attachedImages);
     const layout = currentResponsiveLayout({
       hasPermission: !!permission,
       hasSuggestionsOrAt: suggestions.length > 0 || atMatches.length > 0,
@@ -2832,6 +2915,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
               {(busy || activeTools.length > 0) ? <row key="live-turn" gap="sm" align="center">
                 <spinner style="starburst" />
                 <shimmer mode="kitt" text={liveTaskLabel} />
+                {streamRate !== undefined && <rate key="stream-rate" value={streamRate} unit="ch/s" />}
                 <elapsed age={hudAgeMs} />
                 <button size="sm" variant="quiet" onClick={() => openPanel({ kind: 'tasks' })}>Tasks</button>
                 <button size="sm" variant="danger" disabled={cancelling && 'Cancellation requested'} onClick={stop}>
@@ -3002,7 +3086,10 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
               })}
             </row>}
             <row key="line" role="omp.composer.line" align="start" gap="sm">
-              <editor key="draft" role={busy ? 'agy.draft.busy' : undefined} grow={1} aria="Message to Antigravity" text={st.draft.text} cursor={st.draft.cursor} anchor={st.draft.anchor}
+              <editor key="draft" role={busy ? 'agy.draft.busy' : undefined}
+                mode={(suggestions.length > 0 || atMatches.length > 0) ? 'insert' : undefined}
+                decor={draftDecor.length ? draftDecor : undefined}
+                grow={1} aria="Message to Antigravity" text={st.draft.text} cursor={st.draft.cursor} anchor={st.draft.anchor}
                 placeholder={disconnected ? 'Use /account to sign in, or draft a message' : busy ? 'Draft your next message' : 'Message Antigravity, / for commands, @ for files & dirs'}
                 readonly={authBusy} maxLines={layout.composerMaxLines} variant="well"
                 onFocus={() => surface?.focus(DOCK_DRAFT_ID)}
@@ -3344,6 +3431,11 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
             return;
           }
           const conv = stateManager.getConversation();
+          if (busy && (update.sessionUpdate === 'agent_message_chunk' || update.sessionUpdate === 'agent_thought_chunk') &&
+            update.content.type === 'text' && update.content.text) {
+            turnFirstChunkAt ??= Date.now();
+            turnStreamChars += update.content.text.length;
+          }
           if (!busy || update.sessionUpdate !== 'user_message_chunk') {
             conv.update(update, Date.now(), busy ? clockTime() : undefined);
           }
@@ -3403,7 +3495,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
           } else {
             permissions.push(prompt);
             if (userPrefs.notifyOnTurnComplete) {
-              sendTerminalAttention('agy-tern', `Approval required: ${prompt.request.toolCall.title ?? 'tool call'}`);
+              notifyAttention('agy-tern', `Approval required: ${prompt.request.toolCall.title ?? 'tool call'}`);
             }
           }
           render();
@@ -3418,7 +3510,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
             activateNextElicitation();
           }
           if (userPrefs.notifyOnTurnComplete) {
-            sendTerminalAttention('agy-tern', `Follow-up question: ${prompt.request.message}`);
+            notifyAttention('agy-tern', `Follow-up question: ${prompt.request.message}`);
           }
           render();
         },
@@ -3565,6 +3657,11 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       renderController.noteVisibleActivity(render);
       const key = input.key;
       if (((key.ctrl || key.meta) && key.name === 'q') || (key.ctrl && key.name === 'c')) { quit(); continue; }
+      if (key.ctrl && !key.alt && !key.meta && key.name === 'k' && !permissions.length && !authBusy) {
+        if (panel?.kind === 'commands') closePanel();
+        else openPanel({ kind: 'commands' });
+        continue;
+      }
       if (key.name === 'escape') {
         if (panel) stepBackPanel();
         else if (autocomplete().length) { autocompleteDismissed = true; render(); }
@@ -3637,41 +3734,73 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
             submitFollowUp();
             continue;
           }
-          if (followUpState && followUpState.fields.length > 0 && (key.name === 'tab' || key.name === 'up' || key.name === 'down')) {
+          if (followUpState && followUpState.fields.length > 0) {
             const fields = followUpState.fields;
             const activeField = fields[followUpState.activeFieldIdx];
-            if ((key.name === 'up' || key.name === 'down') && activeField?.kind === 'single-select' && activeField.options.length > 0) {
-              const curVal = followUpState.answers[activeField.name];
-              const curIdx = activeField.options.findIndex(o => o.value === curVal);
-              const nextIdx = key.name === 'down'
-                ? (curIdx + 1) % activeField.options.length
-                : (curIdx <= 0 ? activeField.options.length - 1 : curIdx - 1);
-              followUpState.answers[activeField.name] = activeField.options[nextIdx]!.value;
-              followUpState.error = undefined;
-              render();
+            if ((key.name === 'space' || (!key.ctrl && !key.meta && !key.alt && key.text === ' ')) &&
+              activeField?.kind === 'multi-select' && activeField.options.length > 0) {
+              const optIdx = followUpState.optionCursors?.[activeField.name] ?? 0;
+              const chosenOpt = activeField.options[optIdx];
+              if (chosenOpt) {
+                const prev = Array.isArray(followUpState.answers[activeField.name])
+                  ? [...(followUpState.answers[activeField.name] as string[])]
+                  : [];
+                const hit = prev.indexOf(chosenOpt.value);
+                if (hit >= 0) prev.splice(hit, 1);
+                else prev.push(chosenOpt.value);
+                followUpState.answers[activeField.name] = prev;
+                followUpState.error = undefined;
+                render();
+              }
               continue;
             }
-            if ((key.name === 'up' || key.name === 'down') && activeField?.kind === 'boolean') {
-              const cur = followUpState.answers[activeField.name];
-              followUpState.answers[activeField.name] = cur === undefined ? true : !cur;
-              followUpState.error = undefined;
-              render();
-              continue;
-            }
-            if (fields.length > 1) {
-              const step = key.name === 'up' || (key.name === 'tab' && key.shift) ? -1 : 1;
-              followUpState.activeFieldIdx = (followUpState.activeFieldIdx + fields.length + step) % fields.length;
-              render();
-              surface.focus(followUpFocusTarget(followUpState));
-              continue;
+            if (key.name === 'tab' || key.name === 'up' || key.name === 'down' || key.name === 'left' || key.name === 'right') {
+              if ((key.name === 'up' || key.name === 'down') && activeField?.kind === 'single-select' && activeField.options.length > 0) {
+                const curVal = followUpState.answers[activeField.name];
+                const curIdx = activeField.options.findIndex(o => o.value === curVal);
+                const nextIdx = key.name === 'down'
+                  ? (curIdx + 1) % activeField.options.length
+                  : (curIdx <= 0 ? activeField.options.length - 1 : curIdx - 1);
+                followUpState.answers[activeField.name] = activeField.options[nextIdx]!.value;
+                followUpState.customDrafts[activeField.name] = '';
+                followUpState.error = undefined;
+                render();
+                continue;
+              }
+              if ((key.name === 'up' || key.name === 'down') && activeField?.kind === 'multi-select' && activeField.options.length > 0) {
+                const curIdx = followUpState.optionCursors?.[activeField.name] ?? 0;
+                const nextIdx = key.name === 'down'
+                  ? (curIdx + 1) % activeField.options.length
+                  : (curIdx <= 0 ? activeField.options.length - 1 : curIdx - 1);
+                followUpState.optionCursors = { ...(followUpState.optionCursors ?? {}), [activeField.name]: nextIdx };
+                render();
+                continue;
+              }
+              if ((key.name === 'up' || key.name === 'down' || key.name === 'left' || key.name === 'right') && activeField?.kind === 'boolean') {
+                const cur = followUpState.answers[activeField.name];
+                followUpState.answers[activeField.name] = cur === undefined ? true : !cur;
+                followUpState.error = undefined;
+                render();
+                continue;
+              }
+              if ((key.name === 'tab' || key.name === 'up' || key.name === 'down') && fields.length > 1) {
+                const step = key.name === 'up' || (key.name === 'tab' && key.shift) ? -1 : 1;
+                followUpState.activeFieldIdx = (followUpState.activeFieldIdx + fields.length + step) % fields.length;
+                render();
+                surface.focus(followUpFocusTarget(followUpState));
+                continue;
+              }
             }
           }
           continue;
         }
-        if ((current.kind === 'report' || current.kind === 'account' || current.kind === 'account-switch' || current.kind === 'permissions') &&
-          (key.name === 'page_up' || key.name === 'page_down' || key.name === 'home' || key.name === 'end')) {
+        if ((current.kind === 'report' || current.kind === 'account' || current.kind === 'account-switch' || current.kind === 'permissions' || current.kind === 'keys') &&
+          (key.name === 'page_up' || key.name === 'page_down' || key.name === 'home' || key.name === 'end' ||
+            (current.kind === 'keys' && (key.name === 'up' || key.name === 'down')))) {
           surface.scroll('layer.panel.overlay-scroll',
-            key.name === 'page_up' ? 'page-up'
+            key.name === 'up' ? 'line-up'
+              : key.name === 'down' ? 'line-down'
+              : key.name === 'page_up' ? 'page-up'
               : key.name === 'page_down' ? 'page-down'
               : key.name === 'home' ? 'start' : 'end');
           continue;
@@ -3834,10 +3963,12 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
           } else if (current.kind === 'changes') {
             const needle = panelDraft.text.trim().toLowerCase();
             const sessionDiffs = getSessionDiffs();
-            const usingGit = pickerTab === 'git';
+            const usingGit = pickerTab === 'git' || pickerTab === 'untracked';
             const filteredEdits = sessionDiffs.filter(item => item.path.toLowerCase().includes(needle));
-            const filteredGit = gitChanges.filter(item => `${item.status} ${item.path}`.toLowerCase().includes(needle));
-            tabIds = ['edits', 'git'];
+            const filteredGit = gitChanges.filter(item =>
+              (pickerTab === 'untracked' ? item.status === '?' : item.status !== '?') &&
+              `${item.status} ${item.path}`.toLowerCase().includes(needle));
+            tabIds = ['edits', 'git', 'untracked'];
             visibleIds = usingGit ? filteredGit.map(item => `git:${item.path}`) : filteredEdits.map(item => item.id);
             activate = chosenId => {
               const chosenPath = usingGit
@@ -3927,9 +4058,11 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         render();
         continue;
       }
+      const isNavPrev = key.name === 'up' || (key.ctrl && !key.alt && !key.meta && key.name === 'p');
+      const isNavNext = key.name === 'down' || (key.ctrl && !key.alt && !key.meta && key.name === 'n');
       const suggestions = autocomplete();
-      if (suggestions.length && (key.name === 'up' || key.name === 'down')) {
-        commandSelection = (commandSelection + (key.name === 'up' ? suggestions.length - 1 : 1)) % suggestions.length;
+      if (suggestions.length && (isNavPrev || isNavNext)) {
+        commandSelection = (commandSelection + (isNavPrev ? suggestions.length - 1 : 1)) % suggestions.length;
         render();
         continue;
       }
@@ -3938,8 +4071,8 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         continue;
       }
       const fileMatches = atFileMatches();
-      if (fileMatches.length && (key.name === 'up' || key.name === 'down')) {
-        fileSelection = (fileSelection + (key.name === 'up' ? fileMatches.length - 1 : 1)) % fileMatches.length;
+      if (fileMatches.length && (isNavPrev || isNavNext)) {
+        fileSelection = (fileSelection + (isNavPrev ? fileMatches.length - 1 : 1)) % fileMatches.length;
         render();
         continue;
       }

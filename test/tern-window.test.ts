@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { buildAttentionSequence, openInTernSplit, resolveTernTarget, runCommandInTernSplit, sendTerminalAttention } from '../src/tern-window';
+import { buildAttentionSequence, openInTernSplit, resolveTernTarget, runCommandInTernSplit, sendDesktopNotification, sendTerminalAttention } from '../src/tern-window';
 
 const dirs: string[] = [];
 
@@ -71,5 +71,28 @@ exit 0
     const tty = { isTTY: true, write: (chunk: string) => { output += chunk; return true; } };
     expect(sendTerminalAttention('agy-tern', 'Ready', tty)).toBe(true);
     expect(output).toBe('\x1b]9;agy-tern: Ready\x07\x07');
+  });
+
+  test('dispatches OS desktop notification cleanly on Linux/macOS and degrades quietly when unavailable', async () => {
+    const calls: Array<{ cmd: string; args: readonly string[] }> = [];
+    expect(await sendDesktopNotification('agy-tern', 'Turn; done\nnow', {
+      platform: 'linux',
+      hasCommand: cmd => cmd === 'notify-send',
+      exec: async (cmd, args) => { calls.push({ cmd, args }); },
+    })).toBe(true);
+    expect(calls[0]).toEqual({ cmd: 'notify-send', args: ['-a', 'agy-tern', 'agy-tern', 'Turn done now'] });
+
+    expect(await sendDesktopNotification('agy-tern', 'Approval required', {
+      platform: 'darwin',
+      hasCommand: cmd => cmd === 'osascript',
+      exec: async (cmd, args) => { calls.push({ cmd, args }); },
+    })).toBe(true);
+    expect(calls[1]?.cmd).toBe('osascript');
+    expect(calls[1]?.args.slice(-2)).toEqual(['Approval required', 'agy-tern']);
+
+    expect(await sendDesktopNotification('agy-tern', 'Done', {
+      platform: 'linux',
+      hasCommand: () => false,
+    })).toBe(false);
   });
 });

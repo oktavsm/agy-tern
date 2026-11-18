@@ -1,6 +1,6 @@
 import type { AvailableCommand, SessionConfigOption, SessionConfigSelectOption } from '@agentclientprotocol/sdk';
 
-export type LocalCommand = 'help' | 'model' | 'settings' | 'usage' | 'credits' | 'changelog' | 'permissions' | 'sessions' | 'new' | 'rename' | 'account' | 'switch-account' | 'login' | 'changes' | 'find' | 'tasks' | 'paste-image' | 'export' | 'expand' | 'collapse' | 'mcp' | 'plugins' | 'agents' | 'templates' | 'exit';
+export type LocalCommand = 'help' | 'keys' | 'update' | 'model' | 'settings' | 'usage' | 'credits' | 'changelog' | 'permissions' | 'sessions' | 'new' | 'rename' | 'account' | 'switch-account' | 'login' | 'changes' | 'find' | 'tasks' | 'paste-image' | 'export' | 'expand' | 'collapse' | 'mcp' | 'plugins' | 'agents' | 'templates' | 'exit';
 export type CommandCategory = 'frontend' | 'workflow' | 'skill';
 
 const CORE_WORKFLOWS = new Set([
@@ -37,11 +37,13 @@ const LOCAL: readonly Command[] = [
   { name: 'rename', local: 'rename', description: 'Set a local name for this conversation' },
   { name: 'credits', local: 'credits', description: 'Read the official CLI account credits report' },
   { name: 'changelog', local: 'changelog', description: 'Read the official CLI release notes' },
+  { name: 'update', local: 'update', description: 'Check for or install the latest agy-tern GitHub release' },
+  { name: 'keys', local: 'keys', description: 'Browse keyboard shortcuts and composer controls' },
   { name: 'help', local: 'help', description: 'Browse all commands available in this session' },
   { name: 'exit', local: 'exit', description: 'Close this frontend and its agy session' },
 ];
 const ALIASES: Readonly<Record<string, string>> = {
-  quota: 'usage', config: 'settings', preferences: 'settings', prefs: 'settings', quit: 'exit', commands: 'help', resume: 'sessions', conversation: 'sessions', switch: 'sessions', reauth: 'switch-account', diff: 'changes', search: 'find', skills: 'plugins', agent: 'agents', snippets: 'templates', running: 'tasks', ps: 'tasks', clip: 'paste-image',
+  quota: 'usage', config: 'settings', preferences: 'settings', prefs: 'settings', quit: 'exit', commands: 'help', palette: 'help', shortcuts: 'keys', hotkeys: 'keys', upgrade: 'update', resume: 'sessions', conversation: 'sessions', switch: 'sessions', reauth: 'switch-account', diff: 'changes', search: 'find', skills: 'plugins', agent: 'agents', snippets: 'templates', running: 'tasks', ps: 'tasks', clip: 'paste-image',
 };
 const ALIAS_PATTERN = new RegExp(`^\\/(${Object.keys(ALIASES).join('|')})(?=\\s|$)`);
 

@@ -88,6 +88,7 @@ export type Panel =
   | { kind: 'plugin-install' }
   | { kind: 'confirm'; title: string; detail: string; actionLabel: string; returnTo?: Panel; onConfirm(): void }
   | { kind: 'inspect'; title: string; subtitle?: string; item: InspectTarget }
+  | { kind: 'keys' }
   | { kind: 'followup'; source: 'elicitation' | 'prompt'; title: string; message: string; urlMode?: { elicitationId: string; url: string } };
 
 export interface Choice {
@@ -528,8 +529,12 @@ function renderSessionsPicker(ctx: PanelRenderContext): JSX.Element {
 function renderChangesPicker(ctx: PanelRenderContext): JSX.Element {
   const query = ctx.panelDraft.text.trim().toLowerCase();
   const filteredEdits = ctx.sessionDiffs.filter(item => item.path.toLowerCase().includes(query));
-  const filteredGit = ctx.gitChanges.filter(item => `${item.status} ${item.path}`.toLowerCase().includes(query));
-  const usingGit = ctx.pickerTab === 'git';
+  const allGit = ctx.gitChanges.filter(item => `${item.status} ${item.path}`.toLowerCase().includes(query));
+  const modifiedGit = allGit.filter(item => item.status !== '?');
+  const untrackedGit = allGit.filter(item => item.status === '?');
+  const tab = ctx.pickerTab === 'git' || ctx.pickerTab === 'untracked' ? ctx.pickerTab : 'edits';
+  const filteredGit = tab === 'untracked' ? untrackedGit : modifiedGit;
+  const usingGit = tab !== 'edits';
   const order = usingGit ? filteredGit.map(item => `git:${item.path}`) : filteredEdits.map(item => item.id);
   const selectedId = order.includes(ctx.pickerSelected) ? ctx.pickerSelected : (order[0] ?? '');
   const highlightedEdit = usingGit ? undefined : filteredEdits.find(item => item.id === selectedId);
@@ -543,6 +548,15 @@ function renderChangesPicker(ctx: PanelRenderContext): JSX.Element {
   }
   const cachedGitDiff = highlightedGit ? ctx.gitDiffCache.get(highlightedGit.path) : undefined;
   const highlightedPath = highlightedEdit?.path ?? highlightedGit?.path;
+  const activeDiffText = (() => {
+    const targetEdit = highlightedEdit ?? highlightedGitDiff;
+    if (targetEdit) {
+      if (targetEdit.hunks.length) return targetEdit.hunks.flatMap(h => h.lines).join('\n');
+      if (targetEdit.newFileText !== undefined) return targetEdit.newFileText;
+    }
+    if (cachedGitDiff?.hunks.length) return cachedGitDiff.hunks.flatMap(h => h.lines).join('\n');
+    return undefined;
+  })();
 
   const items: PickerItem[] = usingGit
     ? filteredGit.map(entry => ({
@@ -567,20 +581,26 @@ function renderChangesPicker(ctx: PanelRenderContext): JSX.Element {
     }));
 
   return <picker key="picker" size={ctx.rLayout.panelSize} title="Changes" icon="diff"
-    subtitle="Session edits and git status"
+    subtitle="Session edits, modified tracked files, and untracked paths"
     placeholder="Filter modified paths..."
     query={ctx.panelDraft.text} cursor={ctx.panelDraft.cursor} onEdit={ctx.onEditPanelDraft}
     tabs={[
       { id: 'edits', label: 'Session edits', count: ctx.sessionDiffs.length },
-      { id: 'git', label: 'Git status', count: ctx.gitChanges.length },
+      { id: 'git', label: 'Modified', count: ctx.gitChanges.filter(item => item.status !== '?').length },
+      { id: 'untracked', label: 'Untracked', count: ctx.gitChanges.filter(item => item.status === '?').length },
     ]}
-    tab={usingGit ? 'git' : 'edits'}
+    tab={tab}
     order={order} items={items} selected={selectedId}
     state="ready"
-    empty={usingGit ? 'Working tree is clean or git status is unavailable.' : 'No file edits recorded in this conversation yet.'}
+    empty={tab === 'untracked'
+      ? 'No untracked files matching filter.'
+      : usingGit
+        ? 'No tracked git changes matching filter.'
+        : 'No file edits recorded in this conversation yet.'}
     preview={highlightedPath ? 'below' : 'none'}
     actions={[
-      { id: 'refresh', label: 'Refresh git' },
+      { id: 'refresh', label: 'Refresh' },
+      { id: 'copy-diff', label: activeDiffText ? 'Copy diff' : 'Copy path', disabled: !highlightedPath ? (true as const) : undefined },
       { id: 'inspect', label: 'Fullscreen', disabled: !highlightedPath ? (true as const) : undefined },
       { id: 'split', label: 'Tern split',
         disabled: !highlightedPath || !(ctx.pathExists ?? cachedPathExists)(resolve(ctx.options.cwd, highlightedPath)) ? (true as const) : undefined },
@@ -598,6 +618,10 @@ function renderChangesPicker(ctx: PanelRenderContext): JSX.Element {
         if (typeof event.value === 'string') ctx.onSetPickerTab(event.value, true);
       },
       refresh: ctx.onRefreshGitChanges,
+      'copy-diff': () => {
+        if (activeDiffText) ctx.onCopy(activeDiffText);
+        else if (highlightedPath) ctx.onCopy(highlightedPath);
+      },
       split: () => {
         const line = highlightedEdit?.hunks[0]?.newStart ?? cachedGitDiff?.hunks[0]?.newStart;
         if (highlightedPath) ctx.onOpenSplit(highlightedPath, line);
@@ -1271,7 +1295,7 @@ function renderFollowUpOverlay(
     meta={p.source === 'elicitation' ? 'Agent waiting for your response' : 'Reply via next prompt'}
     end={<button keys={['esc']} variant="quiet" onClick={closeAction}>Cancel</button>}
     foot={<row gap="xs" justify="between" align="center" wrap>
-      <text><span s="muted">Tab/Up/Down navigate · Enter submit · Esc cancel</span></text>
+      <text><span s="muted">Tab switch · Up/Down choose · Space toggle · Enter submit · Esc cancel</span></text>
       <row gap="xs">
         {p.source === 'elicitation' && ctx.onDeclineFollowUp && (
           <button size="sm" variant="quiet" onClick={ctx.onDeclineFollowUp}>Decline</button>
@@ -1330,11 +1354,14 @@ function renderFollowUpOverlay(
             {field.kind === 'multi-select' && <col gap="xs">
               {field.options.map((opt, optIdx) => {
                 const checked = Array.isArray(val) && val.includes(opt.value);
-                return <button key={`mopt-${optIdx}`} size="sm" variant={checked ? 'primary' : 'default'}
+                const optCursor = st?.optionCursors?.[field.name] ?? 0;
+                const focusedOpt = isActive && optIdx === optCursor;
+                return <button key={`mopt-${optIdx}`} size="sm"
+                  variant={checked ? 'primary' : focusedOpt ? 'default' : 'quiet'}
                   icon={checked ? 'check' : undefined}
                   title={opt.description ?? opt.label}
                   onClick={() => toggleMultiOption(field.name, opt.value, idx)}>
-                  {`${checked ? '[x]' : '[ ]'} ${opt.label}${opt.description ? ` - ${opt.description}` : ''}`}
+                  {`${focusedOpt ? '> ' : ''}${checked ? '[x]' : '[ ]'} ${opt.label}${opt.description ? ` - ${opt.description}` : ''}`}
                 </button>;
               })}
             </col>}
@@ -1492,11 +1519,50 @@ function renderUsageDetails(
   </col>;
 }
 
+function renderKeysOverlay(ctx: PanelRenderContext): JSX.Element {
+  return <overlay key="panel" head="Keyboard shortcuts" icon="key" modal size={ctx.rLayout.panelSize}
+    meta="All composer, modal, and transcript controls"
+    end={<button keys={['esc']} variant="quiet" onClick={ctx.onClosePanel}>Close</button>}>
+    <scroll key="overlay-scroll" bar="always" max={{ h: ctx.rLayout.inspectBodyMaxH }}>
+      <col gap="md">
+        <section head="Composer & Attachments">
+          <kv items={[
+            { k: 'Enter', v: 'Send message or queue while busy (Shift+Enter inserts newline)' },
+            { k: '/', v: 'Open slash command autocomplete; Tab completes command' },
+            { k: '@', v: 'Attach files or dirs inline (Up/Down navigate list, Enter/Tab insert)' },
+            { k: 'Alt+V', v: 'Paste clipboard screenshot/image inline + chip preview' },
+            { k: 'Ctrl+Z / Ctrl+Y', v: 'Undo / redo draft edits' },
+            { k: 'Up / Down', v: 'Step sent prompt history on first/last row (or navigate popups)' },
+          ]} />
+        </section>
+        <section head="Navigation & Quick Panels">
+          <kv items={[
+            { k: 'Ctrl+K', v: 'Open Commands & Quick Switcher palette' },
+            { k: 'Ctrl+Up / Ctrl+Down', v: 'Jump to previous / next user turn in transcript' },
+            { k: 'PageUp / PageDown', v: 'Scroll conversation or active modal overlay' },
+            { k: 'Esc', v: 'Step back from sub-panel, dismiss popup, or cancel active turn' },
+            { k: 'Ctrl+C / Ctrl+Q', v: 'Quit agy-tern safely and close ACP session' },
+          ]} />
+        </section>
+        <section head="Approvals & Follow-up Modals">
+          <kv items={[
+            { k: 'Tab / Shift+Tab', v: 'Cycle approval choices or follow-up form fields' },
+            { k: 'Ctrl+Y / Ctrl+N', v: 'Allow once / Deny once on active permission request' },
+            { k: 'Up / Down & Space', v: 'Navigate options and toggle multi-select items' },
+            { k: 'Enter (in modal)', v: 'Submit follow-up response or apply selected choice' },
+          ]} />
+        </section>
+      </col>
+    </scroll>
+  </overlay>;
+}
+
 /** Render the active modal picker, prefs window, report overlay, or inspector dialog. */
 export function renderActivePanel(ctx: PanelRenderContext): JSX.Element {
   const currentPanel = ctx.panel;
   if (currentPanel.kind === 'settings') return renderPrefsPanel(ctx);
   if (currentPanel.kind === 'followup') return renderFollowUpOverlay(ctx, currentPanel);
+  if (currentPanel.kind === 'keys') return renderKeysOverlay(ctx);
   const config = currentPanel.kind === 'config' ? ctx.metadata.configOptions.find(option => option.id === currentPanel.id) : undefined;
   if (currentPanel.kind === 'config' && config?.type === 'select') return renderSelectConfigPicker(ctx, config);
   if (currentPanel.kind === 'commands') return renderCommandsPicker(ctx);
@@ -1546,6 +1612,17 @@ export function renderActivePanel(ctx: PanelRenderContext): JSX.Element {
             onChange={event => ctx.onSetUsageTab(String(event.value ?? event.item ?? 'overview'))} />
           {ctx.reportLoading && <spinner label="Reading official /usage report" />}
           {ctx.usageTab === 'overview' && <>
+            {(contextUsage || quotaSummary) && <row gap="lg" align="center" wrap>
+              {contextUsage && <meter style="ring" size="md"
+                value={contextUsage.percent / 100}
+                thresholds={{ warn: 0.75, bad: 0.9 }}
+                label={`${contextUsage.percent}%`}
+                total="Context" />}
+              {quotaSummary && <meter style="ring" size="md"
+                value={quotaSummary.tightest.fraction}
+                label={quotaSummary.tightest.remaining}
+                total={quotaSummary.tightest.group} />}
+            </row>}
             <stats items={[
               {
                 label: 'Tightest quota',
