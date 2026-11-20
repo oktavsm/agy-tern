@@ -411,6 +411,18 @@ describe('panel renderers & transcript view helpers', () => {
     expect(fullJson).toContain('0.12 USD');
     expect(fullJson).toContain('Quota bar');
     expect(fullJson).toContain('Gemini 3 Pro');
+
+    const overviewCtx = baseContext({ kind: 'report', report: 'usage' });
+    overviewCtx.usageTab = 'overview';
+    overviewCtx.reportText = [
+      'Quota:',
+      'Gemini Models          Weekly Limit Remaining       64%   2026-11-26 15:24 WIB',
+      'Gemini Models          Five Hour Limit Remaining    82%   2026-11-21 05:48 WIB',
+    ].join('\n');
+    const overviewJson = JSON.stringify(renderActivePanel(overviewCtx));
+    expect(overviewJson).toContain('Next reset');
+    expect(overviewJson).toContain('2026-11-21 05:48 WIB');
+    expect(overviewJson).toContain('Gemini Models');
   });
 
   test('/sessions picker surfaces loading state despite active session and supports All workspaces + chat match', () => {

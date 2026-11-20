@@ -16,12 +16,15 @@ import {
   formatContextUsage,
   formatPathLabel,
   formatPlanSummary,
+  formatQuotaResetCountdown,
+  formatQuotaResetDisplay,
   formatTranscriptJson,
   formatTranscriptMarkdown,
   isRunnableCodeLang,
   parseUnifiedGitDiff,
   searchTranscript,
   splitMarkdownSegments,
+  selectSoonestQuotaReset,
   summarizeQuotaRows,
   summarizeThoughtTopic,
   summarizeToolCall,
@@ -396,5 +399,19 @@ describe('ui formatting helpers', () => {
     });
     expect(detail).toContain('PID 4123');
     expect(detail).toContain('http://localhost:5173');
+
+    const nowMs = Date.parse('2026-11-21T01:08:00+07:00');
+    expect(formatQuotaResetCountdown('2026-11-21 05:48 WIB', nowMs)).toBe('in 4h 40m');
+    expect(formatQuotaResetCountdown('2026-11-26 15:24 WIB', nowMs)).toBe('in 5d 14h');
+    expect(formatQuotaResetDisplay('2026-11-21 05:48 WIB', nowMs)).toBe('2026-11-21 05:48 WIB (in 4h 40m)');
+    expect(formatQuotaResetCountdown('reset-a', nowMs)).toBeUndefined();
+
+    const summary = summarizeQuotaRows([
+      { group: 'Gemini', limit: 'Weekly', remaining: '64%', reset: '2026-11-26 15:24 WIB' },
+      { group: 'Gemini', limit: 'Five Hour', remaining: '82%', reset: '2026-11-21 05:48 WIB' },
+    ])!;
+    const soonest = selectSoonestQuotaReset(summary, nowMs);
+    expect(soonest.row.limit).toBe('Five Hour');
+    expect(soonest.countdown).toBe('in 4h 40m');
   });
 });

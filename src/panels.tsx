@@ -34,8 +34,11 @@ import {
   extractToolLiveOutput,
   formatContextUsage,
   formatPathLabel,
+  formatQuotaResetCountdown,
+  formatQuotaResetDisplay,
   searchTranscript,
   searchTranscriptCached,
+  selectSoonestQuotaReset,
   summarizeQuotaRows,
   summarizeToolCall,
   thinkingOption,
@@ -1786,6 +1789,29 @@ function formatConfigDetail(option: SessionConfigOption | undefined, fallback: s
   return raw && raw !== label ? `${label} (${raw})` : label;
 }
 
+function renderQuotaTable(quotaSummary: QuotaSummary, rowPrefix: string): JSX.Element {
+  return <table cols={[
+    { id: 'group', head: 'Model group', grow: 1, priority: 4 },
+    { id: 'limit', head: 'Limit', priority: 2 },
+    { id: 'meter', head: 'Quota bar', priority: 3 },
+    { id: 'remaining', head: 'Left', align: 'end', mono: true, priority: 4 },
+    { id: 'reset', head: 'Reset', mono: true, priority: 4 },
+  ]} rows={quotaSummary.rows.map((row, index) => ({
+    id: `${rowPrefix}-${index}`,
+    cells: {
+      group: row.group,
+      limit: row.limit,
+      meter: { meter: {
+        value: row.fraction,
+        tone: row.fraction <= 0.15 ? 'error' : row.fraction <= 0.35 ? 'warning' : 'success',
+      } },
+      remaining: row.remaining,
+      reset: formatQuotaResetDisplay(row.reset),
+    },
+    title: `${row.group}: ${row.limit}, ${row.remaining} remaining, resets ${formatQuotaResetDisplay(row.reset)}`,
+  }))} />;
+}
+
 /** Render the detailed account, active session, context window, and quota table view inside /usage. */
 function renderUsageDetails(
   ctx: PanelRenderContext,
@@ -1863,26 +1889,7 @@ function renderUsageDetails(
             ...(usage.cost ? [{ k: 'Session cost', v: `${usage.cost.amount} ${usage.cost.currency}` }] : []),
           ]} />
         </> : <text><span s="muted">No session-context token usage has been reported by ACP yet.</span></text>}
-        {quotaSummary ? <table cols={[
-          { id: 'group', head: 'Model group', grow: 1, priority: 4 },
-          { id: 'limit', head: 'Limit', priority: 2 },
-          { id: 'meter', head: 'Quota bar', priority: 3 },
-          { id: 'remaining', head: 'Left', align: 'end', mono: true, priority: 4 },
-          { id: 'reset', head: 'Reset', mono: true, priority: 1 },
-        ]} rows={quotaSummary.rows.map((row, index) => ({
-          id: `detail-${index}`,
-          cells: {
-            group: row.group,
-            limit: row.limit,
-            meter: { meter: {
-              value: row.fraction,
-              tone: row.fraction <= 0.15 ? 'error' : row.fraction <= 0.35 ? 'warning' : 'success',
-            } },
-            remaining: row.remaining,
-            reset: row.reset,
-          },
-          title: `${row.group}: ${row.limit}, ${row.remaining} remaining, reset ${row.reset}`,
-        }))} /> : ctx.reportText && <md>{ctx.reportText}</md>}
+        {quotaSummary ? renderQuotaTable(quotaSummary, 'detail') : ctx.reportText && <md>{ctx.reportText}</md>}
       </col>
     </section>
   </col>;
@@ -1997,50 +2004,39 @@ export function renderActivePanel(ctx: PanelRenderContext): JSX.Element {
                 label={quotaSummary.tightest.remaining}
                 total={quotaSummary.tightest.group} />}
             </row>}
-            <stats items={[
-              {
-                label: 'Tightest quota',
-                value: quotaSummary ? quotaSummary.tightest.remaining : (ctx.reportLoading ? 'Loading' : 'Unavailable'),
-                sub: quotaSummary
-                  ? `${quotaSummary.tightest.group} · ${quotaSummary.tightest.limit}${ctx.metadata.tier ? ` · ${ctx.metadata.tier.name}` : ''}`
-                  : (ctx.metadata.tier ? `${ctx.metadata.tier.name} · Official CLI /usage` : 'From official CLI /usage'),
-                tone: quotaSummary
-                  ? (quotaSummary.tightest.fraction <= 0.15 ? 'error' : quotaSummary.tightest.fraction <= 0.35 ? 'warning' : 'success')
-                  : 'muted',
-              },
-              {
-                label: 'Model groups',
-                value: quotaSummary ? String(quotaSummary.groupCount) : '0',
-                sub: quotaSummary ? `${quotaSummary.rows.length} tracked limits` : 'Parsed from /usage',
-                tone: 'neutral',
-              },
-              {
-                label: 'Session context',
-                value: contextUsage ? `${contextUsage.percent}%` : 'Not reported',
-                sub: contextUsage ? `${contextUsage.usedLabel} / ${contextUsage.sizeLabel} tokens` : 'Waiting for ACP usage_update',
-                tone: contextUsage ? 'info' : 'muted',
-              },
-            ]} />
-            {quotaSummary ? <table cols={[
-              { id: 'group', head: 'Model group', grow: 1, priority: 4 },
-              { id: 'limit', head: 'Limit', priority: 2 },
-              { id: 'meter', head: 'Quota bar', priority: 3 },
-              { id: 'remaining', head: 'Left', align: 'end', mono: true, priority: 4 },
-              { id: 'reset', head: 'Reset', mono: true, priority: 1 },
-            ]} rows={quotaSummary.rows.map((row, index) => ({
-              id: `quota-${index}`,
-              cells: {
-                group: row.group,
-                limit: row.limit,
-                meter: { meter: {
-                  value: row.fraction,
-                  tone: row.fraction <= 0.15 ? 'error' : row.fraction <= 0.35 ? 'warning' : 'success',
-                } },
-                remaining: row.remaining,
-                reset: row.reset,
-              },
-              title: `${row.group}: ${row.limit}, ${row.remaining} remaining, reset ${row.reset}`,
-            }))} /> : ctx.reportText && <md>{ctx.reportText}</md>}
+            {(() => {
+              const soonestReset = quotaSummary ? selectSoonestQuotaReset(quotaSummary) : undefined;
+              const tightestReset = quotaSummary ? formatQuotaResetCountdown(quotaSummary.tightest.reset) : undefined;
+              return <stats items={[
+                {
+                  label: 'Tightest quota',
+                  value: quotaSummary ? quotaSummary.tightest.remaining : (ctx.reportLoading ? 'Loading' : 'Unavailable'),
+                  sub: quotaSummary
+                    ? `${quotaSummary.tightest.group} · resets ${tightestReset ?? quotaSummary.tightest.reset}${ctx.metadata.tier ? ` · ${ctx.metadata.tier.name}` : ''}`
+                    : (ctx.metadata.tier ? `${ctx.metadata.tier.name} · Official CLI /usage` : 'From official CLI /usage'),
+                  tone: quotaSummary
+                    ? (quotaSummary.tightest.fraction <= 0.15 ? 'error' : quotaSummary.tightest.fraction <= 0.35 ? 'warning' : 'success')
+                    : 'muted',
+                },
+                {
+                  label: 'Next reset',
+                  value: soonestReset
+                    ? (soonestReset.countdown ?? soonestReset.row.reset)
+                    : (ctx.reportLoading ? 'Loading' : 'Unavailable'),
+                  sub: soonestReset
+                    ? `${soonestReset.row.reset} · ${soonestReset.row.group}`
+                    : 'Parsed from /usage',
+                  tone: soonestReset ? 'info' : 'muted',
+                },
+                {
+                  label: 'Session context',
+                  value: contextUsage ? `${contextUsage.percent}%` : 'Not reported',
+                  sub: contextUsage ? `${contextUsage.usedLabel} / ${contextUsage.sizeLabel} tokens` : 'Waiting for ACP usage_update',
+                  tone: contextUsage ? 'info' : 'muted',
+                },
+              ]} />;
+            })()}
+            {quotaSummary ? renderQuotaTable(quotaSummary, 'quota') : ctx.reportText && <md>{ctx.reportText}</md>}
           </>}
           {ctx.usageTab === 'details' && renderUsageDetails(ctx, quotaSummary, contextUsage)}
           {ctx.usageTab === 'raw' && (ctx.reportText

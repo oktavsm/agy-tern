@@ -56,4 +56,18 @@ describe('official information reports', () => {
     expect(parseQuotaReport('Gemini\tWeekly\t101%\treset-a')).toBeUndefined();
     expect(parseQuotaReport('')).toBeUndefined();
   });
+
+  test('parses real space-padded agy /usage CLI output including Quota: header and WIB timestamps', () => {
+    const realReport = [
+      'Quota:',
+      'Gemini Models          Weekly Limit Remaining       64%   2026-11-26 15:24 WIB',
+      'Gemini Models          Five Hour Limit Remaining    82%   2026-11-21 05:48 WIB',
+      'Gemini 4 Argon         Gemini 4 Argon Weekly Limit  100%  2026-11-28 01:08 WIB',
+    ].join('\n');
+    expect(parseQuotaReport(realReport)).toEqual([
+      { group: 'Gemini Models', limit: 'Weekly Limit Remaining', remaining: '64%', reset: '2026-11-26 15:24 WIB' },
+      { group: 'Gemini Models', limit: 'Five Hour Limit Remaining', remaining: '82%', reset: '2026-11-21 05:48 WIB' },
+      { group: 'Gemini 4 Argon', limit: 'Gemini 4 Argon Weekly Limit', remaining: '100%', reset: '2026-11-28 01:08 WIB' },
+    ]);
+  });
 });

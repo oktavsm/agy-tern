@@ -2,6 +2,12 @@
 
 All notable changes to `agy-tern` are documented in this file.
 
+## [0.3.2] - 2026-11-21
+
+### Fixed
+- Updated `parseQuotaReport` in [src/reports.ts](src/reports.ts) to parse official `agy --print /usage` space-padded columns and its leading `Quota:` header in addition to tab-delimited output.
+- Added reset countdown indicators (`formatQuotaResetCountdown`, `formatQuotaResetDisplay`, `selectSoonestQuotaReset`) in `/usage` Overview (`Next reset` stat card and `Tightest quota` reset detail) and raised `Reset` column priority in quota tables so reset times stay visible.
+
 ## [0.3.1] - 2026-11-21
 
 ### Added

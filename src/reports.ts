@@ -31,15 +31,31 @@ export interface QuotaRow {
   reset: string;
 }
 
+function splitQuotaLine(line: string): string[] | undefined {
+  if (line.includes('\t')) {
+    const cells = line.split('\t').map(cell => cell.trim());
+    return cells.length === 4 ? cells : undefined;
+  }
+  const spaceCols = line.trim().split(/\s{2,}/).map(cell => cell.trim());
+  if (spaceCols.length === 4) return spaceCols;
+  const match = /^(.+?)\s{2,}(.+?)\s+(\d+(?:\.\d+)?%)\s+(.+)$/.exec(line.trim());
+  if (!match) return undefined;
+  return [match[1]!.trim(), match[2]!.trim(), match[3]!.trim(), match[4]!.trim()];
+}
+
 export function parseQuotaReport(text: string): QuotaRow[] | undefined {
   if (!text.trim()) return undefined;
+  const rawLines = text.trim().split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+  const lines = rawLines.length > 1 && /^quota\s*:?$/i.test(rawLines[0]!) ? rawLines.slice(1) : rawLines;
   const rows: QuotaRow[] = [];
-  for (const line of text.trim().split(/\r?\n/)) {
-    const cells = line.split('\t');
-    if (cells.length !== 4) return undefined;
-    const [group, limit, remaining, reset] = cells.map(cell => cell.trim());
-    if (!group || !limit || !reset || !/^\d+(?:\.\d+)?%$/.test(remaining) || Number(remaining.slice(0, -1)) > 100) return undefined;
-    rows.push({ group, limit, remaining, reset });
+  for (const line of lines) {
+    const cells = splitQuotaLine(line);
+    if (!cells) return undefined;
+    const [group, limit, remaining, reset] = cells;
+    if (!group || !limit || !reset || !/^\d+(?:\.\d+)?%$/.test(remaining!) || Number(remaining!.slice(0, -1)) > 100) {
+      return undefined;
+    }
+    rows.push({ group, limit, remaining: remaining!, reset });
   }
-  return rows;
+  return rows.length ? rows : undefined;
 }

@@ -549,6 +549,87 @@ export function summarizeQuotaRows(rows: readonly QuotaRow[] | undefined): Quota
   return { rows: meterRows, tightest, groupCount: groups.size };
 }
 
+const TZ_OFFSETS: Readonly<Record<string, string>> = {
+  UTC: 'Z',
+  GMT: 'Z',
+  Z: 'Z',
+  WIB: '+07:00',
+  WITA: '+08:00',
+  WIT: '+09:00',
+  PST: '-08:00',
+  PDT: '-07:00',
+  EST: '-05:00',
+  EDT: '-04:00',
+  JST: '+09:00',
+  SGT: '+08:00',
+};
+
+/** Parse an official `/usage` reset timestamp (`ISO`, `YYYY-MM-DD HH:MM TZ`) into epoch ms when possible. */
+export function parseQuotaResetTimestamp(reset: string): number | undefined {
+  const trimmed = reset.trim();
+  if (!trimmed) return undefined;
+  const localNamed = /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}(?::\d{2})?)(?:\s+([A-Za-z]+|[+-]\d{2}:?\d{2}))?$/.exec(trimmed);
+  if (localNamed) {
+    const [, datePart, timePart, tzRaw] = localNamed;
+    const tzUpper = tzRaw?.toUpperCase();
+    const mappedTz = tzUpper ? (TZ_OFFSETS[tzUpper] ?? (/^[+-]\d{2}:?\d{2}$/.test(tzUpper) ? tzUpper : undefined)) : undefined;
+    const fullTime = timePart!.length === 5 ? `${timePart}:00` : timePart;
+    const candidate = mappedTz ? `${datePart}T${fullTime}${mappedTz}` : `${datePart}T${fullTime}`;
+    const ms = Date.parse(candidate);
+    if (Number.isFinite(ms)) return ms;
+  }
+  if (/^\d{4}-\d{2}-\d{2}T/.test(trimmed)) {
+    const ms = Date.parse(trimmed);
+    if (Number.isFinite(ms)) return ms;
+  }
+  return undefined;
+}
+
+/** Format a compact relative countdown (`in 4h 40m`, `in 5d 14h`) from a reset timestamp. */
+export function formatQuotaResetCountdown(reset: string, now = Date.now()): string | undefined {
+  const targetMs = parseQuotaResetTimestamp(reset);
+  if (targetMs === undefined) return undefined;
+  const diffMs = targetMs - now;
+  if (diffMs <= 0) return 'now';
+  const totalMinutes = Math.max(1, Math.round(diffMs / 60_000));
+  const days = Math.floor(totalMinutes / (24 * 60));
+  const hours = Math.floor((totalMinutes % (24 * 60)) / 60);
+  const mins = totalMinutes % 60;
+  if (days > 0) return hours > 0 ? `in ${days}d ${hours}h` : `in ${days}d`;
+  if (hours > 0) return mins > 0 ? `in ${hours}h ${mins}m` : `in ${hours}h`;
+  return `in ${mins}m`;
+}
+
+/** Format a reset cell showing countdown plus original timestamp when parseable. */
+export function formatQuotaResetDisplay(reset: string, now = Date.now()): string {
+  const countdown = formatQuotaResetCountdown(reset, now);
+  return countdown ? `${reset} (${countdown})` : reset;
+}
+
+/** Find the soonest upcoming quota reset (preferring non-100% depleted pools when present). */
+export function selectSoonestQuotaReset(
+  summary: QuotaSummary,
+  now = Date.now(),
+): { row: QuotaMeterRow; countdown?: string; targetMs?: number } {
+  const activeDepleted = summary.rows.filter(row => row.fraction < 1);
+  const pool = activeDepleted.length ? activeDepleted : summary.rows;
+  let best = pool[0]!;
+  let bestMs = parseQuotaResetTimestamp(best.reset);
+  for (let i = 1; i < pool.length; i++) {
+    const candidate = pool[i]!;
+    const ms = parseQuotaResetTimestamp(candidate.reset);
+    if (ms !== undefined && (bestMs === undefined || ms < bestMs)) {
+      best = candidate;
+      bestMs = ms;
+    }
+  }
+  return {
+    row: best,
+    countdown: formatQuotaResetCountdown(best.reset, now),
+    targetMs: bestMs,
+  };
+}
+
 export interface SessionDiffItem {
   id: string;
   path: string;
