@@ -2,6 +2,11 @@
 
 All notable changes to `agy-tern` are documented in this file.
 
+## [0.3.3] - 2026-11-21
+
+### Added
+- GitHub-style Commit Contribution Heatmap (`/commits`, aliases `heatmap`, `contributions`) backed by [src/git-history.ts](src/git-history.ts), rendered with Tern `<chart kind="heatmap" token="success">` plus commit streak stats (`Commits`, `Current streak`, `Peak day`), clickable recent commit diffs, and a quick `Commit map` shortcut inside `/changes`.
+
 ## [0.3.2] - 2026-11-21
 
 ### Fixed

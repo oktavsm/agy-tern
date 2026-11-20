@@ -51,6 +51,7 @@ import {
   matchToolStepToLiveProcess,
   type LiveProcessInfo,
 } from './task-monitor';
+import type { CommitEntry, CommitHeatmapGrid } from './git-history';
 import {
   filterAgentsList,
   filterCommandsForTab,
@@ -90,6 +91,7 @@ export type Panel =
   | { kind: 'account' }
   | { kind: 'account-switch' }
   | { kind: 'changes' }
+  | { kind: 'commits' }
   | { kind: 'find' }
   | { kind: 'turns' }
   | { kind: 'queue' }
@@ -241,6 +243,11 @@ export interface PanelRenderContext {
   onRefreshLiveProcesses?(): void;
   onKillProcess?(proc: LiveProcessInfo, force?: boolean): void;
   onInspectLiveTask?(target: { toolCallId?: string; pid?: number }): void;
+  commitHistory?: CommitHeatmapGrid;
+  commitHistoryLoading?: boolean;
+  gitBranch?: string;
+  onRefreshCommits?(): void;
+  onInspectCommit?(commit: CommitEntry): void;
 }
 
 function renderPrefsPanel(ctx: PanelRenderContext): JSX.Element {
@@ -642,6 +649,7 @@ function renderChangesPicker(ctx: PanelRenderContext): JSX.Element {
     preview={highlightedPath ? 'below' : 'none'}
     actions={[
       { id: 'refresh', label: 'Refresh' },
+      { id: 'commits', label: 'Commit map' },
       ...(usingGit ? [
         ...(canUnstage ? [{ id: 'unstage', label: 'Unstage' }] : []),
         ...(canStage ? [{ id: 'stage', label: 'Stage' }] : []),
@@ -665,6 +673,7 @@ function renderChangesPicker(ctx: PanelRenderContext): JSX.Element {
         if (typeof event.value === 'string') ctx.onSetPickerTab(event.value, true);
       },
       refresh: ctx.onRefreshGitChanges,
+      commits: () => ctx.onOpenPanel({ kind: 'commits' }),
       stage: () => {
         if (highlightedGit && ctx.onStageGitPath) ctx.onStageGitPath(highlightedGit.path);
       },
@@ -1935,12 +1944,80 @@ function renderKeysOverlay(ctx: PanelRenderContext): JSX.Element {
   </overlay>;
 }
 
+function renderCommitsOverlay(ctx: PanelRenderContext): JSX.Element {
+  const grid = ctx.commitHistory;
+  const branchText = ctx.gitBranch ? `Branch ${ctx.gitBranch}` : ctx.workspaceName;
+  const recentCommits = grid?.commits.slice(0, 30) ?? [];
+
+  return <overlay key="panel" head="Commit history & activity" icon="branch" modal size={ctx.rLayout.panelSize}
+    meta={grid ? `${branchText} · Last ${grid.weeks} weeks` : branchText}
+    end={<button keys={['esc']} variant="quiet" onClick={ctx.onClosePanel}>Close</button>}
+    foot={<row gap="xs" justify="between" align="center" wrap>
+      <text><span s="muted">Up/Down/PgUp/PgDn scroll · r refresh · Click commit to inspect diff</span></text>
+      <row gap="xs">
+        <button size="sm" variant="quiet" onClick={() => ctx.onOpenPanel({ kind: 'changes' })}>Working tree (/changes)</button>
+        {ctx.onRefreshCommits && <button size="sm" variant="primary" disabled={ctx.commitHistoryLoading && 'Loading'}
+          onClick={ctx.onRefreshCommits}>Refresh</button>}
+      </row>
+    </row>}>
+    <scroll key="overlay-scroll" bar="always" max={{ h: ctx.rLayout.inspectBodyMaxH }}>
+      <col gap="md">
+        {ctx.commitHistoryLoading && <spinner label="Reading git commit history" />}
+        {grid && <>
+          <stats items={[
+            {
+              label: `Commits (${grid.weeks}w)`,
+              value: String(grid.totalCommits),
+              sub: `${grid.activeDays} active day(s)`,
+              tone: grid.totalCommits > 0 ? 'success' : 'muted',
+            },
+            {
+              label: 'Current streak',
+              value: `${grid.currentStreak}d`,
+              sub: `Longest: ${grid.longestStreak}d`,
+              tone: grid.currentStreak > 0 ? 'accent' : 'neutral',
+            },
+            {
+              label: 'Peak day',
+              value: grid.busiestDate ? `${grid.busiestDate.count}` : '0',
+              sub: grid.busiestDate ? grid.busiestDate.date : 'No commits in range',
+              tone: grid.busiestDate ? 'info' : 'muted',
+            },
+          ]} />
+          <section head="Contribution heatmap">
+            <col gap="xs">
+              <chart kind="heatmap" size="md" token="success"
+                rows={grid.rows}
+                cols={grid.cols}
+                cells={grid.cells}
+                tips={grid.tips}
+                summary={`${grid.totalCommits} commits across ${grid.weeks} weeks (${grid.activeDays} active days)`} />
+              <text><span s="muted">Squares darken with commit count per day (0 to {grid.maxDailyCommits || 1}); hover any day for date count.</span></text>
+            </col>
+          </section>
+          <section head="Recent commits">
+            {recentCommits.length > 0 ? <list max={{ lines: Math.max(5, ctx.rLayout.modalListMaxLines) }}>
+              {recentCommits.map(commit => <item key={commit.hash}
+                icon="commit"
+                label={commit.subject}
+                detail={`${commit.shortHash} · ${commit.date} (${commit.relativeTime}) · ${commit.author}`}
+                value="Inspect"
+                onClick={() => ctx.onInspectCommit?.(commit)} />)}
+            </list> : <text><span s="muted">No commits found in this workspace or git repository is uninitialized.</span></text>}
+          </section>
+        </>}
+      </col>
+    </scroll>
+  </overlay>;
+}
+
 /** Render the active modal picker, prefs window, report overlay, or inspector dialog. */
 export function renderActivePanel(ctx: PanelRenderContext): JSX.Element {
   const currentPanel = ctx.panel;
   if (currentPanel.kind === 'settings') return renderPrefsPanel(ctx);
   if (currentPanel.kind === 'followup') return renderFollowUpOverlay(ctx, currentPanel);
   if (currentPanel.kind === 'keys') return renderKeysOverlay(ctx);
+  if (currentPanel.kind === 'commits') return renderCommitsOverlay(ctx);
   const config = currentPanel.kind === 'config' ? ctx.metadata.configOptions.find(option => option.id === currentPanel.id) : undefined;
   if (currentPanel.kind === 'config' && config?.type === 'select') return renderSelectConfigPicker(ctx, config);
   if (currentPanel.kind === 'commands') return renderCommandsPicker(ctx);

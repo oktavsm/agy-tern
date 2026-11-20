@@ -1,6 +1,6 @@
 import type { AvailableCommand, SessionConfigOption, SessionConfigSelectOption } from '@agentclientprotocol/sdk';
 
-export type LocalCommand = 'help' | 'keys' | 'update' | 'model' | 'settings' | 'usage' | 'credits' | 'changelog' | 'permissions' | 'sessions' | 'turns' | 'queue' | 'new' | 'rename' | 'account' | 'switch-account' | 'login' | 'changes' | 'find' | 'tasks' | 'paste-image' | 'export' | 'expand' | 'collapse' | 'mcp' | 'plugins' | 'agents' | 'templates' | 'exit';
+export type LocalCommand = 'help' | 'keys' | 'update' | 'model' | 'settings' | 'usage' | 'credits' | 'changelog' | 'permissions' | 'sessions' | 'turns' | 'queue' | 'new' | 'rename' | 'account' | 'switch-account' | 'login' | 'changes' | 'commits' | 'find' | 'tasks' | 'paste-image' | 'export' | 'expand' | 'collapse' | 'mcp' | 'plugins' | 'agents' | 'templates' | 'exit';
 export type CommandCategory = 'frontend' | 'workflow' | 'skill';
 
 const CORE_WORKFLOWS = new Set([
@@ -20,6 +20,7 @@ const LOCAL: readonly Command[] = [
   { name: 'switch-account', local: 'switch-account', description: 'Confirm logout and switch account via official login' },
   { name: 'login', local: 'login', description: 'Open official sign-in options, including while disconnected' },
   { name: 'changes', local: 'changes', description: 'Review session file edits and git working tree status' },
+  { name: 'commits', local: 'commits', description: 'View GitHub-style commit contribution heatmap and recent git history' },
   { name: 'tasks', local: 'tasks', description: 'Inspect live child processes, view live command output, or kill running tasks' },
   { name: 'paste-image', local: 'paste-image', description: 'Attach a screenshot or image directly from system clipboard' },
   { name: 'find', local: 'find', description: 'Search messages, tools, thoughts, and diffs in this conversation', hint: 'query' },
@@ -45,7 +46,7 @@ const LOCAL: readonly Command[] = [
   { name: 'exit', local: 'exit', description: 'Close this frontend and its agy session' },
 ];
 const ALIASES: Readonly<Record<string, string>> = {
-  quota: 'usage', config: 'settings', preferences: 'settings', prefs: 'settings', quit: 'exit', commands: 'help', palette: 'help', shortcuts: 'keys', hotkeys: 'keys', upgrade: 'update', resume: 'sessions', conversation: 'sessions', switch: 'sessions', reauth: 'switch-account', diff: 'changes', search: 'find', outline: 'turns', jump: 'turns', queued: 'queue', skills: 'plugins', agent: 'agents', snippets: 'templates', running: 'tasks', ps: 'tasks', clip: 'paste-image',
+  quota: 'usage', config: 'settings', preferences: 'settings', prefs: 'settings', quit: 'exit', commands: 'help', palette: 'help', shortcuts: 'keys', hotkeys: 'keys', upgrade: 'update', resume: 'sessions', conversation: 'sessions', switch: 'sessions', reauth: 'switch-account', diff: 'changes', heatmap: 'commits', contributions: 'commits', search: 'find', outline: 'turns', jump: 'turns', queued: 'queue', skills: 'plugins', agent: 'agents', snippets: 'templates', running: 'tasks', ps: 'tasks', clip: 'paste-image',
 };
 const ALIAS_PATTERN = new RegExp(`^\\/(${Object.keys(ALIASES).join('|')})(?=\\s|$)`);
 

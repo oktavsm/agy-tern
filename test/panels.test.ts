@@ -544,5 +544,34 @@ describe('panel renderers & transcript view helpers', () => {
     const keysJson = JSON.stringify(renderActivePanel(baseContext({ kind: 'keys' })));
     expect(keysJson).toContain('Keyboard shortcuts');
     expect(keysJson).toContain('Ctrl+Tab');
+
+    const commitsCtx = baseContext({ kind: 'commits' });
+    commitsCtx.gitBranch = 'main';
+    commitsCtx.commitHistory = {
+      weeks: 8,
+      totalCommits: 3,
+      activeDays: 2,
+      maxDailyCommits: 2,
+      currentStreak: 2,
+      longestStreak: 2,
+      busiestDate: { date: '2026-11-21', count: 2 },
+      rows: ['', 'Mon', '', 'Wed', '', 'Fri', ''],
+      cols: [{ at: 0, label: 'Oct' }, { at: 4, label: 'Nov' }],
+      cells: Array.from({ length: 7 }, (_, r) => Array.from({ length: 8 }, (__, c) => (r === 6 && c === 7 ? 2 : 0))),
+      tips: Array.from({ length: 7 }, (_, r) => Array.from({ length: 8 }, (__, c) => (r === 6 && c === 7 ? '2 commits on 2026-11-21' : 'No commits'))),
+      commits: [{
+        hash: 'abc1234',
+        shortHash: 'abc1234',
+        date: '2026-11-21',
+        relativeTime: '1 hour ago',
+        author: 'oktavsm',
+        subject: 'feat(ui): add commit heatmap',
+      }],
+    };
+    const commitsJson = JSON.stringify(renderActivePanel(commitsCtx));
+    expect(commitsJson).toContain('"kind":"heatmap"');
+    expect(commitsJson).toContain('"token":"success"');
+    expect(commitsJson).toContain('Contribution heatmap');
+    expect(commitsJson).toContain('feat(ui): add commit heatmap');
   });
 });

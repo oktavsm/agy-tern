@@ -89,6 +89,7 @@ import {
   type WorkspaceEntry,
 } from './files';
 import { AttachmentSizeCache, computeDraftContextBudget, formatCompactTokens } from './context-budget';
+import { readCommitHistory, readCommitPatch, type CommitEntry, type CommitHeatmapGrid } from './git-history';
 import {
   killLiveChildProcess,
   listLiveChildProcesses,
@@ -443,6 +444,8 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
   let ignoredPathsSet = new Set<string>();
   let gitChanges: GitStatusEntry[] = [];
   let gitMutationBusy = false;
+  let commitHistory: CommitHeatmapGrid | undefined;
+  let commitHistoryLoading = false;
   let liveProcesses: LiveProcessInfo[] = [];
   let taskPollTimer: NodeJS.Timeout | undefined;
   let openSessionTabs: string[] = [];
@@ -1844,6 +1847,34 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     showToast(`Turn ${turnNumber}`);
   }
 
+  function loadCommitHistory(): void {
+    if (commitHistoryLoading || quitting) return;
+    commitHistoryLoading = true;
+    render();
+    const weeks = (process.stdout.columns || 100) < 84 ? 12 : 16;
+    void readCommitHistory(options.cwd, { weeks }).then(grid => {
+      if (quitting) return;
+      commitHistory = grid;
+    }).finally(() => {
+      commitHistoryLoading = false;
+      if (!quitting) render();
+    });
+  }
+
+  function inspectCommit(commit: CommitEntry): void {
+    if (quitting) return;
+    void readCommitPatch(options.cwd, commit.hash).then(patch => {
+      if (quitting) return;
+      openInspect(
+        `${commit.shortHash}: ${commit.subject}`,
+        { type: 'file', path: `${commit.shortHash}.diff`, content: patch || 'Empty commit diff.' },
+        `${commit.author} · ${commit.date} (${commit.relativeTime})`,
+      );
+    }).catch(err => {
+      if (!quitting) showToast(`Cannot read commit ${commit.shortHash}`, err instanceof Error ? err.message : String(err));
+    });
+  }
+
   function mutateGitPath(action: 'stage' | 'unstage' | 'discard', filePath: string, status = ''): void {
     if (gitMutationBusy || quitting) return;
     gitMutationBusy = true;
@@ -1965,6 +1996,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     surface?.focus(targetFocus);
     if (next.kind === 'report') loadReport(next.report);
     if (next.kind === 'tasks' || next.kind === 'task-inspect') refreshLiveProcesses();
+    if (next.kind === 'commits') loadCommitHistory();
     if (next.kind === 'mcp' || next.kind === 'plugins' || next.kind === 'agents') loadExtensions(next.kind);
     if (next.kind === 'templates') loadTemplates();
     if (next.kind === 'sessions' && agent?.capabilities.listSessions) {
@@ -2092,6 +2124,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         case 'settings': openPanel({ kind: 'settings' }); return;
         case 'permissions': openPanel({ kind: 'permissions' }); return;
         case 'changes': openPanel({ kind: 'changes' }); return;
+        case 'commits': openPanel({ kind: 'commits' }); return;
         case 'tasks': openPanel({ kind: 'tasks' }); return;
         case 'paste-image': closePanel(); attachClipboardImage(); return;
         case 'find':
@@ -2856,6 +2889,11 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       onRefreshLiveProcesses: refreshLiveProcesses,
       onKillProcess: killTaskProcess,
       onInspectLiveTask: target => openPanel({ kind: 'task-inspect', ...target }),
+      commitHistory,
+      commitHistoryLoading,
+      gitBranch,
+      onRefreshCommits: loadCommitHistory,
+      onInspectCommit: inspectCommit,
     });
   }
 
@@ -3912,7 +3950,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       }
       if (panel && !permissions.length) {
         const current = panel;
-        const scrollInspectByKey = (keyName: string): boolean => {
+        const scrollContainerByKey = (containerId: string, keyName: string): boolean => {
           const action = keyName === 'up' ? 'line-up'
             : keyName === 'down' ? 'line-down'
             : keyName === 'page_up' ? 'page-up'
@@ -3921,11 +3959,16 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
             : keyName === 'end' ? 'end'
             : undefined;
           if (!action || !surface) return false;
-          surface.scroll('layer.panel.inspect-scroll', action);
+          surface.scroll(containerId, action);
           return true;
         };
+        if (current.kind === 'commits') {
+          if (scrollContainerByKey('layer.panel.overlay-scroll', key.name)) continue;
+          if (!key.ctrl && !key.meta && !key.alt && key.name === 'r') loadCommitHistory();
+          continue;
+        }
         if (current.kind === 'task-inspect') {
-          if (scrollInspectByKey(key.name)) continue;
+          if (scrollContainerByKey('layer.panel.inspect-scroll', key.name)) continue;
           const tools = stateManager.getConversation().entries.filter((entry): entry is ToolStep => entry.type === 'tool');
           const proc = current.pid !== undefined ? liveProcesses.find(item => item.pid === current.pid) : undefined;
           const step = current.toolCallId
@@ -3957,7 +4000,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         }
         if (current.kind === 'inspect') {
           const item = current.item;
-          if (scrollInspectByKey(key.name)) {
+          if (scrollContainerByKey('layer.panel.inspect-scroll', key.name)) {
             // handled by shared helper
           } else if (!key.ctrl && !key.meta && !key.alt && key.name === 'c') {
             const copyText = item.type === 'file' ? item.content

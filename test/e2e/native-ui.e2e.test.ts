@@ -315,6 +315,18 @@ describe('agy-tern native Tern E2E smoke', () => {
     }
     expect(harness.findById('layer.picker')).toBeUndefined();
 
+    // Verify /commits renders GitHub-style commit contribution heatmap overlay cleanly.
+    harness.sendText('/commits');
+    harness.sendKey('enter');
+    await harness.waitForText('Contribution heatmap', 'layer', 5_000);
+    harness.assertWireInvariants();
+    harness.sendKey('esc');
+    const commitsDeadline = Date.now() + 4_000;
+    while (harness.findById('layer.panel') && Date.now() < commitsDeadline) {
+      await new Promise(resolveDelay => setTimeout(resolveDelay, 25));
+    }
+    expect(harness.findById('layer.panel')).toBeUndefined();
+
     // Verify multiline @file popup keeps mode="insert", allows Up/Down navigation without cursor escaping, and inserts inline @path + decor.
     harness.sendText('line one');
     harness.sendKey('shift+enter');
