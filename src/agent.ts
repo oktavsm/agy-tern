@@ -838,6 +838,7 @@ export async function connectAgent(options: AgentOptions, events: AgentEvents): 
   }
 
   return {
+    get pid() { return exited ? undefined : child.pid; },
     get sessionId() { return sessionId; },
     get metadata() { return metadata; },
     get authentication() { return authentication; },

@@ -716,17 +716,27 @@ export function extractToolImagePaths(call: ToolCallUpdate, cwd: string): string
   return [...seen];
 }
 
-/** Build plain text inspection summary for a tool step (shared by /tasks and UI inspect). */
-export function buildTaskDetailText(step: ToolStep, cwd: string): string {
+/** Build plain text inspection summary for a tool step (shared by /tasks and live task output inspect). */
+export function buildTaskDetailText(
+  step: ToolStep,
+  cwd: string,
+  liveProc?: { pid: number; stat: string; elapsed: string; commandLine: string },
+): string {
   const s = summarizeToolCall(step.call, cwd, { includeDiffStats: false });
+  const statusLabel = step.call.status ?? 'unknown';
+  const elapsedMs = (step.endedAt ?? (statusLabel === 'in_progress' || statusLabel === 'pending' ? Date.now() : step.startedAt)) !== undefined && step.startedAt !== undefined
+    ? Math.max(0, (step.endedAt ?? Date.now()) - step.startedAt)
+    : undefined;
+  const exit = extractExitCode(step.call.rawOutput);
+  const liveOutput = extractToolLiveOutput(step);
   return [
     `Tool: ${s.title}`,
+    `Status: ${statusLabel}${elapsedMs !== undefined ? ` (${(elapsedMs / 1000).toFixed(1)}s)` : ''}${exit !== undefined ? ` · exit ${exit}` : ''}`,
+    ...(liveProc ? [`Process: PID ${liveProc.pid} (${liveProc.stat}, ${liveProc.elapsed}) - ${liveProc.commandLine}`] : []),
     ...(s.target ? [`Target: ${s.target}`] : []),
     ...(s.fullCommand ? [`Command:\n${s.fullCommand}`] : []),
+    ...(liveOutput ? [`Output:\n${liveOutput}`] : []),
     ...(step.call.rawInput !== undefined ? [`Input:\n${JSON.stringify(step.call.rawInput, null, 2)}`] : []),
-    ...(step.call.rawOutput !== undefined
-      ? [`Output:\n${typeof step.call.rawOutput === 'string' ? step.call.rawOutput : JSON.stringify(step.call.rawOutput, null, 2)}`]
-      : []),
   ].join('\n\n');
 }
 
@@ -1180,8 +1190,30 @@ export function extractToolOutputText(rawOutput: unknown): string | undefined {
       const joined = [stdout, stderr].filter(Boolean).join('\n');
       return joined || undefined;
     }
+    for (const key of ['output', 'combinedOutput', 'combined_output', 'commandOutput', 'text'] as const) {
+      if (typeof rec[key] === 'string' && rec[key].trimEnd()) return rec[key].trimEnd();
+    }
   }
   return JSON.stringify(rawOutput, null, 2);
+}
+
+/** Combine live ACP tool content chunks and structured rawOutput into one live output string. */
+export function extractToolLiveOutput(step: ToolStep): string | undefined {
+  const chunks: string[] = [];
+  for (const item of step.call.content ?? []) {
+    if (item.type === 'content') {
+      const text = contentText(item.content).trimEnd();
+      if (text) chunks.push(text);
+    } else if (item.type === 'terminal' && item.terminalId) {
+      chunks.push(`[Terminal: ${item.terminalId}]`);
+    }
+  }
+  const contentBlock = chunks.join('\n').trimEnd();
+  const rawBlock = extractToolOutputText(step.call.rawOutput);
+  if (contentBlock && rawBlock && contentBlock !== rawBlock && !rawBlock.includes(contentBlock)) {
+    return `${contentBlock}\n${rawBlock}`;
+  }
+  return rawBlock || contentBlock || undefined;
 }
 
 export interface ResponsiveLayout {

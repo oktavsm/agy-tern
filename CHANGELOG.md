@@ -2,6 +2,12 @@
 
 All notable changes to `agy-tern` are documented in this file.
 
+## [0.3.1] - 2026-11-21
+
+### Added
+- Live child process supervision for `/tasks` via [src/task-monitor.ts](src/task-monitor.ts): monitors strict descendant processes under the active `agy` subprocess PID (`LIVE PID` badges, elapsed runtime, state, and automatic 1s polling while `/tasks` is open), correlates them with tool calls, and supports confirmed `Kill process` (`SIGTERM`) / `Force SIGKILL`.
+- Dynamic live task output overlay (`task-inspect`) opened on `Enter` in `/tasks`: auto-follows streaming tool output (`stick="end"`) combining ACP `content` chunks and `rawOutput` (`extractToolLiveOutput`), with `Copy output`, `Refresh`, `k` kill shortcut, and `Esc` back to `/tasks`.
+
 ## [0.3.0] - 2026-11-18
 
 ### Added

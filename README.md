@@ -170,7 +170,7 @@ agy-tern --doctor                                 # Verify agy, tern, Bun, and c
 | `/settings`, `/config` | Open 4-page `<prefs>` modal persisted in `$XDG_STATE_HOME/agy-tern/prefs.json` |
 | `/find [query]`, `/search [query]` | Search transcript messages, thoughts, tools, diffs, plans, and notices |
 | `/changes`, `/diff` | Inspect session edits and workspace `git status` diffs; stage, unstage, discard (confirmed), copy diff, or open in `Tern split` |
-| `/tasks`, `/running`, `/ps` | Inspect active and completed session tools or stop the active turn |
+| `/tasks`, `/running`, `/ps` | Inspect live child processes and tool activity, view live streaming command output (`Enter`), or kill running processes |
 | `/templates [query]` | Save, search, insert, or delete workspace prompt templates |
 | `/mcp`, `/plugins`, `/agents` | Manage `agy` MCP servers, plugins/skills, and custom agent profiles |
 | `/new`, `/rename [name]` | Start a new session or set a local display label |
@@ -216,7 +216,7 @@ bun run dist/cli.js --doctor
 Core module map:
 - `src/contracts.ts`, `src/agent.ts`, `src/auth.ts`, `src/reports.ts`: Official ACP stdio boundary, login lifecycle, and CLI reports.
 - `src/model.ts`, `src/history.ts`, `src/session-state.ts`, `src/draft.ts`, `src/files.ts`, `src/prefs.ts`, `src/session-names.ts`, `src/templates.ts`: Transcript hydration, local XDG stores, composer input, and `@file` indexing.
-- `src/cli-args.ts`, `src/cli.tsx`, `src/updater.ts`, `src/commands.ts`, `src/extensions.ts`, `src/tern-window.ts`: CLI flag parsing, `update` & passive check, extension managers, `tern open` splits, and OSC 9 attention alerts.
+- `src/cli-args.ts`, `src/cli.tsx`, `src/updater.ts`, `src/commands.ts`, `src/extensions.ts`, `src/task-monitor.ts`, `src/tern-window.ts`: CLI flag parsing, `update` & passive check, extension managers, live child process monitor, `tern open` splits, and OSC 9 attention alerts.
 - `src/tern-render.ts`, `src/ui-format.ts`, `src/context-budget.ts`, `src/turn-outline.ts`, `src/ui-session-helpers.ts`, `src/picker-nav.ts`, `src/transcript-view.tsx`, `src/panels.tsx`, `src/ui.tsx`: Adaptive Tern render controller, pre-send context estimator, turn outline, modal pickers, inspector overlays, composer card, and keyboard/pointer orchestration.
 
 ---

@@ -298,6 +298,23 @@ describe('agy-tern native Tern E2E smoke', () => {
     }
     expect(harness.findById('layer.picker')).toBeUndefined();
 
+    // Verify /tasks opens live process & tool picker, and Enter opens live output overlay cleanly.
+    harness.sendText('/tasks');
+    harness.sendKey('enter');
+    await harness.waitForText('Tasks & live processes', 'layer', 5_000);
+    harness.assertWireInvariants();
+    harness.sendKey('enter');
+    await harness.waitForText('Copy output', 'layer', 5_000);
+    harness.assertWireInvariants();
+    harness.sendKey('esc');
+    await harness.waitForText('Tasks & live processes', 'layer', 4_000);
+    harness.sendKey('esc');
+    const tasksDeadline = Date.now() + 4_000;
+    while (harness.findById('layer.picker') && Date.now() < tasksDeadline) {
+      await new Promise(resolveDelay => setTimeout(resolveDelay, 25));
+    }
+    expect(harness.findById('layer.picker')).toBeUndefined();
+
     // Verify multiline @file popup keeps mode="insert", allows Up/Down navigation without cursor escaping, and inserts inline @path + decor.
     harness.sendText('line one');
     harness.sendKey('shift+enter');

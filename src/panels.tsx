@@ -27,9 +27,11 @@ import {
 } from './prefs';
 import { imageMimeType, type GitStatusEntry, type WorkspaceEntry } from './files';
 import {
+  buildTaskDetailText,
   buildUnifiedDiffHunks,
   extractToolImagePaths,
   extractToolInlineImages,
+  extractToolLiveOutput,
   formatContextUsage,
   formatPathLabel,
   searchTranscript,
@@ -41,6 +43,11 @@ import {
   type ResponsiveLayout,
   type SessionDiffItem,
 } from './ui-format';
+import {
+  matchLiveProcessToToolStep,
+  matchToolStepToLiveProcess,
+  type LiveProcessInfo,
+} from './task-monitor';
 import {
   filterAgentsList,
   filterCommandsForTab,
@@ -84,6 +91,7 @@ export type Panel =
   | { kind: 'turns' }
   | { kind: 'queue' }
   | { kind: 'tasks' }
+  | { kind: 'task-inspect'; toolCallId?: string; pid?: number }
   | { kind: 'mcp' }
   | { kind: 'plugins' }
   | { kind: 'agents' }
@@ -226,6 +234,10 @@ export interface PanelRenderContext {
   onStageGitPath?(filePath: string): void;
   onUnstageGitPath?(filePath: string): void;
   onDiscardGitPath?(filePath: string, status: string): void;
+  liveProcesses?: readonly LiveProcessInfo[];
+  onRefreshLiveProcesses?(): void;
+  onKillProcess?(proc: LiveProcessInfo, force?: boolean): void;
+  onInspectLiveTask?(target: { toolCallId?: string; pid?: number }): void;
 }
 
 function renderPrefsPanel(ctx: PanelRenderContext): JSX.Element {
@@ -1330,96 +1342,252 @@ function renderTemplatesPicker(ctx: PanelRenderContext): JSX.Element {
 
 function renderTasksPicker(ctx: PanelRenderContext): JSX.Element {
   const query = ctx.panelDraft.text.trim().toLowerCase();
+  const liveProcs = ctx.liveProcesses ?? [];
   const allTools = ctx.entries
     .filter((entry): entry is ToolStep => entry.type === 'tool')
     .slice()
     .reverse();
-  const filtered = allTools.filter(step => {
-    const summary = summarizeToolCall(step.call, ctx.options.cwd);
-    const isRunning = step.call.status === 'in_progress' || step.call.status === 'pending';
-    if (ctx.pickerTab === 'running' && !isRunning) return false;
-    if (ctx.pickerTab === 'done' && isRunning) return false;
-    if (!query) return true;
-    return `${summary.title} ${summary.target ?? ''} ${step.call.toolCallId}`.toLowerCase().includes(query);
-  });
-  const order = filtered.map(step => step.id);
-  const selectedId = order.includes(ctx.pickerSelected) ? ctx.pickerSelected : (order[0] ?? '');
-  const highlighted = filtered.find(step => step.id === selectedId);
-  const highlightedSummary = highlighted ? summarizeToolCall(highlighted.call, ctx.options.cwd) : undefined;
-  const now = Date.now();
-  const runningCount = allTools.filter(step => step.call.status === 'in_progress' || step.call.status === 'pending').length;
+  const runningTools = allTools.filter(step => step.call.status === 'in_progress' || step.call.status === 'pending');
+  const finishedCount = allTools.length - runningTools.length;
+  const tab = ctx.pickerTab === 'live' || ctx.pickerTab === 'running' || ctx.pickerTab === 'done' ? ctx.pickerTab : 'all';
 
-  const inspectTaskStep = (step: ToolStep): void => {
-    const s = summarizeToolCall(step.call, ctx.options.cwd);
-    const detailText = [
-      `Tool: ${s.title}`,
-      ...(s.target ? [`Target: ${s.target}`] : []),
-      ...(s.fullCommand ? [`Command:\n${s.fullCommand}`] : []),
-      ...(step.call.rawInput !== undefined ? [`Input:\n${JSON.stringify(step.call.rawInput, null, 2)}`] : []),
-      ...(step.call.rawOutput !== undefined ? [`Output:\n${typeof step.call.rawOutput === 'string' ? step.call.rawOutput : JSON.stringify(step.call.rawOutput, null, 2)}`] : []),
-    ].join('\n\n');
-    ctx.onOpenInspect(s.title, { type: 'file', path: 'task.log', content: detailText }, s.target);
+  type TaskRow =
+    | { id: string; kind: 'proc'; proc: LiveProcessInfo; matchedStep?: ToolStep }
+    | { id: string; kind: 'tool'; step: ToolStep; summary: ReturnType<typeof summarizeToolCall>; matchedProc?: LiveProcessInfo; isRunning: boolean };
+
+  const procRows: TaskRow[] = liveProcs
+    .filter(proc => !query || `pid ${proc.pid} ${proc.summary} ${proc.commandLine} ${proc.stat}`.toLowerCase().includes(query))
+    .map(proc => ({
+      id: `proc:${proc.pid}`,
+      kind: 'proc',
+      proc,
+      matchedStep: matchLiveProcessToToolStep(proc, allTools, ctx.options.cwd),
+    }));
+
+  const matchedProcToolIds = new Set(procRows.flatMap(row => (row.kind === 'proc' && row.matchedStep ? [row.matchedStep.id] : [])));
+  const toolRows: TaskRow[] = allTools
+    .filter(step => {
+      const summary = summarizeToolCall(step.call, ctx.options.cwd);
+      const isRunning = step.call.status === 'in_progress' || step.call.status === 'pending';
+      if (tab === 'live' && (!isRunning || matchedProcToolIds.has(step.id))) return false;
+      if (tab === 'running' && !isRunning) return false;
+      if (tab === 'done' && isRunning) return false;
+      if (!query) return true;
+      return `${summary.title} ${summary.target ?? ''} ${step.call.toolCallId}`.toLowerCase().includes(query);
+    })
+    .map(step => ({
+      id: step.id,
+      kind: 'tool',
+      step,
+      summary: summarizeToolCall(step.call, ctx.options.cwd),
+      matchedProc: matchToolStepToLiveProcess(step, liveProcs, ctx.options.cwd),
+      isRunning: step.call.status === 'in_progress' || step.call.status === 'pending',
+    }));
+
+  const combinedRows: TaskRow[] = tab === 'live'
+    ? [...procRows, ...toolRows]
+    : tab === 'all'
+      ? [...procRows, ...toolRows]
+      : toolRows;
+
+  const order = combinedRows.map(row => row.id);
+  const selectedId = order.includes(ctx.pickerSelected) ? ctx.pickerSelected : (order[0] ?? '');
+  const highlighted = combinedRows.find(row => row.id === selectedId);
+  const now = Date.now();
+
+  const openLiveOutput = (row: TaskRow | undefined): void => {
+    if (!row) return;
+    if (row.kind === 'proc') {
+      const target = { pid: row.proc.pid, ...(row.matchedStep ? { toolCallId: row.matchedStep.call.toolCallId } : {}) };
+      if (ctx.onInspectLiveTask) ctx.onInspectLiveTask(target);
+      else ctx.onOpenPanel({ kind: 'task-inspect', ...target });
+      return;
+    }
+    const target = { toolCallId: row.step.call.toolCallId, ...(row.matchedProc ? { pid: row.matchedProc.pid } : {}) };
+    if (ctx.onInspectLiveTask) ctx.onInspectLiveTask(target);
+    else ctx.onOpenPanel({ kind: 'task-inspect', ...target });
   };
 
-  const items: PickerItem[] = filtered.map(step => {
-    const summary = summarizeToolCall(step.call, ctx.options.cwd);
-    const isRunning = step.call.status === 'in_progress' || step.call.status === 'pending';
-    const elapsedMs = isRunning && step.startedAt !== undefined
-      ? Math.max(0, now - step.startedAt)
-      : step.startedAt !== undefined && step.endedAt !== undefined
-        ? Math.max(0, step.endedAt - step.startedAt)
+  const selectedProc = highlighted
+    ? (highlighted.kind === 'proc' ? highlighted.proc : highlighted.matchedProc)
+    : undefined;
+
+  const requestKillSelected = (proc: LiveProcessInfo | undefined): void => {
+    if (!proc || !ctx.onKillProcess) return;
+    ctx.onOpenPanel({
+      kind: 'confirm',
+      title: `Kill child process PID ${proc.pid}?`,
+      detail: `Sends SIGTERM to "${proc.summary}" (elapsed ${proc.elapsed}).`,
+      actionLabel: 'Kill process',
+      returnTo: { kind: 'tasks' },
+      onConfirm: () => ctx.onKillProcess?.(proc, false),
+    });
+  };
+
+  const items: PickerItem[] = combinedRows.map(row => {
+    if (row.kind === 'proc') {
+      return {
+        id: row.id,
+        label: row.proc.summary,
+        detail: `PID ${row.proc.pid} · elapsed ${row.proc.elapsed} · stat ${row.proc.stat}`,
+        badges: [
+          { text: `LIVE PID ${row.proc.pid}`, tone: 'accent' as const },
+          ...(row.matchedStep ? [{ text: 'Output linked', tone: 'info' as const }] : []),
+        ],
+        node: 'pv',
+      };
+    }
+    const elapsedMs = row.isRunning && row.step.startedAt !== undefined
+      ? Math.max(0, now - row.step.startedAt)
+      : row.step.startedAt !== undefined && row.step.endedAt !== undefined
+        ? Math.max(0, row.step.endedAt - row.step.startedAt)
         : undefined;
     const elapsedLabel = elapsedMs !== undefined ? `${(elapsedMs / 1000).toFixed(1)}s` : '';
     return {
-      id: step.id,
-      label: summary.title,
-      detail: [summary.target, elapsedLabel].filter(Boolean).join(' · ') || step.call.toolCallId,
+      id: row.id,
+      label: row.summary.title,
+      detail: [row.summary.target, elapsedLabel, row.matchedProc ? `PID ${row.matchedProc.pid}` : undefined].filter(Boolean).join(' · ') || row.step.call.toolCallId,
       badges: [
         {
-          text: isRunning ? 'Running' : step.call.status === 'failed' ? 'Failed' : 'Done',
-          tone: isRunning ? 'accent' : step.call.status === 'failed' ? 'error' : 'success',
+          text: row.isRunning ? 'Running' : row.step.call.status === 'failed' ? 'Failed' : 'Done',
+          tone: row.isRunning ? 'accent' as const : row.step.call.status === 'failed' ? 'error' as const : 'success' as const,
         },
-        ...(summary.exit !== undefined ? [{ text: `exit ${summary.exit}`, tone: summary.exit === 0 ? ('neutral' as const) : ('error' as const) }] : []),
+        ...(row.matchedProc ? [{ text: `PID ${row.matchedProc.pid}`, tone: 'info' as const }] : []),
+        ...(row.summary.exit !== undefined ? [{ text: `exit ${row.summary.exit}`, tone: row.summary.exit === 0 ? ('neutral' as const) : ('error' as const) }] : []),
       ],
       node: 'pv',
     };
   });
 
-  return <picker key="picker" size={ctx.rLayout.panelSize} title="Tasks & tool activity" icon="timer"
-    subtitle={ctx.busy || runningCount ? `${runningCount} active tool(s) in current turn · Stop cancels the active ACP turn` : `${allTools.length} tool call(s) recorded in this session`}
-    placeholder="Filter tasks by tool, command, or path..."
+  const liveTabCount = procRows.length + runningTools.filter(step => !matchedProcToolIds.has(step.id)).length;
+  const pvStep = highlighted?.kind === 'tool' ? highlighted.step : highlighted?.matchedStep;
+  const pvSummary = pvStep ? summarizeToolCall(pvStep.call, ctx.options.cwd) : undefined;
+
+  return <picker key="picker" size={ctx.rLayout.panelSize} title="Tasks & live processes" icon="timer"
+    subtitle={liveProcs.length || runningTools.length
+      ? `${liveProcs.length} live child process(es) · ${runningTools.length} active tool(s) · Enter views live output`
+      : `${allTools.length} tool call(s) recorded in this session`}
+    placeholder="Filter processes, commands, or tool steps..."
     query={ctx.panelDraft.text} cursor={ctx.panelDraft.cursor} onEdit={ctx.onEditPanelDraft}
     tabs={[
-      { id: 'all', label: 'All', count: allTools.length },
-      { id: 'running', label: 'Running', count: runningCount },
-      { id: 'done', label: 'Finished', count: allTools.length - runningCount },
+      { id: 'all', label: 'All', count: liveProcs.length + allTools.length },
+      { id: 'live', label: 'Live', count: liveTabCount },
+      { id: 'running', label: 'Running tools', count: runningTools.length },
+      { id: 'done', label: 'Finished', count: finishedCount },
     ]}
-    tab={ctx.pickerTab}
+    tab={tab}
     order={order}
     items={items} selected={selectedId}
     state="ready"
-    empty={ctx.pickerTab === 'running' ? 'No tool tasks are currently running.' : 'No tool activity recorded in this conversation yet.'}
+    empty={tab === 'live'
+      ? 'No live child processes or active tools running under this agy session.'
+      : tab === 'running'
+        ? 'No tool tasks are currently running.'
+        : 'No tool activity recorded in this conversation yet.'}
     preview={highlighted ? 'below' : 'none'}
     actions={[
-      ...(ctx.busy ? [{ id: 'stopTurn', label: ctx.cancelling ? 'Stopping...' : 'Stop active turn', keys: ['esc'], disabled: ctx.cancelling ? (true as const) : undefined }] : []),
+      { id: 'refresh', label: 'Refresh' },
+      ...(ctx.onKillProcess ? [{ id: 'kill', label: selectedProc ? `Kill PID ${selectedProc.pid}` : 'Kill process', disabled: !selectedProc ? (true as const) : undefined }] : []),
+      ...(ctx.busy ? [{ id: 'stopTurn', label: ctx.cancelling ? 'Stopping...' : 'Stop active turn', disabled: ctx.cancelling ? (true as const) : undefined }] : []),
       { id: 'close', label: 'Close', keys: ['esc'] },
-      { id: 'inspect', label: 'Inspect details', primary: true, keys: ['enter'], disabled: !highlighted ? (true as const) : undefined },
+      { id: 'inspect', label: 'Live output', primary: true, keys: ['enter'], disabled: !highlighted ? (true as const) : undefined },
     ]}
     onSelect={event => ctx.onSetPickerSelected(event.item)}
-    onActivate={() => { if (highlighted) inspectTaskStep(highlighted); }}
+    onActivate={() => openLiveOutput(highlighted)}
     onAction={{
       close: ctx.onClosePanel,
       tab: event => {
         if (typeof event.value === 'string') ctx.onSetPickerTab(event.value, false);
       },
+      refresh: () => ctx.onRefreshLiveProcesses?.(),
+      kill: () => requestKillSelected(selectedProc),
       stopTurn: ctx.onStopTurn,
-      inspect: () => { if (highlighted) inspectTaskStep(highlighted); },
+      inspect: () => openLiveOutput(highlighted),
     }}>
-    {highlighted && highlightedSummary && <ToolBody call={highlighted.call} cwd={ctx.options.cwd} showRawInput={highlightedSummary.showRawInput}
-      fullCommand={highlightedSummary.fullCommand} diffMode={ctx.userPrefs.diffMode}
-      pathExists={ctx.pathExists} getBlob={ctx.blobForImage} onInspect={ctx.onOpenInspect} onOpenSplit={ctx.onOpenSplit}
-      onCopy={ctx.onCopy} />}
+    {highlighted && <col key="pv" gap="xs">
+      {selectedProc && <kv items={[
+        { k: 'Process', v: `PID ${selectedProc.pid} (PPID ${selectedProc.ppid}) · ${selectedProc.stat} · ${selectedProc.elapsed}` },
+        { k: 'Command', v: selectedProc.commandLine },
+      ]} />}
+      {pvStep && pvSummary && <ToolBody call={pvStep.call} cwd={ctx.options.cwd} showRawInput={pvSummary.showRawInput}
+        fullCommand={pvSummary.fullCommand} diffMode={ctx.userPrefs.diffMode}
+        pathExists={ctx.pathExists} getBlob={ctx.blobForImage} onInspect={ctx.onOpenInspect} onOpenSplit={ctx.onOpenSplit}
+        onCopy={ctx.onCopy} />}
+    </col>}
   </picker>;
+}
+
+function renderTaskInspectOverlay(
+  ctx: PanelRenderContext,
+  p: Extract<Panel, { kind: 'task-inspect' }>,
+): JSX.Element {
+  const tools = ctx.entries.filter((entry): entry is ToolStep => entry.type === 'tool');
+  const liveProcs = ctx.liveProcesses ?? [];
+  const liveProcByPid = p.pid !== undefined ? liveProcs.find(item => item.pid === p.pid) : undefined;
+  const step = p.toolCallId
+    ? tools.find(entry => entry.call.toolCallId === p.toolCallId)
+    : (liveProcByPid ? matchLiveProcessToToolStep(liveProcByPid, tools, ctx.options.cwd) : undefined);
+  const liveProc = liveProcByPid ?? (step ? matchToolStepToLiveProcess(step, liveProcs, ctx.options.cwd) : undefined);
+
+  const stepRunning = !!step && (step.call.status === 'in_progress' || step.call.status === 'pending');
+  const isLive = !!liveProc || stepRunning;
+  const summary = step ? summarizeToolCall(step.call, ctx.options.cwd, { includeDiffStats: false }) : undefined;
+  const title = summary?.title ?? liveProc?.summary ?? 'Live task output';
+  const liveOutputText = step
+    ? (extractToolLiveOutput(step) ?? '')
+    : '';
+  const detailText = step
+    ? buildTaskDetailText(step, ctx.options.cwd, liveProc)
+    : liveProc
+      ? `PID: ${liveProc.pid}\nPPID: ${liveProc.ppid}\nState: ${liveProc.stat}\nElapsed: ${liveProc.elapsed}\nCommand:\n${liveProc.commandLine}`
+      : 'This task or process is no longer active.';
+
+  return <overlay key="panel" head={title} modal size={ctx.rLayout.inspectSize}
+    icon="timer"
+    meta={liveProc
+      ? `LIVE PID ${liveProc.pid} · ${liveProc.elapsed}`
+      : stepRunning
+        ? 'Running · Live output'
+        : step?.call.status ?? 'Finished'}
+    end={<button keys={['esc']} variant="quiet" onClick={() => ctx.onOpenPanel({ kind: 'tasks' })}>Back</button>}
+    foot={<row gap="xs" justify="between" align="center" wrap>
+      <text><span s="muted">Up/Down/PgUp/PgDn scroll · c copy · k kill process · Esc back to /tasks</span></text>
+      <row gap="xs">
+        {ctx.onRefreshLiveProcesses && <button size="sm" variant="quiet" onClick={ctx.onRefreshLiveProcesses}>Refresh</button>}
+        <button size="sm" variant="quiet" icon="copy" onClick={() => ctx.onCopy(liveOutputText || detailText)}>Copy output</button>
+        {liveProc && ctx.onKillProcess && <>
+          <button size="sm" variant="danger" icon="stop" onClick={() => ctx.onOpenPanel({
+            kind: 'confirm',
+            title: `Kill child process PID ${liveProc.pid}?`,
+            detail: `Sends SIGTERM to "${liveProc.summary}".`,
+            actionLabel: 'Kill process',
+            returnTo: p,
+            onConfirm: () => ctx.onKillProcess?.(liveProc, false),
+          })}>Kill PID {liveProc.pid}</button>
+          <button size="sm" variant="danger" onClick={() => ctx.onKillProcess?.(liveProc, true)}>Force SIGKILL</button>
+        </>}
+        {!liveProc && ctx.busy && <button size="sm" variant="danger" icon="stop" disabled={ctx.cancelling && 'Stopping'} onClick={ctx.onStopTurn}>
+          {ctx.cancelling ? 'Stopping...' : 'Stop turn'}
+        </button>}
+      </row>
+    </row>}>
+    <scroll key="inspect-scroll" bar="always" stick={isLive ? 'end' : undefined} max={{ h: ctx.rLayout.inspectBodyMaxH }}>
+      <col gap="sm">
+        <kv items={[
+          ...(summary?.target ? [{ k: 'Command / Target', v: summary.fullCommand ?? summary.target }] : []),
+          ...(liveProc ? [{ k: 'Live process', v: `PID ${liveProc.pid} (stat ${liveProc.stat}, elapsed ${liveProc.elapsed})` }] : []),
+          ...(step ? [{ k: 'ACP status', v: step.call.status ?? 'unknown' }] : []),
+        ]} />
+        {isLive && <row gap="xs" align="center">
+          <spinner style="starburst" />
+          <text><span s="accent">{liveOutputText ? 'Streaming live output...' : 'Process running; waiting for output chunks...'}</span></text>
+        </row>}
+        {liveOutputText
+          ? <code wrap>{liveOutputText}</code>
+          : <code wrap>{detailText}</code>}
+      </col>
+    </scroll>
+  </overlay>;
 }
 
 function renderFollowUpOverlay(
@@ -1779,6 +1947,7 @@ export function renderActivePanel(ctx: PanelRenderContext): JSX.Element {
   if (currentPanel.kind === 'turns') return renderTurnsPicker(ctx);
   if (currentPanel.kind === 'queue') return renderQueuePicker(ctx);
   if (currentPanel.kind === 'tasks') return renderTasksPicker(ctx);
+  if (currentPanel.kind === 'task-inspect') return renderTaskInspectOverlay(ctx, currentPanel);
   if (currentPanel.kind === 'inspect') return renderInspectOverlay(ctx, currentPanel);
 
   const mode = ctx.modeOption;

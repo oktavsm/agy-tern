@@ -488,6 +488,47 @@ describe('panel renderers & transcript view helpers', () => {
     expect(queueJson).toContain('Prompt queue');
     expect(queueJson).toContain('Follow up test');
 
+    const tasksCtx = baseContext({ kind: 'tasks' });
+    tasksCtx.pickerTab = 'live';
+    tasksCtx.onKillProcess = () => {};
+    tasksCtx.liveProcesses = [{
+      pid: 4123,
+      ppid: 500,
+      pgid: 4123,
+      stat: 'S+',
+      elapsed: '00:18',
+      commandLine: 'npm run dev',
+      summary: 'npm run dev',
+    }];
+    tasksCtx.entries = [{
+      type: 'tool',
+      id: 'entry-dev',
+      startedAt: Date.now() - 5_000,
+      call: {
+        toolCallId: 'c-dev',
+        kind: 'execute',
+        name: 'run_command',
+        title: 'npm run dev',
+        status: 'in_progress',
+        rawInput: { CommandLine: 'npm run dev' },
+        rawOutput: { stdout: 'ready in 240 ms' },
+      },
+    }];
+    const tasksJson = JSON.stringify(renderActivePanel(tasksCtx));
+    expect(tasksJson).toContain('LIVE PID 4123');
+    expect(tasksJson).toContain('Kill PID 4123');
+    expect(tasksJson).toContain('Live output');
+
+    const liveInspectCtx = baseContext({ kind: 'task-inspect', toolCallId: 'c-dev', pid: 4123 });
+    liveInspectCtx.entries = tasksCtx.entries;
+    liveInspectCtx.liveProcesses = tasksCtx.liveProcesses;
+    liveInspectCtx.onKillProcess = () => {};
+    const liveInspectJson = JSON.stringify(renderActivePanel(liveInspectCtx));
+    expect(liveInspectJson).toContain('ready in 240 ms');
+    expect(liveInspectJson).toContain('Kill PID 4123');
+    expect(liveInspectJson).toContain('Force SIGKILL');
+    expect(liveInspectJson).toContain('"stick":"end"');
+
     const keysJson = JSON.stringify(renderActivePanel(baseContext({ kind: 'keys' })));
     expect(keysJson).toContain('Keyboard shortcuts');
     expect(keysJson).toContain('Ctrl+Tab');

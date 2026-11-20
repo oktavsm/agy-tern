@@ -20,7 +20,7 @@ const LOCAL: readonly Command[] = [
   { name: 'switch-account', local: 'switch-account', description: 'Confirm logout and switch account via official login' },
   { name: 'login', local: 'login', description: 'Open official sign-in options, including while disconnected' },
   { name: 'changes', local: 'changes', description: 'Review session file edits and git working tree status' },
-  { name: 'tasks', local: 'tasks', description: 'Inspect running tools and cancel active turn tasks' },
+  { name: 'tasks', local: 'tasks', description: 'Inspect live child processes, view live command output, or kill running tasks' },
   { name: 'paste-image', local: 'paste-image', description: 'Attach a screenshot or image directly from system clipboard' },
   { name: 'find', local: 'find', description: 'Search messages, tools, thoughts, and diffs in this conversation', hint: 'query' },
   { name: 'turns', local: 'turns', description: 'Browse conversation turns, jump to any prompt, or view pinned turns', hint: 'query' },

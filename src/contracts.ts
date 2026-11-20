@@ -72,6 +72,7 @@ export interface AgentEvents {
 }
 
 export interface AgentSession {
+  readonly pid?: number;
   readonly sessionId: string;
   readonly metadata: AgentMetadata;
   readonly authentication: AgentAuthentication;

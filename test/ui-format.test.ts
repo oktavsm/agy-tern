@@ -9,7 +9,9 @@ import {
   extractMarkdownImagePaths,
   extractToolImagePaths,
   extractToolInlineImages,
+  extractToolLiveOutput,
   extractToolOutputText,
+  buildTaskDetailText,
   formatCompactTokens,
   formatContextUsage,
   formatPathLabel,
@@ -369,5 +371,30 @@ describe('ui formatting helpers', () => {
     expect(summarizeThoughtTopic('')).toBeUndefined();
     expect(summarizeThoughtTopic('**Inspecting settings**\nReading nav rows\n**Updating controls**\nWriting edits')).toBe('Updating controls');
     expect(summarizeThoughtTopic('- First check `src/ui.tsx` for **inline** styles')).toBe('First check src/ui.tsx for inline styles');
+
+    const liveStep = {
+      type: 'tool' as const,
+      id: 't-live',
+      startedAt: 1_000,
+      call: {
+        toolCallId: 'c-dev',
+        kind: 'execute' as const,
+        name: 'run_command',
+        title: 'npm run dev',
+        status: 'in_progress' as const,
+        rawInput: { CommandLine: 'npm run dev' },
+        content: [{ type: 'content' as const, content: { type: 'text' as const, text: 'VITE v6.0 ready' } }],
+        rawOutput: { output: 'VITE v6.0 ready\nLocal: http://localhost:5173' },
+      },
+    };
+    expect(extractToolLiveOutput(liveStep)).toBe('VITE v6.0 ready\nLocal: http://localhost:5173');
+    const detail = buildTaskDetailText(liveStep, cwd, {
+      pid: 4123,
+      stat: 'S+',
+      elapsed: '00:12',
+      commandLine: 'npm run dev',
+    });
+    expect(detail).toContain('PID 4123');
+    expect(detail).toContain('http://localhost:5173');
   });
 });

@@ -89,6 +89,13 @@ import {
   type WorkspaceEntry,
 } from './files';
 import { AttachmentSizeCache, computeDraftContextBudget, formatCompactTokens } from './context-budget';
+import {
+  killLiveChildProcess,
+  listLiveChildProcesses,
+  matchLiveProcessToToolStep,
+  matchToolStepToLiveProcess,
+  type LiveProcessInfo,
+} from './task-monitor';
 import { buildTurnOutline, filterTurnOutline } from './turn-outline';
 import { cycleOpenSessionTab, recordOpenSessionTab, removeOpenSessionTab } from './ui-session-helpers';
 import {
@@ -101,6 +108,7 @@ import {
   detectGitBranch,
   extractToolImagePaths,
   extractToolInlineImages,
+  extractToolLiveOutput,
   formatContextUsage,
   formatPathLabel,
   formatPlanSummary,
@@ -435,6 +443,8 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
   let ignoredPathsSet = new Set<string>();
   let gitChanges: GitStatusEntry[] = [];
   let gitMutationBusy = false;
+  let liveProcesses: LiveProcessInfo[] = [];
+  let taskPollTimer: NodeJS.Timeout | undefined;
   let openSessionTabs: string[] = [];
   const attachmentSizes = new AttachmentSizeCache(() => { if (!quitting) render(); });
   const gitDiffCache = new Map<string, { status: 'loading' | 'ready'; hunks: DiffHunk[]; error?: string }>();
@@ -807,6 +817,8 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     quitting = true;
     clearTimeout(toastTimer);
     toastTimer = undefined;
+    clearInterval(taskPollTimer);
+    taskPollTimer = undefined;
     replayCoordinator.dispose();
     renderController?.dispose();
     pathPresenceCache.clear();
@@ -1176,6 +1188,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
 
   function parentPanel(current: Panel): Panel | undefined {
     if (current.kind === 'inspect') return inspectReturnPanel;
+    if (current.kind === 'task-inspect') return { kind: 'tasks' };
     if (current.kind === 'confirm') return current.returnTo;
     if (current.kind === 'template-save') return { kind: 'templates' };
     if (current.kind === 'mcp-add') return { kind: 'mcp' };
@@ -1202,6 +1215,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     prefsFocus = undefined;
     panel = undefined;
     panelError = '';
+    syncTaskPolling(undefined);
     sessionSearchToken++;
     sessionIndexing = undefined;
     gitDiffCache.clear();
@@ -1772,6 +1786,50 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     });
   }
 
+  function refreshLiveProcesses(): void {
+    const pid = agent?.pid;
+    if (!pid || quitting) {
+      if (liveProcesses.length) { liveProcesses = []; render(); }
+      return;
+    }
+    void listLiveChildProcesses(pid).then(procs => {
+      if (quitting) return;
+      liveProcesses = procs;
+      if (panel?.kind === 'tasks' || panel?.kind === 'task-inspect') render();
+    }).catch(() => {});
+  }
+
+  function syncTaskPolling(activePanel: Panel | undefined): void {
+    const shouldPoll = activePanel?.kind === 'tasks' || activePanel?.kind === 'task-inspect';
+    if (!shouldPoll) {
+      clearInterval(taskPollTimer);
+      taskPollTimer = undefined;
+      return;
+    }
+    if (taskPollTimer) return;
+    taskPollTimer = setInterval(() => {
+      if (quitting || !panel || (panel.kind !== 'tasks' && panel.kind !== 'task-inspect')) {
+        clearInterval(taskPollTimer);
+        taskPollTimer = undefined;
+        return;
+      }
+      refreshLiveProcesses();
+    }, 1_000);
+  }
+
+  function killTaskProcess(proc: LiveProcessInfo, force = false): void {
+    if (quitting) return;
+    void killLiveChildProcess(agent?.pid, proc.pid, force ? 'SIGKILL' : 'SIGTERM')
+      .then(() => {
+        if (quitting) return;
+        showToast(force ? `Killed PID ${proc.pid} (SIGKILL)` : `Sent SIGTERM to PID ${proc.pid}`, proc.summary);
+        setTimeout(() => { if (!quitting) refreshLiveProcesses(); }, 120);
+      })
+      .catch(err => {
+        if (!quitting) showToast(`Could not kill PID ${proc.pid}`, err instanceof Error ? err.message : String(err));
+      });
+  }
+
   function jumpToTurnEntry(entryId: string, turnNumber: number): void {
     const activeConv = stateManager.getConversation();
     const activeSt = stateManager.getActive();
@@ -1882,7 +1940,9 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     if (next.kind === 'report') usageTab = 'overview';
     if (next.kind === 'changes') pickerTab = 'edits';
     if (next.kind === 'sessions') pickerTab = 'workspace';
+    if (next.kind === 'tasks') pickerTab = liveProcesses.length || activeToolSteps().length ? 'live' : 'all';
     if (next.kind !== 'inspect') inspectReturnPanel = undefined;
+    syncTaskPolling(next);
     if (next.kind === 'config') {
       const option = metadata.configOptions.find(candidate => candidate.id === next.id);
       if (option && option.type === 'select') pickerSelected = option.currentValue;
@@ -1904,6 +1964,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       : followUpFocus;
     surface?.focus(targetFocus);
     if (next.kind === 'report') loadReport(next.report);
+    if (next.kind === 'tasks' || next.kind === 'task-inspect') refreshLiveProcesses();
     if (next.kind === 'mcp' || next.kind === 'plugins' || next.kind === 'agents') loadExtensions(next.kind);
     if (next.kind === 'templates') loadTemplates();
     if (next.kind === 'sessions' && agent?.capabilities.listSessions) {
@@ -2567,9 +2628,12 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
   }
 
   function inspectTaskStep(step: ToolStep): void {
-    const s = summarizeToolCall(step.call, options.cwd);
-    const detailText = buildTaskDetailText(step, options.cwd);
-    openInspect(s.title, { type: 'file', path: 'task.log', content: detailText }, s.target);
+    const matched = matchToolStepToLiveProcess(step, liveProcesses, options.cwd);
+    openPanel({
+      kind: 'task-inspect',
+      toolCallId: step.call.toolCallId,
+      ...(matched ? { pid: matched.pid } : {}),
+    });
   }
 
   function renderPanel(): JSX.Element | null {
@@ -2788,6 +2852,10 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       onStageGitPath: filePath => mutateGitPath('stage', filePath),
       onUnstageGitPath: filePath => mutateGitPath('unstage', filePath),
       onDiscardGitPath: (filePath, status) => mutateGitPath('discard', filePath, status),
+      liveProcesses,
+      onRefreshLiveProcesses: refreshLiveProcesses,
+      onKillProcess: killTaskProcess,
+      onInspectLiveTask: target => openPanel({ kind: 'task-inspect', ...target }),
     });
   }
 
@@ -3844,20 +3912,53 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       }
       if (panel && !permissions.length) {
         const current = panel;
+        const scrollInspectByKey = (keyName: string): boolean => {
+          const action = keyName === 'up' ? 'line-up'
+            : keyName === 'down' ? 'line-down'
+            : keyName === 'page_up' ? 'page-up'
+            : keyName === 'page_down' ? 'page-down'
+            : keyName === 'home' ? 'start'
+            : keyName === 'end' ? 'end'
+            : undefined;
+          if (!action || !surface) return false;
+          surface.scroll('layer.panel.inspect-scroll', action);
+          return true;
+        };
+        if (current.kind === 'task-inspect') {
+          if (scrollInspectByKey(key.name)) continue;
+          const tools = stateManager.getConversation().entries.filter((entry): entry is ToolStep => entry.type === 'tool');
+          const proc = current.pid !== undefined ? liveProcesses.find(item => item.pid === current.pid) : undefined;
+          const step = current.toolCallId
+            ? tools.find(entry => entry.call.toolCallId === current.toolCallId)
+            : (proc ? matchLiveProcessToToolStep(proc, tools, options.cwd) : undefined);
+          const resolvedProc = proc ?? (step ? matchToolStepToLiveProcess(step, liveProcesses, options.cwd) : undefined);
+          if (!key.ctrl && !key.meta && !key.alt && key.name === 'c') {
+            const copyText = (step && extractToolLiveOutput(step)) ||
+              (step && buildTaskDetailText(step, options.cwd, resolvedProc)) ||
+              resolvedProc?.commandLine;
+            if (copyText) {
+              void copyToClipboard(copyText).then(copied => {
+                if (!quitting) showToast(copied ? 'Copied to clipboard' : 'Clipboard utility unavailable', copied ? undefined : 'Install wl-copy or xclip to copy');
+              });
+            }
+          } else if (!key.ctrl && !key.meta && !key.alt && key.name === 'k' && resolvedProc) {
+            openPanel({
+              kind: 'confirm',
+              title: `Kill child process PID ${resolvedProc.pid}?`,
+              detail: `Sends SIGTERM to "${resolvedProc.summary}".`,
+              actionLabel: 'Kill process',
+              returnTo: current,
+              onConfirm: () => killTaskProcess(resolvedProc, false),
+            });
+          } else if (!key.ctrl && !key.meta && !key.alt && key.name === 'r') {
+            refreshLiveProcesses();
+          }
+          continue;
+        }
         if (current.kind === 'inspect') {
           const item = current.item;
-          if (key.name === 'up') {
-            surface.scroll('layer.panel.inspect-scroll', 'line-up');
-          } else if (key.name === 'down') {
-            surface.scroll('layer.panel.inspect-scroll', 'line-down');
-          } else if (key.name === 'page_up') {
-            surface.scroll('layer.panel.inspect-scroll', 'page-up');
-          } else if (key.name === 'page_down') {
-            surface.scroll('layer.panel.inspect-scroll', 'page-down');
-          } else if (key.name === 'home') {
-            surface.scroll('layer.panel.inspect-scroll', 'start');
-          } else if (key.name === 'end') {
-            surface.scroll('layer.panel.inspect-scroll', 'end');
+          if (scrollInspectByKey(key.name)) {
+            // handled by shared helper
           } else if (!key.ctrl && !key.meta && !key.alt && key.name === 'c') {
             const copyText = item.type === 'file' ? item.content
               : item.type === 'diff' ? item.hunks.flatMap(h => h.lines).join('\n')
@@ -4147,22 +4248,40 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
             };
           } else if (current.kind === 'tasks') {
             const needle = panelDraft.text.trim().toLowerCase();
-            const allTools = stateManager.getConversation().entries
+            const allToolsRaw = stateManager.getConversation().entries
               .filter((entry): entry is ToolStep => entry.type === 'tool')
               .slice()
-              .reverse()
-              .filter(step => {
-                const isRunning = step.call.status === 'in_progress' || step.call.status === 'pending';
-                if (pickerTab === 'running' && !isRunning) return false;
-                if (pickerTab === 'done' && isRunning) return false;
-                if (!needle) return true;
-                const summary = summarizeToolCall(step.call, options.cwd);
-                return `${summary.title} ${summary.target ?? ''} ${step.call.toolCallId}`.toLowerCase().includes(needle);
-              });
-            tabIds = ['all', 'running', 'done'];
-            visibleIds = allTools.map(s => s.id);
+              .reverse();
+            const matchedProcs = liveProcesses.filter(proc =>
+              !needle || `pid ${proc.pid} ${proc.summary} ${proc.commandLine} ${proc.stat}`.toLowerCase().includes(needle));
+            const matchedToolIds = new Set(matchedProcs.flatMap(proc => {
+              const linked = matchLiveProcessToToolStep(proc, allToolsRaw, options.cwd);
+              return linked ? [linked.id] : [];
+            }));
+            const filteredTools = allToolsRaw.filter(step => {
+              const isRunning = step.call.status === 'in_progress' || step.call.status === 'pending';
+              if (pickerTab === 'live' && (!isRunning || matchedToolIds.has(step.id))) return false;
+              if (pickerTab === 'running' && !isRunning) return false;
+              if (pickerTab === 'done' && isRunning) return false;
+              if (!needle) return true;
+              const summary = summarizeToolCall(step.call, options.cwd);
+              return `${summary.title} ${summary.target ?? ''} ${step.call.toolCallId}`.toLowerCase().includes(needle);
+            });
+            tabIds = ['all', 'live', 'running', 'done'];
+            const useProcs = pickerTab === 'all' || pickerTab === 'live';
+            visibleIds = [
+              ...(useProcs ? matchedProcs.map(proc => `proc:${proc.pid}`) : []),
+              ...filteredTools.map(s => s.id),
+            ];
             activate = chosenId => {
-              const step = allTools.find(s => s.id === chosenId);
+              if (chosenId.startsWith('proc:')) {
+                const pid = Number(chosenId.slice(5));
+                const proc = liveProcesses.find(item => item.pid === pid);
+                const linked = proc ? matchLiveProcessToToolStep(proc, allToolsRaw, options.cwd) : undefined;
+                openPanel({ kind: 'task-inspect', pid, ...(linked ? { toolCallId: linked.call.toolCallId } : {}) });
+                return;
+              }
+              const step = allToolsRaw.find(s => s.id === chosenId);
               if (step) inspectTaskStep(step);
             };
           } else if (current.kind === 'changes') {
