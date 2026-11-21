@@ -13,6 +13,7 @@ import {
   extractToolOutputText,
   buildTaskDetailText,
   formatCompactTokens,
+  formatCompactWorkspacePath,
   formatContextUsage,
   formatPathLabel,
   formatPlanSummary,
@@ -338,7 +339,7 @@ describe('ui formatting helpers', () => {
     expect(wide.panelSize).toBe('lg');
     expect(wide.proseMaxW).toBe('116ch');
     expect(wide.showKeyLegend).toBe(true);
-    expect(wide.scrollMaxH).toBe('44lines');
+    expect(wide.scrollMaxH).toBe('43lines');
 
     const smallSplit = computeResponsiveLayout(58, 16, {
       userComposerLines: 10,
@@ -413,5 +414,9 @@ describe('ui formatting helpers', () => {
     const soonest = selectSoonestQuotaReset(summary, nowMs);
     expect(soonest.row.limit).toBe('Five Hour');
     expect(soonest.countdown).toBe('in 4h 40m');
+
+    expect(formatCompactWorkspacePath('/home/me/Code/repo', 30, '/home/me')).toBe('~/Code/repo');
+    expect(formatCompactWorkspacePath('/home/me/Code/github.com/org/very-long-repo-name', 28, '/home/me'))
+      .toContain('very-long-repo-name');
   });
 });

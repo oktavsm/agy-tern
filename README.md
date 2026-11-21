@@ -120,7 +120,7 @@ agy-tern --doctor                                 # Verify agy, tern, Bun, and c
 - **Clickable Tasks & Media**: Click any file-read task in the transcript to inspect the file in a centered modal; use inline pill actions (`Open file`, `Inspect`, `Inspect diff`, `Split`, `Copy`) on any tool step; paste screenshots with `Alt+V` or `/paste-image`.
 - **Interactive Follow-Up Questions**: ACP `elicitation/create` prompts and `ask_question` follow-ups open in a centered interactive modal supporting single-select, multi-select, text/number/boolean inputs, and URL prompts.
 - **Cross-Workspace Sessions & Chat Search (`/sessions`)**: Switch between **`This folder`**, **`All workspaces`** (sessions from any folder reported by `agy`, showing each session's origin workspace), and **`Local named`**. Search matches **titles, local labels, folder names, session IDs, and cached chat message content** (`Chat match`).
-- **Usage & Account Details (`/usage`, `/account`)**: View quota meters and reset timers alongside ACP context token metrics and the **`Details`** tab (tier, auth boundary, sign-in method, active session runtime, model/thinking/mode, capabilities, and remaining context tokens).
+- **Usage & Account Details (`/usage`, `/account`)**: View quota meters, reset countdowns, daily **Antigravity usage activity heatmap**, ACP context token metrics, and the **`Details`** tab (tier, auth boundary, sign-in method, active session runtime, model/thinking/mode, capabilities, and remaining context tokens).
 - **One-Time Safety Approvals**: Tool permission requests show diffs and commands inline. Use `Tab`, `Ctrl+Y` (allow once), and `Ctrl+N` (deny); `Enter` never approves a tool call.
 
 <details>
@@ -217,7 +217,7 @@ bun run dist/cli.js --doctor
 Core module map:
 - `src/contracts.ts`, `src/agent.ts`, `src/auth.ts`, `src/reports.ts`: Official ACP stdio boundary, login lifecycle, and CLI reports.
 - `src/model.ts`, `src/history.ts`, `src/session-state.ts`, `src/draft.ts`, `src/files.ts`, `src/prefs.ts`, `src/session-names.ts`, `src/templates.ts`: Transcript hydration, local XDG stores, composer input, and `@file` indexing.
-- `src/cli-args.ts`, `src/cli.tsx`, `src/updater.ts`, `src/commands.ts`, `src/extensions.ts`, `src/git-history.ts`, `src/task-monitor.ts`, `src/tern-window.ts`: CLI flag parsing, `update` & passive check, extension managers, commit heatmap builder, live child process monitor, `tern open` splits, and OSC 9 attention alerts.
+- `src/cli-args.ts`, `src/cli.tsx`, `src/updater.ts`, `src/commands.ts`, `src/extensions.ts`, `src/heatmap.ts`, `src/usage-heatmap.ts`, `src/git-history.ts`, `src/task-monitor.ts`, `src/tern-window.ts`: CLI flag parsing, `update` & passive check, extension managers, shared calendar heatmap grid, Antigravity usage activity & commit heatmap builders, live child process monitor, `tern open` splits, and OSC 9 attention alerts.
 - `src/tern-render.ts`, `src/ui-format.ts`, `src/context-budget.ts`, `src/turn-outline.ts`, `src/ui-session-helpers.ts`, `src/picker-nav.ts`, `src/transcript-view.tsx`, `src/panels.tsx`, `src/ui.tsx`: Adaptive Tern render controller, pre-send context estimator, turn outline, modal pickers, inspector overlays, composer card, and keyboard/pointer orchestration.
 
 ---

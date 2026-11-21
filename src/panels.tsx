@@ -52,6 +52,7 @@ import {
   type LiveProcessInfo,
 } from './task-monitor';
 import type { CommitEntry, CommitHeatmapGrid } from './git-history';
+import type { UsageHeatmapData } from './usage-heatmap';
 import {
   filterAgentsList,
   filterCommandsForTab,
@@ -248,6 +249,8 @@ export interface PanelRenderContext {
   gitBranch?: string;
   onRefreshCommits?(): void;
   onInspectCommit?(commit: CommitEntry): void;
+  usageHeatmap?: UsageHeatmapData;
+  usageHeatmapLoading?: boolean;
 }
 
 function renderPrefsPanel(ctx: PanelRenderContext): JSX.Element {
@@ -2114,6 +2117,20 @@ export function renderActivePanel(ctx: PanelRenderContext): JSX.Element {
               ]} />;
             })()}
             {quotaSummary ? renderQuotaTable(quotaSummary, 'quota') : ctx.reportText && <md>{ctx.reportText}</md>}
+            {(ctx.usageHeatmapLoading || ctx.usageHeatmap) && <section head="Antigravity usage activity">
+              {ctx.usageHeatmapLoading && !ctx.usageHeatmap && <spinner label="Scanning Antigravity session activity" />}
+              {ctx.usageHeatmap && <col gap="xs">
+                <chart kind="heatmap" size="md" token="accent"
+                  rows={ctx.usageHeatmap.rows}
+                  cols={ctx.usageHeatmap.cols}
+                  cells={ctx.usageHeatmap.cells}
+                  tips={ctx.usageHeatmap.tips}
+                  summary={`${ctx.usageHeatmap.totalTurns} prompts across ${ctx.usageHeatmap.totalSessions} sessions in ${ctx.usageHeatmap.weeks} weeks`} />
+                <text><span s="muted">
+                  {`${ctx.usageHeatmap.totalTurns} prompt(s) · ${ctx.usageHeatmap.totalSessions} session(s) · ${ctx.usageHeatmap.activeDays} active day(s) · Streak ${ctx.usageHeatmap.currentStreak}d (best ${ctx.usageHeatmap.longestStreak}d)`}
+                </span></text>
+              </col>}
+            </section>}
           </>}
           {ctx.usageTab === 'details' && renderUsageDetails(ctx, quotaSummary, contextUsage)}
           {ctx.usageTab === 'raw' && (ctx.reportText

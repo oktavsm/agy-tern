@@ -419,10 +419,27 @@ describe('panel renderers & transcript view helpers', () => {
       'Gemini Models          Weekly Limit Remaining       64%   2026-11-26 15:24 WIB',
       'Gemini Models          Five Hour Limit Remaining    82%   2026-11-21 05:48 WIB',
     ].join('\n');
+    overviewCtx.usageHeatmap = {
+      weeks: 8,
+      totalCount: 12,
+      totalTurns: 12,
+      totalSessions: 3,
+      activeDays: 4,
+      maxDailyCount: 5,
+      currentStreak: 2,
+      longestStreak: 3,
+      rows: ['', 'Mon', '', 'Wed', '', 'Fri', ''],
+      cols: [{ at: 0, label: 'Oct' }, { at: 4, label: 'Nov' }],
+      cells: Array.from({ length: 7 }, (_, r) => Array.from({ length: 8 }, (__, c) => (r === 6 && c === 7 ? 5 : 0))),
+      tips: Array.from({ length: 7 }, (_, r) => Array.from({ length: 8 }, (__, c) => (r === 6 && c === 7 ? '5 prompts on 2026-11-21' : 'No agy activity'))),
+    };
     const overviewJson = JSON.stringify(renderActivePanel(overviewCtx));
     expect(overviewJson).toContain('Next reset');
     expect(overviewJson).toContain('2026-11-21 05:48 WIB');
     expect(overviewJson).toContain('Gemini Models');
+    expect(overviewJson).toContain('Antigravity usage activity');
+    expect(overviewJson).toContain('"kind":"heatmap"');
+    expect(overviewJson).toContain('12 prompt(s)');
   });
 
   test('/sessions picker surfaces loading state despite active session and supports All workspaces + chat match', () => {
@@ -549,8 +566,10 @@ describe('panel renderers & transcript view helpers', () => {
     commitsCtx.gitBranch = 'main';
     commitsCtx.commitHistory = {
       weeks: 8,
+      totalCount: 3,
       totalCommits: 3,
       activeDays: 2,
+      maxDailyCount: 2,
       maxDailyCommits: 2,
       currentStreak: 2,
       longestStreak: 2,

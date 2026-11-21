@@ -90,6 +90,7 @@ import {
 } from './files';
 import { AttachmentSizeCache, computeDraftContextBudget, formatCompactTokens } from './context-budget';
 import { readCommitHistory, readCommitPatch, type CommitEntry, type CommitHeatmapGrid } from './git-history';
+import { readAgyUsageActivity, type UsageHeatmapData } from './usage-heatmap';
 import {
   killLiveChildProcess,
   listLiveChildProcesses,
@@ -110,6 +111,7 @@ import {
   extractToolImagePaths,
   extractToolInlineImages,
   extractToolLiveOutput,
+  formatCompactWorkspacePath,
   formatContextUsage,
   formatPathLabel,
   formatPlanSummary,
@@ -446,6 +448,8 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
   let gitMutationBusy = false;
   let commitHistory: CommitHeatmapGrid | undefined;
   let commitHistoryLoading = false;
+  let usageHeatmap: UsageHeatmapData | undefined;
+  let usageHeatmapLoading = false;
   let liveProcesses: LiveProcessInfo[] = [];
   let taskPollTimer: NodeJS.Timeout | undefined;
   let openSessionTabs: string[] = [];
@@ -1251,6 +1255,24 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     reportLoading = true;
     reportText = '';
     panelError = '';
+    if (command === 'usage') {
+      usageHeatmapLoading = true;
+      const weeks = viewportCols() < 84 ? 12 : 16;
+      const sessionsSource = allListedSessions.length ? allListedSessions : listedSessions;
+      void readAgyUsageActivity({
+        listedSessions: sessionsSource,
+        activeEntries: stateManager.getConversation().entries,
+        activeSessionId: stateManager.activeSessionId,
+        weeks,
+      }).then(grid => {
+        if (!quitting && reportAbort === request) usageHeatmap = grid;
+      }).finally(() => {
+        if (!quitting && reportAbort === request) {
+          usageHeatmapLoading = false;
+          render();
+        }
+      });
+    }
     render();
     reportTask = readOfficialReport({ ...options, signal }, command, request.signal).then(text => {
       if (!request.signal.aborted) reportText = text;
@@ -2894,6 +2916,8 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       gitBranch,
       onRefreshCommits: loadCommitHistory,
       onInspectCommit: inspectCommit,
+      usageHeatmap,
+      usageHeatmapLoading,
     });
   }
 
@@ -3286,6 +3310,48 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
             })}
           </col>}
           <col key="composer" role="omp.editor" tone={busy ? 'pending' : undefined} gap="xs">
+            {rowsNow >= 16 && <row key="ctx" role="agy.composer.context" justify="between" align="center" gap="sm">
+              <button size="sm" variant="quiet" icon="folder"
+                disabled={(!!permission || authBusy) && 'Finish current prompt'}
+                title={`Working directory: ${options.cwd}${options.additionalDirectories?.length ? ` (+${options.additionalDirectories.length} --add-dir)` : ''}`}
+                hovercard={cachedHoverKv(
+                  'composer-cwd',
+                  `${options.cwd}|${gitBranch ?? ''}|${options.additionalDirectories?.join(',') ?? ''}`,
+                  () => [
+                    { k: 'Directory', v: options.cwd },
+                    ...(gitBranch ? [{ k: 'Git branch', v: gitBranch }] : []),
+                    ...(options.additionalDirectories?.length ? [{ k: 'Extra dirs', v: options.additionalDirectories.join(', ') }] : []),
+                    { k: 'Action', v: 'Click to inspect /changes' },
+                  ],
+                )}
+                onClick={() => openPanel({ kind: 'changes' })}>
+                {gitBranch
+                  ? `${formatCompactWorkspacePath(options.cwd, colsNow < 84 ? 22 : 34)} (${gitBranch})`
+                  : formatCompactWorkspacePath(options.cwd, colsNow < 84 ? 26 : 38)}
+              </button>
+              <button size="sm" variant="quiet" icon="history"
+                disabled={(!!permission || authBusy) && 'Finish current prompt'}
+                title={sid ? `Active session: ${sessionTitle(sid)} (${sid})` : 'Connecting session'}
+                hovercard={cachedHoverKv(
+                  'composer-session',
+                  `${sid}|${sid ? sessionTitle(sid) : ''}|${phase}`,
+                  () => [
+                    { k: 'Session', v: sid ? sessionTitle(sid) : phase },
+                    ...(sid ? [{ k: 'Session ID', v: sid }] : []),
+                    { k: 'Action', v: 'Click to browse /sessions' },
+                  ],
+                )}
+                onClick={() => openPanel({ kind: 'sessions' })}>
+                {sid
+                  ? (() => {
+                    const label = sessionTitle(sid);
+                    const maxLen = colsNow < 84 ? 18 : 28;
+                    const short = label.length > maxLen ? `${label.slice(0, maxLen - 3)}...` : label;
+                    return `${short} · ${sid.slice(0, 8)}`;
+                  })()
+                  : phase}
+              </button>
+            </row>}
             {hasAttachments && <row key="attachments" role="omp.composer.chips" gap="xs" wrap>
               {st.attachedImages.map(image => <attachment key={`img:${image.path}`} variant="tile"
                 name={basename(image.path)} mime={image.mimeType} size={image.size} path={image.path}

@@ -2,6 +2,12 @@
 
 All notable changes to `agy-tern` are documented in this file.
 
+## [0.3.4] - 2026-11-21
+
+### Added
+- Antigravity Usage Activity Heatmap inside `/usage` (`Overview` tab) via [src/usage-heatmap.ts](src/usage-heatmap.ts) and shared [src/heatmap.ts](src/heatmap.ts), aggregating daily prompt counts, active sessions, and streaks across local Antigravity session logs and active ACP sessions using `<chart kind="heatmap" token="accent">`.
+- Active working directory (`~`-compacted workspace path + git branch) and active session indicator (`title · shortId`) directly inside the chatbox header (`role="agy.composer.context"`), clickable to inspect `/changes` or switch via `/sessions`.
+
 ## [0.3.3] - 2026-11-21
 
 ### Added

@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { extname, isAbsolute, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { SessionConfigOption, ToolCallUpdate, UsageUpdate } from '@agentclientprotocol/sdk';
@@ -300,6 +301,24 @@ export function formatPathLabel(filePath: string, cwd: string): string {
   if (!rel) return '.';
   if (rel.startsWith('..') || isAbsolute(rel)) return filePath;
   return rel;
+}
+
+/** Compact an absolute directory path (substituting `~` for home) for narrow chatbox headers. */
+export function formatCompactWorkspacePath(cwd: string, maxChars = 34, homeDir = homedir()): string {
+  const normalizedHome = homeDir.replace(/\/+$/, '');
+  const withTilde = normalizedHome && (cwd === normalizedHome || cwd.startsWith(`${normalizedHome}/`))
+    ? `~${cwd.slice(normalizedHome.length)}`
+    : cwd;
+  if (withTilde.length <= maxChars) return withTilde;
+  const parts = withTilde.split('/').filter(Boolean);
+  if (parts.length <= 2) return `...${withTilde.slice(-(Math.max(8, maxChars - 3)))}`;
+  const prefix = parts[0] === '~' ? '~/' : '/';
+  const tail = parts.slice(-2).join('/');
+  const compact = `${prefix}.../${tail}`;
+  if (compact.length <= maxChars) return compact;
+  const leaf = parts.at(-1) ?? tail;
+  const shorter = `${prefix}.../${leaf}`;
+  return shorter.length <= maxChars ? shorter : `${leaf.slice(0, Math.max(8, maxChars - 3))}...`;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -1346,7 +1365,7 @@ export function computeResponsiveLayout(
   const approvalBodyMaxH = `${approvalBodyLines}lines` as const;
   const compactEmpty = safeRows < 22 || safeCols < 56;
 
-  const baseDock = 5 + (showKeyLegend ? (safeCols < 80 ? 2 : 1) : 0);
+  const baseDock = (safeRows >= 16 ? 6 : 5) + (showKeyLegend ? (safeCols < 80 ? 2 : 1) : 0);
   const popupRows = opts.hasPermission
     ? approvalBodyLines + 4
     : opts.hasSuggestionsOrAt

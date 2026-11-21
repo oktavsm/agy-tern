@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import { resolve } from 'node:path';
+import { basename, resolve } from 'node:path';
 import { createIsolatedEnv, type IsolatedEnv } from './harness/cli-runner';
 import { TspHarness } from './harness/tsp-emulator';
 
@@ -314,6 +314,24 @@ describe('agy-tern native Tern E2E smoke', () => {
       await new Promise(resolveDelay => setTimeout(resolveDelay, 25));
     }
     expect(harness.findById('layer.picker')).toBeUndefined();
+
+    // Verify chatbox shows workspace directory and active session context right inside omp.editor.
+    const ctxRow = harness.findById('dock.shell.composer.ctx');
+    expect(ctxRow).toBeDefined();
+    expect(harness.extractText('dock')).toContain(basename(iso.workspace));
+
+    // Verify /usage renders official quota + Antigravity usage activity heatmap inside /usage Overview.
+    harness.sendText('/usage');
+    harness.sendKey('enter');
+    await harness.waitForText('Usage & Quota', 'layer', 5_000);
+    await harness.waitForText('Antigravity usage activity', 'layer', 5_000);
+    harness.assertWireInvariants();
+    harness.sendKey('esc');
+    const usageDeadline = Date.now() + 4_000;
+    while (harness.findById('layer.panel') && Date.now() < usageDeadline) {
+      await new Promise(resolveDelay => setTimeout(resolveDelay, 25));
+    }
+    expect(harness.findById('layer.panel')).toBeUndefined();
 
     // Verify /commits renders GitHub-style commit contribution heatmap overlay cleanly.
     harness.sendText('/commits');
