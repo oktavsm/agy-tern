@@ -2,6 +2,13 @@
 
 All notable changes to `agy-tern` are documented in this file.
 
+## [0.3.5] - 2026-11-22
+
+### Fixed
+- Separated `agy`-spawned MCP stdio helper daemons (`mcp-server-fetch`, `playwright-mcp`, `duckduckgo-mcp-server`, `rea-agents`, `uvx`, `npm exec ... mcp`) from real session subprocesses in [src/task-monitor.ts](src/task-monitor.ts) (`category: 'session' | 'mcp'` with subtree inheritance) and [src/panels.tsx](src/panels.tsx) (`Session live`, `All session`, `Finished`, and dedicated `MCP helpers` tab in `/tasks`).
+- Kept the working HUD visible whenever a session background process or active tool is waiting on output even after the ACP turn yields (`Waiting output: <command> · PID <pid> [taskId]`), with direct `Live output`, `Tasks (N)`, and `Kill PID <pid>` buttons plus continuous 1s background polling while active.
+- Streamed bounded tails of official session background task logs (`~/.gemini/antigravity-cli/brain/<uuid>/.system_generated/tasks/task-*.log` parsed via `extractBackgroundTaskRef` and `readTaskLogTail`) into `/tasks` preview and the `task-inspect` (`Enter`) overlay, and clearly labeled MCP stdio daemons when inspected.
+
 ## [0.3.4] - 2026-11-21
 
 ### Added

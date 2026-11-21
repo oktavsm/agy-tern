@@ -520,15 +520,28 @@ describe('panel renderers & transcript view helpers', () => {
     const tasksCtx = baseContext({ kind: 'tasks' });
     tasksCtx.pickerTab = 'live';
     tasksCtx.onKillProcess = () => {};
-    tasksCtx.liveProcesses = [{
-      pid: 4123,
-      ppid: 500,
-      pgid: 4123,
-      stat: 'S+',
-      elapsed: '00:18',
-      commandLine: 'npm run dev',
-      summary: 'npm run dev',
-    }];
+    tasksCtx.liveProcesses = [
+      {
+        pid: 4123,
+        ppid: 500,
+        pgid: 4123,
+        stat: 'S+',
+        elapsed: '00:18',
+        commandLine: 'npm run dev',
+        summary: 'npm run dev',
+        category: 'session',
+      },
+      {
+        pid: 9901,
+        ppid: 500,
+        pgid: 9901,
+        stat: 'Sl',
+        elapsed: '04:10',
+        commandLine: '/opt/bin/uv tool uvx mcp-server-fetch',
+        summary: 'uv tool uvx mcp-server-fetch',
+        category: 'mcp',
+      },
+    ];
     tasksCtx.entries = [{
       type: 'tool',
       id: 'entry-dev',
@@ -540,23 +553,42 @@ describe('panel renderers & transcript view helpers', () => {
         title: 'npm run dev',
         status: 'in_progress',
         rawInput: { CommandLine: 'npm run dev' },
-        rawOutput: { stdout: 'ready in 240 ms' },
+        rawOutput: {
+          output: 'Tool is running as a background task with task id: 16653416-77b5-4a12-9012-abcdef123456/task-dev1.',
+        },
       },
     }];
+    tasksCtx.taskLogs = new Map([['c-dev', 'ready in 240 ms\nlistening on :5173']]);
     const tasksJson = JSON.stringify(renderActivePanel(tasksCtx));
     expect(tasksJson).toContain('LIVE PID 4123');
     expect(tasksJson).toContain('Kill PID 4123');
     expect(tasksJson).toContain('Live output');
+    expect(tasksJson).toContain('Session live');
+    expect(tasksJson).toContain('MCP helpers');
+    expect(tasksJson).toContain('listening on :5173');
+    expect(tasksJson).not.toContain('MCP PID 9901');
+
+    tasksCtx.pickerTab = 'mcp';
+    const mcpTasksJson = JSON.stringify(renderActivePanel(tasksCtx));
+    expect(mcpTasksJson).toContain('MCP PID 9901');
+    expect(mcpTasksJson).toContain('uv tool uvx mcp-server-fetch');
 
     const liveInspectCtx = baseContext({ kind: 'task-inspect', toolCallId: 'c-dev', pid: 4123 });
     liveInspectCtx.entries = tasksCtx.entries;
     liveInspectCtx.liveProcesses = tasksCtx.liveProcesses;
+    liveInspectCtx.taskLogs = tasksCtx.taskLogs;
     liveInspectCtx.onKillProcess = () => {};
     const liveInspectJson = JSON.stringify(renderActivePanel(liveInspectCtx));
     expect(liveInspectJson).toContain('ready in 240 ms');
+    expect(liveInspectJson).toContain('listening on :5173');
     expect(liveInspectJson).toContain('Kill PID 4123');
     expect(liveInspectJson).toContain('Force SIGKILL');
     expect(liveInspectJson).toContain('"stick":"end"');
+
+    const mcpInspectCtx = baseContext({ kind: 'task-inspect', pid: 9901 });
+    mcpInspectCtx.liveProcesses = tasksCtx.liveProcesses;
+    const mcpInspectJson = JSON.stringify(renderActivePanel(mcpInspectCtx));
+    expect(mcpInspectJson).toContain('MCP stdio helper daemon');
 
     const keysJson = JSON.stringify(renderActivePanel(baseContext({ kind: 'keys' })));
     expect(keysJson).toContain('Keyboard shortcuts');

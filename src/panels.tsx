@@ -47,6 +47,7 @@ import {
   type SessionDiffItem,
 } from './ui-format';
 import {
+  extractBackgroundTaskRef,
   matchLiveProcessToToolStep,
   matchToolStepToLiveProcess,
   type LiveProcessInfo,
@@ -241,6 +242,7 @@ export interface PanelRenderContext {
   onUnstageGitPath?(filePath: string): void;
   onDiscardGitPath?(filePath: string, status: string): void;
   liveProcesses?: readonly LiveProcessInfo[];
+  taskLogs?: ReadonlyMap<string, string>;
   onRefreshLiveProcesses?(): void;
   onKillProcess?(proc: LiveProcessInfo, force?: boolean): void;
   onInspectLiveTask?(target: { toolCallId?: string; pid?: number }): void;
@@ -1357,21 +1359,28 @@ function renderTemplatesPicker(ctx: PanelRenderContext): JSX.Element {
 
 function renderTasksPicker(ctx: PanelRenderContext): JSX.Element {
   const query = ctx.panelDraft.text.trim().toLowerCase();
-  const liveProcs = ctx.liveProcesses ?? [];
+  const allLiveProcs = ctx.liveProcesses ?? [];
+  const sessionProcs = allLiveProcs.filter(proc => proc.category !== 'mcp');
+  const mcpProcs = allLiveProcs.filter(proc => proc.category === 'mcp');
   const allTools = ctx.entries
     .filter((entry): entry is ToolStep => entry.type === 'tool')
     .slice()
     .reverse();
   const runningTools = allTools.filter(step => step.call.status === 'in_progress' || step.call.status === 'pending');
   const finishedCount = allTools.length - runningTools.length;
-  const tab = ctx.pickerTab === 'live' || ctx.pickerTab === 'running' || ctx.pickerTab === 'done' ? ctx.pickerTab : 'all';
+  const tab = ctx.pickerTab === 'live' || ctx.pickerTab === 'done' || ctx.pickerTab === 'mcp'
+    ? ctx.pickerTab
+    : 'all';
 
   type TaskRow =
     | { id: string; kind: 'proc'; proc: LiveProcessInfo; matchedStep?: ToolStep }
-    | { id: string; kind: 'tool'; step: ToolStep; summary: ReturnType<typeof summarizeToolCall>; matchedProc?: LiveProcessInfo; isRunning: boolean };
+    | { id: string; kind: 'tool'; step: ToolStep; summary: ReturnType<typeof summarizeToolCall>; matchedProc?: LiveProcessInfo; bgTaskId?: string; hasLogTail: boolean; isRunning: boolean };
 
-  const procRows: TaskRow[] = liveProcs
-    .filter(proc => !query || `pid ${proc.pid} ${proc.summary} ${proc.commandLine} ${proc.stat}`.toLowerCase().includes(query))
+  const filterProc = (proc: LiveProcessInfo): boolean =>
+    !query || `pid ${proc.pid} ${proc.summary} ${proc.commandLine} ${proc.stat} ${proc.category}`.toLowerCase().includes(query);
+
+  const sessionProcRows: TaskRow[] = sessionProcs
+    .filter(filterProc)
     .map(proc => ({
       id: `proc:${proc.pid}`,
       kind: 'proc',
@@ -1379,31 +1388,45 @@ function renderTasksPicker(ctx: PanelRenderContext): JSX.Element {
       matchedStep: matchLiveProcessToToolStep(proc, allTools, ctx.options.cwd),
     }));
 
-  const matchedProcToolIds = new Set(procRows.flatMap(row => (row.kind === 'proc' && row.matchedStep ? [row.matchedStep.id] : [])));
+  const mcpProcRows: TaskRow[] = mcpProcs
+    .filter(filterProc)
+    .map(proc => ({
+      id: `proc:${proc.pid}`,
+      kind: 'proc',
+      proc,
+      matchedStep: undefined,
+    }));
+
+  const matchedProcToolIds = new Set(sessionProcRows.flatMap(row => (row.kind === 'proc' && row.matchedStep ? [row.matchedStep.id] : [])));
   const toolRows: TaskRow[] = allTools
     .filter(step => {
       const summary = summarizeToolCall(step.call, ctx.options.cwd);
       const isRunning = step.call.status === 'in_progress' || step.call.status === 'pending';
       if (tab === 'live' && (!isRunning || matchedProcToolIds.has(step.id))) return false;
-      if (tab === 'running' && !isRunning) return false;
       if (tab === 'done' && isRunning) return false;
+      if (tab === 'mcp') return false;
       if (!query) return true;
       return `${summary.title} ${summary.target ?? ''} ${step.call.toolCallId}`.toLowerCase().includes(query);
     })
-    .map(step => ({
-      id: step.id,
-      kind: 'tool',
-      step,
-      summary: summarizeToolCall(step.call, ctx.options.cwd),
-      matchedProc: matchToolStepToLiveProcess(step, liveProcs, ctx.options.cwd),
-      isRunning: step.call.status === 'in_progress' || step.call.status === 'pending',
-    }));
+    .map(step => {
+      const bgRef = extractBackgroundTaskRef(step, ctx.options.cwd);
+      return {
+        id: step.id,
+        kind: 'tool',
+        step,
+        summary: summarizeToolCall(step.call, ctx.options.cwd),
+        matchedProc: matchToolStepToLiveProcess(step, sessionProcs, ctx.options.cwd),
+        bgTaskId: bgRef?.taskId,
+        hasLogTail: Boolean(ctx.taskLogs?.get(step.call.toolCallId)?.trim()),
+        isRunning: step.call.status === 'in_progress' || step.call.status === 'pending',
+      };
+    });
 
-  const combinedRows: TaskRow[] = tab === 'live'
-    ? [...procRows, ...toolRows]
-    : tab === 'all'
-      ? [...procRows, ...toolRows]
-      : toolRows;
+  const combinedRows: TaskRow[] = tab === 'mcp'
+    ? mcpProcRows
+    : tab === 'done'
+      ? toolRows
+      : [...sessionProcRows, ...toolRows];
 
   const order = combinedRows.map(row => row.id);
   const selectedId = order.includes(ctx.pickerSelected) ? ctx.pickerSelected : (order[0] ?? '');
@@ -1441,13 +1464,17 @@ function renderTasksPicker(ctx: PanelRenderContext): JSX.Element {
 
   const items: PickerItem[] = combinedRows.map(row => {
     if (row.kind === 'proc') {
+      const isMcp = row.proc.category === 'mcp';
+      const hasLinkedLog = row.matchedStep ? Boolean(ctx.taskLogs?.get(row.matchedStep.call.toolCallId)?.trim()) : false;
       return {
         id: row.id,
         label: row.proc.summary,
         detail: `PID ${row.proc.pid} · elapsed ${row.proc.elapsed} · stat ${row.proc.stat}`,
         badges: [
-          { text: `LIVE PID ${row.proc.pid}`, tone: 'accent' as const },
-          ...(row.matchedStep ? [{ text: 'Output linked', tone: 'info' as const }] : []),
+          isMcp
+            ? { text: `MCP PID ${row.proc.pid}`, tone: 'neutral' as const }
+            : { text: `LIVE PID ${row.proc.pid}`, tone: 'accent' as const },
+          ...(row.matchedStep ? [{ text: hasLinkedLog ? 'Live log' : 'Output linked', tone: 'info' as const }] : []),
         ],
         node: 'pv',
       };
@@ -1468,37 +1495,43 @@ function renderTasksPicker(ctx: PanelRenderContext): JSX.Element {
           tone: row.isRunning ? 'accent' as const : row.step.call.status === 'failed' ? 'error' as const : 'success' as const,
         },
         ...(row.matchedProc ? [{ text: `PID ${row.matchedProc.pid}`, tone: 'info' as const }] : []),
+        ...(row.bgTaskId ? [{ text: `BG ${row.bgTaskId}`, tone: 'info' as const }] : []),
+        ...(row.hasLogTail ? [{ text: 'Log', tone: 'neutral' as const }] : []),
         ...(row.summary.exit !== undefined ? [{ text: `exit ${row.summary.exit}`, tone: row.summary.exit === 0 ? ('neutral' as const) : ('error' as const) }] : []),
       ],
       node: 'pv',
     };
   });
 
-  const liveTabCount = procRows.length + runningTools.filter(step => !matchedProcToolIds.has(step.id)).length;
+  const liveTabCount = sessionProcRows.length + runningTools.filter(step => !matchedProcToolIds.has(step.id)).length;
   const pvStep = highlighted?.kind === 'tool' ? highlighted.step : highlighted?.matchedStep;
   const pvSummary = pvStep ? summarizeToolCall(pvStep.call, ctx.options.cwd) : undefined;
+  const pvLogTail = pvStep ? ctx.taskLogs?.get(pvStep.call.toolCallId)?.trim() : undefined;
+  const pvLogPreview = pvLogTail ? pvLogTail.split(/\r?\n/).slice(-10).join('\n') : undefined;
 
   return <picker key="picker" size={ctx.rLayout.panelSize} title="Tasks & live processes" icon="timer"
-    subtitle={liveProcs.length || runningTools.length
-      ? `${liveProcs.length} live child process(es) · ${runningTools.length} active tool(s) · Enter views live output`
-      : `${allTools.length} tool call(s) recorded in this session`}
+    subtitle={sessionProcs.length || runningTools.length
+      ? `${sessionProcs.length} session process(es) · ${runningTools.length} active tool(s)${mcpProcs.length ? ` · ${mcpProcs.length} MCP helper(s) in MCP tab` : ''} · Enter views live output`
+      : `${allTools.length} tool call(s) in this session${mcpProcs.length ? ` · ${mcpProcs.length} MCP helper(s) in MCP tab` : ''}`}
     placeholder="Filter processes, commands, or tool steps..."
     query={ctx.panelDraft.text} cursor={ctx.panelDraft.cursor} onEdit={ctx.onEditPanelDraft}
     tabs={[
-      { id: 'all', label: 'All', count: liveProcs.length + allTools.length },
-      { id: 'live', label: 'Live', count: liveTabCount },
-      { id: 'running', label: 'Running tools', count: runningTools.length },
+      { id: 'live', label: 'Session live', count: liveTabCount },
+      { id: 'all', label: 'All session', count: sessionProcs.length + allTools.length },
       { id: 'done', label: 'Finished', count: finishedCount },
+      { id: 'mcp', label: 'MCP helpers', count: mcpProcs.length },
     ]}
     tab={tab}
     order={order}
     items={items} selected={selectedId}
     state="ready"
     empty={tab === 'live'
-      ? 'No live child processes or active tools running under this agy session.'
-      : tab === 'running'
-        ? 'No tool tasks are currently running.'
-        : 'No tool activity recorded in this conversation yet.'}
+      ? 'No live session commands or active tools running right now.'
+      : tab === 'mcp'
+        ? 'No MCP stdio helper daemons running under agy.'
+        : tab === 'done'
+          ? 'No finished tool calls recorded yet.'
+          : 'No session tasks or tool activity recorded yet.'}
     preview={highlighted ? 'below' : 'none'}
     actions={[
       { id: 'refresh', label: 'Refresh' },
@@ -1522,8 +1555,10 @@ function renderTasksPicker(ctx: PanelRenderContext): JSX.Element {
     {highlighted && <col key="pv" gap="xs">
       {selectedProc && <kv items={[
         { k: 'Process', v: `PID ${selectedProc.pid} (PPID ${selectedProc.ppid}) · ${selectedProc.stat} · ${selectedProc.elapsed}` },
+        { k: 'Kind', v: selectedProc.category === 'mcp' ? 'MCP stdio helper daemon' : 'Session command / subprocess' },
         { k: 'Command', v: selectedProc.commandLine },
       ]} />}
+      {pvLogPreview && <code wrap>{pvLogPreview}</code>}
       {pvStep && pvSummary && <ToolBody call={pvStep.call} cwd={ctx.options.cwd} showRawInput={pvSummary.showRawInput}
         fullCommand={pvSummary.fullCommand} diffMode={ctx.userPrefs.diffMode}
         pathExists={ctx.pathExists} getBlob={ctx.blobForImage} onInspect={ctx.onOpenInspect} onOpenSplit={ctx.onOpenSplit}
@@ -1546,21 +1581,23 @@ function renderTaskInspectOverlay(
 
   const stepRunning = !!step && (step.call.status === 'in_progress' || step.call.status === 'pending');
   const isLive = !!liveProc || stepRunning;
+  const isMcp = liveProc?.category === 'mcp';
   const summary = step ? summarizeToolCall(step.call, ctx.options.cwd, { includeDiffStats: false }) : undefined;
   const title = summary?.title ?? liveProc?.summary ?? 'Live task output';
-  const liveOutputText = step
-    ? (extractToolLiveOutput(step) ?? '')
-    : '';
+  const bgRef = step ? extractBackgroundTaskRef(step, ctx.options.cwd) : undefined;
+  const taskLogText = step ? ctx.taskLogs?.get(step.call.toolCallId) : undefined;
+  const stepOutputText = step ? (extractToolLiveOutput(step) ?? '') : '';
+  const liveOutputText = taskLogText?.trim() ? taskLogText : stepOutputText;
   const detailText = step
     ? buildTaskDetailText(step, ctx.options.cwd, liveProc)
     : liveProc
-      ? `PID: ${liveProc.pid}\nPPID: ${liveProc.ppid}\nState: ${liveProc.stat}\nElapsed: ${liveProc.elapsed}\nCommand:\n${liveProc.commandLine}`
+      ? `PID: ${liveProc.pid}\nPPID: ${liveProc.ppid}\nState: ${liveProc.stat}\nElapsed: ${liveProc.elapsed}\nKind: ${isMcp ? 'MCP stdio helper daemon' : 'Session subprocess'}\nCommand:\n${liveProc.commandLine}`
       : 'This task or process is no longer active.';
 
   return <overlay key="panel" head={title} modal size={ctx.rLayout.inspectSize}
     icon="timer"
     meta={liveProc
-      ? `LIVE PID ${liveProc.pid} · ${liveProc.elapsed}`
+      ? `${isMcp ? 'MCP' : 'LIVE'} PID ${liveProc.pid} · ${liveProc.elapsed}`
       : stepRunning
         ? 'Running · Live output'
         : step?.call.status ?? 'Finished'}
@@ -1591,11 +1628,19 @@ function renderTaskInspectOverlay(
         <kv items={[
           ...(summary?.target ? [{ k: 'Command / Target', v: summary.fullCommand ?? summary.target }] : []),
           ...(liveProc ? [{ k: 'Live process', v: `PID ${liveProc.pid} (stat ${liveProc.stat}, elapsed ${liveProc.elapsed})` }] : []),
+          ...(bgRef?.taskId ? [{ k: 'Background task', v: bgRef.taskId }] : []),
+          ...(bgRef?.logPath ? [{ k: 'Task log', v: bgRef.logPath }] : []),
           ...(step ? [{ k: 'ACP status', v: step.call.status ?? 'unknown' }] : []),
         ]} />
         {isLive && <row gap="xs" align="center">
           <spinner style="starburst" />
-          <text><span s="accent">{liveOutputText ? 'Streaming live output...' : 'Process running; waiting for output chunks...'}</span></text>
+          <text><span s={isMcp && !liveOutputText ? 'muted' : 'accent'}>
+            {isMcp && !liveOutputText
+              ? 'MCP stdio helper daemon (JSON-RPC stdio pipe; no terminal stdout log).'
+              : liveOutputText
+                ? 'Streaming live output...'
+                : 'Process running; waiting for output chunks...'}
+          </span></text>
         </row>}
         {liveOutputText
           ? <code wrap>{liveOutputText}</code>
