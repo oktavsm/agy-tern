@@ -63,7 +63,7 @@ agy-tern
   ```
 - **Not authenticated**: Run `agy acp --login` in your shell or open `/account` inside `agy-tern`.
 - **macOS clipboard image paste**: Works out of the box via built-in `osascript` (or `pngpaste` if installed) for `Ctrl+V` / `Alt+V` / `/paste-image` (`pbcopy` handles text copy).
-- **Linux clipboard copy/paste**: Install `wl-clipboard` (`sudo dnf install wl-clipboard` on Fedora, `sudo apt install wl-clipboard` on Debian/Ubuntu) on Wayland or `xclip` on X11. Use `Ctrl+V` or `Alt+V` (or `/paste-image`) for screenshots and copied image files; `Ctrl+Shift+V` performs terminal paste (image paths auto-attach).
+- **Linux clipboard copy/paste**: `scripts/install.sh` automatically installs `wl-clipboard` (Wayland) or `xclip` (X11) via `dnf`, `apt-get`, `pacman`, `zypper`, `apk`, or `xbps-install` when missing (pass `--no-clipboard-deps` to skip). Use `Ctrl+V` or `Alt+V` (or `/paste-image`) for screenshots and copied image files; `Ctrl+Shift+V` performs terminal paste (image paths auto-attach).
 
 </details>
 

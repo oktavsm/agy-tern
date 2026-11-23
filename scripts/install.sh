@@ -9,6 +9,7 @@ TARGET_LINK="$BIN_DIR/agy-tern"
 FORCE=0
 UNINSTALL=0
 SKIP_DOCTOR=0
+SKIP_CLIPBOARD_DEPS="${AGY_TERN_SKIP_CLIPBOARD_DEPS:-0}"
 TAG_OVERRIDE=""
 
 while [[ $# -gt 0 ]]; do
@@ -16,6 +17,7 @@ while [[ $# -gt 0 ]]; do
     --force) FORCE=1; shift ;;
     --uninstall) UNINSTALL=1; shift ;;
     --no-doctor) SKIP_DOCTOR=1; shift ;;
+    --no-clipboard-deps) SKIP_CLIPBOARD_DEPS=1; shift ;;
     --version)
       [[ $# -ge 2 ]] || { printf 'Error: --version requires a tag (e.g. v0.2.0)\n' >&2; exit 1; }
       TAG_OVERRIDE="$2"
@@ -30,19 +32,21 @@ while [[ $# -gt 0 ]]; do
       cat <<EOF
 Usage:
   curl -fsSL https://raw.githubusercontent.com/oktavsm/agy-tern/main/scripts/install.sh | bash
-  ./scripts/install.sh [--force] [--uninstall] [--version TAG] [--no-doctor]
+  ./scripts/install.sh [--force] [--uninstall] [--version TAG] [--no-doctor] [--no-clipboard-deps]
 
 Installs agy-tern into ~/.local/bin/agy-tern:
   - When run remotely (via curl), downloads the latest verified release archive from GitHub Releases into ~/.local/share/agy-tern/current (no git clone required).
   - When run inside a local git clone, installs dependencies and builds dist/cli.js from source.
+  - On Linux, automatically ensures wl-clipboard (Wayland) or xclip (X11) is available for clipboard image paste unless --no-clipboard-deps is passed.
 
 Options:
-  --version TAG  Install a specific release tag from GitHub Releases (e.g. v0.2.0)
-  --repo REPO    Override GitHub repository (default: oktavsm/agy-tern)
-  --force        Replace an existing non-symlink file at ~/.local/bin/agy-tern
-  --uninstall    Remove the ~/.local/bin/agy-tern symlink and standalone data directory
-  --no-doctor    Skip running \`agy-tern --doctor\` after installation
-  -h, --help     Show this help message
+  --version TAG        Install a specific release tag from GitHub Releases (e.g. v0.3.6)
+  --repo REPO          Override GitHub repository (default: oktavsm/agy-tern)
+  --force              Replace an existing non-symlink file at ~/.local/bin/agy-tern
+  --uninstall          Remove the ~/.local/bin/agy-tern symlink and standalone data directory
+  --no-doctor          Skip running \`agy-tern --doctor\` after installation
+  --no-clipboard-deps  Skip installing wl-clipboard / xclip on Linux
+  -h, --help           Show this help message
 EOF
       exit 0
       ;;
@@ -92,6 +96,86 @@ if ! command -v bun >/dev/null 2>&1; then
   printf 'Error: bun is still not on PATH after installation.\n' >&2
   exit 1
 fi
+
+run_privileged() {
+  if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+    "$@"
+    return $?
+  fi
+  if command -v sudo >/dev/null 2>&1; then
+    if sudo -n true 2>/dev/null; then
+      sudo -n "$@"
+      return $?
+    fi
+    if [[ -r /dev/tty && -w /dev/tty ]]; then
+      sudo "$@" < /dev/tty
+      return $?
+    fi
+    return 126
+  fi
+  if command -v doas >/dev/null 2>&1 && [[ -r /dev/tty && -w /dev/tty ]]; then
+    doas "$@" < /dev/tty
+    return $?
+  fi
+  return 126
+}
+
+ensure_linux_clipboard_deps() {
+  if [[ "$SKIP_CLIPBOARD_DEPS" == "1" ]]; then
+    return 0
+  fi
+  if [[ "$(uname -s)" != "Linux" ]]; then
+    return 0
+  fi
+  if [[ -n "${WSL_DISTRO_NAME:-}" ]] && command -v powershell.exe >/dev/null 2>&1; then
+    return 0
+  fi
+
+  local pkg=""
+  if [[ -n "${WAYLAND_DISPLAY:-}" || "${XDG_SESSION_TYPE:-}" == "wayland" ]]; then
+    if command -v wl-paste >/dev/null 2>&1 && command -v wl-copy >/dev/null 2>&1; then
+      return 0
+    fi
+    pkg="wl-clipboard"
+  else
+    if command -v xclip >/dev/null 2>&1; then
+      return 0
+    fi
+    pkg="xclip"
+  fi
+
+  local -a cmd=()
+  local pre_apt=0
+  if command -v dnf >/dev/null 2>&1; then
+    cmd=(dnf install -y "$pkg")
+  elif command -v apt-get >/dev/null 2>&1; then
+    pre_apt=1
+    cmd=(apt-get install -y "$pkg")
+  elif command -v pacman >/dev/null 2>&1; then
+    cmd=(pacman -Sy --noconfirm --needed "$pkg")
+  elif command -v zypper >/dev/null 2>&1; then
+    cmd=(zypper --non-interactive install "$pkg")
+  elif command -v apk >/dev/null 2>&1; then
+    cmd=(apk add --no-cache "$pkg")
+  elif command -v xbps-install >/dev/null 2>&1; then
+    cmd=(xbps-install -Sy "$pkg")
+  else
+    printf 'Note: %s is not installed and no supported package manager was detected. Install %s manually for clipboard image paste.\n' "$pkg" "$pkg"
+    return 0
+  fi
+
+  printf 'Installing %s for clipboard image paste (%s)...\n' "$pkg" "${cmd[0]}"
+  if [[ "$pre_apt" -eq 1 ]]; then
+    if ! run_privileged apt-get update -qq; then
+      printf 'Note: skipped automatic %s install (sudo unavailable or cancelled). Install manually: sudo apt-get install -y %s\n' "$pkg" "$pkg"
+      return 0
+    fi
+  fi
+  if ! run_privileged "${cmd[@]}"; then
+    printf 'Note: skipped automatic %s install (sudo unavailable or cancelled). Install manually: sudo %s\n' "$pkg" "${cmd[*]}"
+  fi
+  return 0
+}
 
 link_launcher() {
   local entry_file="$1"
@@ -230,6 +314,8 @@ else
   link_launcher "$CURRENT_DIR/dist/cli.js"
   printf 'Installed agy-tern %s to %s\n' "$TAG" "$CURRENT_DIR"
 fi
+
+ensure_linux_clipboard_deps
 
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
