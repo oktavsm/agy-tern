@@ -20,6 +20,7 @@ import {
   loadDirectorySummaryResources,
   loadEmbeddedResourceAttachments,
   readClipboardImage,
+  readClipboardText,
   readGitFileDiff,
   readImageAttachment,
   readWorkspaceTextPreview,
@@ -246,6 +247,57 @@ describe('workspace @file mention helpers', () => {
       platform: 'darwin',
       hasCommand: () => false,
     })).rejects.toThrow('install pngpaste');
+
+    const macOsaLoaded = await readClipboardImage({
+      platform: 'darwin',
+      hasCommand: cmd => cmd === 'osascript',
+      exec: async cmd => (cmd === 'osascript' ? Buffer.from(pngBytes.toString('base64')) : undefined),
+    });
+    expect(macOsaLoaded.mimeType).toBe('image/png');
+    expect(macOsaLoaded.data).toBe(pngBytes.toString('base64'));
+
+    const dir = await tempDir();
+    const uriImgPath = join(dir, 'copied-from-nautilus.png');
+    await writeFile(uriImgPath, pngBytes);
+    const uriLoaded = await readClipboardImage({
+      cwd: dir,
+      platform: 'linux',
+      waylandDisplay: 'wayland-0',
+      hasCommand: cmd => cmd === 'wl-paste',
+      exec: async (_cmd, args) => {
+        if (args.includes('--list-types')) return Buffer.from('text/uri-list\ntext/plain\n');
+        if (args.includes('text/uri-list')) return Buffer.from(`# comment\nfile://${uriImgPath}\r\n`);
+        return undefined;
+      },
+    });
+    expect(uriLoaded.mimeType).toBe('image/png');
+    expect(uriLoaded.data).toBe(pngBytes.toString('base64'));
+
+    const paramMimeLoaded = await readClipboardImage({
+      platform: 'linux',
+      waylandDisplay: 'wayland-0',
+      hasCommand: cmd => cmd === 'wl-paste',
+      exec: async (_cmd, args) => {
+        if (args.includes('--list-types')) return Buffer.from('image/png;charset=binary\n');
+        if (args.includes('image/png;charset=binary')) return pngBytes;
+        return undefined;
+      },
+    });
+    expect(paramMimeLoaded.mimeType).toBe('image/png');
+
+    await expect(readClipboardImage({
+      platform: 'linux',
+      waylandDisplay: 'wayland-0',
+      hasCommand: () => false,
+    })).rejects.toThrow('wl-clipboard');
+
+    const clipText = await readClipboardText({
+      platform: 'linux',
+      waylandDisplay: 'wayland-0',
+      hasCommand: cmd => cmd === 'wl-paste',
+      exec: async cmd => (cmd === 'wl-paste' ? Buffer.from('hello from clipboard') : undefined),
+    });
+    expect(clipText).toBe('hello from clipboard');
   });
 
   test('inserts, highlights, formats, and removes inline attachment tokens without duplicating context', () => {

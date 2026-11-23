@@ -1963,7 +1963,7 @@ function renderKeysOverlay(ctx: PanelRenderContext): JSX.Element {
             { k: 'Enter', v: 'Send message or queue while busy (Shift+Enter inserts newline)' },
             { k: '/', v: 'Open slash command autocomplete; Tab completes command' },
             { k: '@', v: 'Attach files or dirs inline (Up/Down navigate list, Enter/Tab insert)' },
-            { k: 'Alt+V', v: 'Paste clipboard screenshot/image inline + chip preview' },
+            { k: 'Ctrl+V / Alt+V', v: 'Paste clipboard image or text inline + chip preview (Ctrl+Shift+V for terminal paste)' },
             { k: 'Ctrl+Z / Ctrl+Y', v: 'Undo / redo draft edits' },
             { k: 'Up / Down', v: 'Step sent prompt history on first/last row (or navigate popups)' },
           ]} />

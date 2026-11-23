@@ -64,15 +64,24 @@ async function runBinaryCommand(cmd: string, args: string[], maxBytes: number): 
 }
 
 /**
- * Read a PNG/JPEG/WebP screenshot directly from system clipboard (`wl-paste`, `xclip`, or `pngpaste` on macOS).
- * Enforces the 10 MB ACP attachment limit cleanly without shell interpolation.
+ * Read a PNG/JPEG/WebP screenshot or copied image file directly from the system clipboard.
+ * Supports `wl-paste` / `xclip` (including `text/uri-list` from file managers), `pngpaste` + built-in `osascript`
+ * on macOS, and `powershell.exe` on WSL. Enforces the 10 MB ACP attachment limit without shell interpolation.
  */
 export async function readClipboardImage(
-  options?: { exec?: ClipboardExec; hasCommand?: (cmd: string) => boolean; platform?: NodeJS.Platform },
+  options?: {
+    cwd?: string;
+    exec?: ClipboardExec;
+    hasCommand?: (cmd: string) => boolean;
+    platform?: NodeJS.Platform;
+    waylandDisplay?: string;
+  },
 ): Promise<LoadedImageAttachment> {
   const exec = options?.exec ?? runBinaryCommand;
   const hasCmd = options?.hasCommand ?? ((cmd: string) => !!Bun.which(cmd));
   const platform = options?.platform ?? process.platform;
+  const cwd = options?.cwd ?? process.cwd();
+  const isWayland = (options?.waylandDisplay ?? process.env.WAYLAND_DISPLAY ?? '').trim().length > 0;
 
   const tryTool = async (
     cmd: string,
@@ -82,25 +91,65 @@ export async function readClipboardImage(
     if (!hasCmd(cmd)) return { tried: false };
     const typesBuf = await exec(cmd, targetsArgs, 32 * 1024);
     const typesText = typesBuf?.toString('utf8') ?? '';
-    const offered = new Set(typesText.split(/\r?\n/).map(line => line.trim().toLowerCase()).filter(Boolean));
-    const matched = CLIPBOARD_IMAGE_MIMES.find(entry => offered.has(entry.mime));
-    if (!matched) return { tried: true };
-    const payload = await exec(cmd, readArgsForMime(matched.mime), MAX_IMAGE_BYTES + 1);
-    if (!payload || payload.byteLength === 0) {
-      return { tried: true, error: 'Clipboard image payload was empty.' };
-    }
-    if (payload.byteLength > MAX_IMAGE_BYTES) {
-      return { tried: true, error: `Clipboard image exceeds 10 MB limit (${(payload.byteLength / (1024 * 1024)).toFixed(1)} MB).` };
-    }
-    return {
-      tried: true,
-      loaded: {
-        path: `clipboard-${Date.now().toString(36)}.${matched.ext}`,
-        mimeType: matched.mime,
-        size: payload.byteLength,
-        data: payload.toString('base64'),
-      },
+    const offeredLines = typesText.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+    const offeredExact = new Map(offeredLines.map(line => [line.toLowerCase(), line]));
+    const findMime = (mime: string): string | undefined => {
+      const direct = offeredExact.get(mime);
+      if (direct) return direct;
+      for (const [lower, raw] of offeredExact) {
+        if (lower.startsWith(`${mime};`)) return raw;
+      }
+      return undefined;
     };
+
+    let matched: (typeof CLIPBOARD_IMAGE_MIMES)[number] | undefined;
+    let rawMime: string | undefined;
+    for (const entry of CLIPBOARD_IMAGE_MIMES) {
+      const hit = findMime(entry.mime);
+      if (hit) {
+        matched = entry;
+        rawMime = hit;
+        break;
+      }
+    }
+
+    if (matched && rawMime) {
+      const payload = await exec(cmd, readArgsForMime(rawMime), MAX_IMAGE_BYTES + 1);
+      if (!payload || payload.byteLength === 0) {
+        return { tried: true, error: 'Clipboard image payload was empty.' };
+      }
+      if (payload.byteLength > MAX_IMAGE_BYTES) {
+        return { tried: true, error: `Clipboard image exceeds 10 MB limit (${(payload.byteLength / (1024 * 1024)).toFixed(1)} MB).` };
+      }
+      return {
+        tried: true,
+        loaded: {
+          path: `clipboard-${Date.now().toString(36)}.${matched.ext}`,
+          mimeType: matched.mime,
+          size: payload.byteLength,
+          data: payload.toString('base64'),
+        },
+      };
+    }
+
+    const uriMime = findMime('text/uri-list');
+    if (uriMime) {
+      const uriBuf = await exec(cmd, readArgsForMime(uriMime), 64 * 1024);
+      const uriLines = (uriBuf?.toString('utf8') ?? '')
+        .split(/\r?\n/)
+        .map(line => line.trim())
+        .filter(line => line.length > 0 && !line.startsWith('#'));
+      for (const uri of uriLines) {
+        const resolved = resolvePastedImagePath(cwd, uri);
+        if (!resolved) continue;
+        try {
+          return { tried: true, loaded: await readImageAttachment(cwd, resolved) };
+        } catch (err) {
+          return { tried: true, error: err instanceof Error ? err.message : String(err) };
+        }
+      }
+    }
+    return { tried: true };
   };
 
   const tryPngpaste = async (): Promise<{ tried: boolean; loaded?: LoadedImageAttachment; error?: string }> => {
@@ -121,16 +170,83 @@ export async function readClipboardImage(
     };
   };
 
+  const tryMacOsascript = async (): Promise<{ tried: boolean; loaded?: LoadedImageAttachment; error?: string }> => {
+    if (!hasCmd('osascript')) return { tried: false };
+    const script = [
+      'ObjC.import("AppKit");',
+      'var pb = $.NSPasteboard.generalPasteboard;',
+      'var png = pb.dataForType($.NSPasteboardTypePNG);',
+      'if (!png || png.isNil()) {',
+      '  var tiff = pb.dataForType($.NSPasteboardTypeTIFF);',
+      '  if (tiff && !tiff.isNil()) {',
+      '    var rep = $.NSBitmapImageRep.imageRepWithData(tiff);',
+      '    if (rep && !rep.isNil()) png = rep.representationUsingTypeProperties($.NSBitmapImageFileTypePNG, $({}));',
+      '  }',
+      '}',
+      'png && !png.isNil() ? ObjC.unwrap(png.base64EncodedStringWithOptions(0)) : "";',
+    ].join('\n');
+    const b64Buf = await exec('osascript', ['-l', 'JavaScript', '-e', script], Math.ceil(MAX_IMAGE_BYTES * 1.4) + 1024);
+    const b64 = b64Buf?.toString('utf8').trim() ?? '';
+    if (!b64) return { tried: true };
+    const payload = Buffer.from(b64, 'base64');
+    if (payload.byteLength === 0) return { tried: true };
+    if (payload.byteLength > MAX_IMAGE_BYTES) {
+      return { tried: true, error: `Clipboard image exceeds 10 MB limit (${(payload.byteLength / (1024 * 1024)).toFixed(1)} MB).` };
+    }
+    return {
+      tried: true,
+      loaded: {
+        path: `clipboard-${Date.now().toString(36)}.png`,
+        mimeType: 'image/png',
+        size: payload.byteLength,
+        data: payload.toString('base64'),
+      },
+    };
+  };
+
+  const tryPowershellClipboard = async (): Promise<{ tried: boolean; loaded?: LoadedImageAttachment; error?: string }> => {
+    if (!hasCmd('powershell.exe')) return { tried: false };
+    const script = [
+      'Add-Type -AssemblyName System.Windows.Forms;',
+      'Add-Type -AssemblyName System.Drawing;',
+      '$img = [System.Windows.Forms.Clipboard]::GetImage();',
+      'if ($null -ne $img) {',
+      '  $ms = New-Object System.IO.MemoryStream;',
+      '  $img.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png);',
+      '  [Convert]::ToBase64String($ms.ToArray());',
+      '}',
+    ].join(' ');
+    const b64Buf = await exec('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], Math.ceil(MAX_IMAGE_BYTES * 1.4) + 1024);
+    const b64 = b64Buf?.toString('utf8').trim() ?? '';
+    if (!b64) return { tried: true };
+    const payload = Buffer.from(b64, 'base64');
+    if (payload.byteLength === 0) return { tried: true };
+    if (payload.byteLength > MAX_IMAGE_BYTES) {
+      return { tried: true, error: `Clipboard image exceeds 10 MB limit (${(payload.byteLength / (1024 * 1024)).toFixed(1)} MB).` };
+    }
+    return {
+      tried: true,
+      loaded: {
+        path: `clipboard-${Date.now().toString(36)}.png`,
+        mimeType: 'image/png',
+        size: payload.byteLength,
+        data: payload.toString('base64'),
+      },
+    };
+  };
+
   const candidates = platform === 'darwin'
-    ? [tryPngpaste]
-    : process.env.WAYLAND_DISPLAY
+    ? [tryPngpaste, tryMacOsascript]
+    : isWayland
       ? [
         () => tryTool('wl-paste', ['--list-types'], mime => ['--no-newline', '--type', mime]),
         () => tryTool('xclip', ['-selection', 'clipboard', '-t', 'TARGETS', '-o'], mime => ['-selection', 'clipboard', '-t', mime, '-o']),
+        tryPowershellClipboard,
       ]
       : [
         () => tryTool('xclip', ['-selection', 'clipboard', '-t', 'TARGETS', '-o'], mime => ['-selection', 'clipboard', '-t', mime, '-o']),
         () => tryTool('wl-paste', ['--list-types'], mime => ['--no-newline', '--type', mime]),
+        tryPowershellClipboard,
       ];
 
   let anyToolAvailable = false;
@@ -144,10 +260,54 @@ export async function readClipboardImage(
     throw new Error(
       platform === 'darwin'
         ? 'No clipboard image utility available (install pngpaste: brew install pngpaste).'
-        : 'No clipboard image utility available (install wl-paste or xclip).',
+        : isWayland
+          ? 'No clipboard image utility available. Install wl-clipboard (e.g. sudo dnf install wl-clipboard or sudo apt install wl-clipboard).'
+          : 'No clipboard image utility available. Install xclip (e.g. sudo dnf install xclip or sudo apt install xclip).',
     );
   }
   throw new Error('Clipboard does not contain a PNG, JPEG, or WebP image.');
+}
+
+/** Read plain UTF-8 text from the system clipboard for Ctrl+V fallback when no image is copied. */
+export async function readClipboardText(
+  options?: {
+    exec?: ClipboardExec;
+    hasCommand?: (cmd: string) => boolean;
+    platform?: NodeJS.Platform;
+    waylandDisplay?: string;
+  },
+): Promise<string | undefined> {
+  const exec = options?.exec ?? runBinaryCommand;
+  const hasCmd = options?.hasCommand ?? ((cmd: string) => !!Bun.which(cmd));
+  const platform = options?.platform ?? process.platform;
+  const isWayland = (options?.waylandDisplay ?? process.env.WAYLAND_DISPLAY ?? '').trim().length > 0;
+  const maxBytes = 256 * 1024;
+
+  const commands: Array<[string, string[]]> = platform === 'darwin'
+    ? [['pbpaste', []]]
+    : isWayland
+      ? [
+        ['wl-paste', ['--no-newline']],
+        ['xclip', ['-selection', 'clipboard', '-o']],
+        ['xsel', ['--clipboard', '--output']],
+        ['powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', 'Get-Clipboard']],
+      ]
+      : [
+        ['xclip', ['-selection', 'clipboard', '-o']],
+        ['xsel', ['--clipboard', '--output']],
+        ['wl-paste', ['--no-newline']],
+        ['powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', 'Get-Clipboard']],
+      ];
+
+  for (const [cmd, args] of commands) {
+    if (!hasCmd(cmd)) continue;
+    const out = await exec(cmd, args, maxBytes);
+    if (out !== undefined) {
+      const text = out.toString('utf8');
+      if (text.length > 0) return text;
+    }
+  }
+  return undefined;
 }
 
 export interface GitStatusEntry {

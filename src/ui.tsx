@@ -74,6 +74,7 @@ import {
   loadDirectorySummaryResources,
   loadEmbeddedResourceAttachments,
   readClipboardImage,
+  readClipboardText,
   readImageAttachment,
   readGitFileDiff,
   readWorkspaceTextPreview,
@@ -2183,14 +2184,18 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     });
   }
 
-  function attachClipboardImage(): void {
+  function attachClipboardImage(allowTextFallback = false): void {
     if (quitting || authBusy || permissions.length) return;
-    if (agent && !agent.promptCapabilities?.image) {
+    if (!allowTextFallback && agent && !agent.promptCapabilities?.image) {
       showToast('Images not supported', 'This ACP agent did not advertise image prompt support');
       return;
     }
-    void readClipboardImage().then(loaded => {
+    void readClipboardImage({ cwd: options.cwd }).then(loaded => {
       if (quitting) return;
+      if (agent && !agent.promptCapabilities?.image) {
+        showToast('Images not supported', 'This ACP agent did not advertise image prompt support');
+        return;
+      }
       const st = stateManager.getActive();
       if (!st.attachedImages.some(item => item.path === loaded.path)) {
         st.attachedImages = [...st.attachedImages, loaded];
@@ -2199,8 +2204,35 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       showToast('Attached clipboard image', `${loaded.mimeType} (${Math.max(1, Math.round(loaded.size / 1024))} KB)`);
       render();
       surface?.focus(DOCK_DRAFT_ID);
-    }).catch(error => {
-      if (!quitting) showToast('Clipboard image unavailable', error instanceof Error ? error.message : String(error));
+    }).catch(async error => {
+      if (quitting) return;
+      const msg = error instanceof Error ? error.message : String(error);
+      if (allowTextFallback && msg.includes('does not contain')) {
+        const clipText = await readClipboardText().catch(() => undefined);
+        if (quitting) return;
+        if (clipText) {
+          const pastedImg = resolvePastedImagePath(options.cwd, clipText);
+          if (pastedImg) {
+            attachFile(pastedImg);
+            return;
+          }
+          const st = stateManager.getActive();
+          const result = draftKey(
+            st.draft,
+            { name: 'paste', text: clipText, ctrl: false, alt: false, shift: false, meta: false },
+            { wrapWidth: editorWrapWidth() },
+          );
+          recordUndo(st.draft, result.draft);
+          st.draft = result.draft;
+          autocompleteDismissed = false;
+          commandSelection = 0;
+          fileSelection = 0;
+          render();
+          surface?.focus(DOCK_DRAFT_ID);
+          return;
+        }
+      }
+      showToast('Clipboard image unavailable', msg);
     });
   }
 
@@ -3555,6 +3587,18 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
                 onEdit={event => {
                   if (!authBusy) {
                     const currentSt = stateManager.getActive();
+                    const pastedImg = event.text && event.text.length >= 4
+                      ? resolvePastedImagePath(options.cwd, event.text)
+                      : undefined;
+                    if (pastedImg) {
+                      if (event.from !== event.to) {
+                        const cleared = editDraft(currentSt.draft, { ...event, text: '', cursor: event.from });
+                        recordUndo(currentSt.draft, cleared);
+                        currentSt.draft = cleared;
+                      }
+                      attachFile(pastedImg);
+                      return;
+                    }
                     const next = editDraft(currentSt.draft, event);
                     recordUndo(currentSt.draft, next);
                     currentSt.draft = next;
@@ -4679,15 +4723,23 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         applyUndo();
         continue;
       }
-      if (key.alt && !key.ctrl && key.name === 'v') {
-        attachClipboardImage();
+      if (key.alt && !key.ctrl && !key.meta && key.name === 'v') {
+        attachClipboardImage(false);
+        continue;
+      }
+      if (key.ctrl && !key.alt && !key.meta && !key.shift && key.name === 'v') {
+        attachClipboardImage(true);
         continue;
       }
       if (key.ctrl && !key.alt && !key.meta && (key.name === 'up' || key.name === 'down')) {
         jumpUserTurn(key.name === 'up' ? -1 : 1);
         continue;
       }
-      if (key.name === 'paste' && key.text) {
+      if (key.name === 'paste') {
+        if (!key.text?.trim()) {
+          attachClipboardImage(false);
+          continue;
+        }
         const pastedImg = resolvePastedImagePath(options.cwd, key.text);
         if (pastedImg) {
           attachFile(pastedImg);

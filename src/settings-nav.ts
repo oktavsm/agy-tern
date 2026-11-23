@@ -438,7 +438,7 @@ export function buildSettingsViewData(input: SettingsViewInput): SettingsViewDat
         { id: 'k-undo', label: 'Undo composer edit', control: { k: 'keys', keys: [['ctrl', 'z']] } },
         { id: 'k-slash', label: 'Slash commands', control: { k: 'keys', keys: [['/']] } },
         { id: 'k-at', label: 'Attach file/dir/image (or paste image path)', control: { k: 'keys', keys: [['@']] } },
-        { id: 'k-paste-img', label: 'Attach screenshot from system clipboard', control: { k: 'keys', keys: [['alt', 'v']] } },
+        { id: 'k-paste-img', label: 'Paste screenshot/image (or text) from system clipboard', control: { k: 'keys', keys: [['ctrl', 'v'], ['alt', 'v']] } },
         { id: 'k-settings-nav', label: 'Settings navigation (pages / rows / values / apply)', control: { k: 'keys', keys: [['tab'], ['up'], ['down'], ['left'], ['right'], ['enter']] } },
         { id: 'k-stop', label: 'Stop turn / Close modal', control: { k: 'keys', keys: [['esc']] } },
         { id: 'k-scroll', label: 'Scroll conversation', control: { k: 'keys', keys: [['page_up'], ['page_down']] } },

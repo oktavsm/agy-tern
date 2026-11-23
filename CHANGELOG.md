@@ -2,6 +2,13 @@
 
 All notable changes to `agy-tern` are documented in this file.
 
+## [0.3.6] - 2026-11-23
+
+### Fixed
+- Added `Ctrl+V` clipboard paste support in [src/ui.tsx](src/ui.tsx) alongside `Alt+V` and `/paste-image`: attaches screenshots or copied image files (`text/uri-list`) when present on the clipboard, and seamlessly falls back to pasting clipboard text (`readClipboardText`) when no image is copied.
+- Intercepted pasted or dropped local image file paths inside Tern's native `<editor>` `onEdit` handler (and empty bracketed paste fallback) so `Ctrl+Shift+V` and drag-and-drop image paths attach automatically as `[Image: ...]` chips.
+- Extended `readClipboardImage` in [src/files.ts](src/files.ts) and `--doctor` in [src/cli.tsx](src/cli.tsx) with parameterized MIME matching, file-manager `text/uri-list` image resolution (Nautilus/Dolphin), built-in macOS `osascript` (`NSPasteboard`) fallback, WSL `powershell.exe` fallback, and distro-aware `wl-clipboard` (`dnf`/`apt`) install hints.
+
 ## [0.3.5] - 2026-11-22
 
 ### Fixed

@@ -72,7 +72,11 @@ function detectClipboardCommand(): string | undefined {
 }
 
 function detectClipboardPasteCommand(): string | undefined {
-  const candidates = process.platform === 'darwin' ? ['pngpaste'] : ['wl-paste', 'xclip'];
+  const candidates = process.platform === 'darwin'
+    ? ['pngpaste', 'osascript']
+    : process.env.WAYLAND_DISPLAY
+      ? ['wl-paste', 'xclip', 'powershell.exe']
+      : ['xclip', 'wl-paste', 'powershell.exe'];
   for (const cmd of candidates) {
     const found = Bun.which(cmd);
     if (found) return found;
@@ -152,7 +156,7 @@ async function main(): Promise<void> {
       'ACP: stdio and sandbox options available',
       `Tern: ${ternPath ? `${ternPath}${ternVersion ? ` (${ternVersion})` : ''}` : 'not on PATH (official agy fallback available)'}`,
       `Clipboard copy: ${clipboard ?? 'not found (install wl-copy, xclip, or xsel)'}`,
-      `Clipboard image paste: ${clipboardPaste ?? 'not found (install wl-paste or xclip)'}`,
+      `Clipboard image paste: ${clipboardPaste ?? (process.platform === 'darwin' ? 'not found (install pngpaste or ensure osascript is available)' : process.env.WAYLAND_DISPLAY ? 'not found (install wl-clipboard: sudo dnf install wl-clipboard / sudo apt install wl-clipboard)' : 'not found (install xclip: sudo dnf install xclip / sudo apt install xclip)')}`,
       ...(symlink ? [`Launcher: ${symlink.path} -> ${symlink.target} (${symlink.valid ? 'ok' : 'broken'})`] : []),
       `Workspace: ${report.workspace}`,
       'Authentication and OS sandbox enforcement: not checked',
