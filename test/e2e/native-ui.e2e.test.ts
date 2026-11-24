@@ -43,6 +43,7 @@ describe('agy-tern native Tern E2E smoke', () => {
     // Verify Antigravity logo PNG blob renders on welcome screen and carries through to assistant message avatars.
     const brandAvatar = harness.findById('main.conversation.empty-wrap.agy-brand');
     expect(brandAvatar?.k).toBe('avatar');
+    expect(harness.findById('main.conversation')?.p['role']).toBe('agy.conversation');
     const brandBlob = String(brandAvatar?.p['blob'] ?? '');
     expect(brandBlob.length).toBeGreaterThan(0);
     expect(harness.getBlobs().get(brandBlob)?.mime).toBe('image/png');

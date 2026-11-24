@@ -202,6 +202,21 @@ export type NativeChatResult =
 const DOCK_DRAFT_ID = 'dock.shell.composer.line.draft';
 
 const COMPOSER_LAYOUT_CSS = [
+  ".sf-scroll[data-role='agy.conversation'] > .sf-scroll-view {",
+  '  box-sizing: border-box;',
+  '  padding: 12px max(20px, calc((100% - 94ch) / 2)) 16px;',
+  '}',
+  ".sf-row[data-role='agy.tabs'] {",
+  '  box-sizing: border-box;',
+  '  padding: 8px max(20px, calc((100% - 94ch) / 2)) 4px;',
+  '}',
+  '@media (max-width: 560px) {',
+  "  .sf-scroll[data-role='agy.conversation'] > .sf-scroll-view,",
+  "  .sf-row[data-role='agy.tabs'] {",
+  '    padding-left: 12px;',
+  '    padding-right: 12px;',
+  '  }',
+  '}',
   ".sf-col[data-role='agy.dock.center'] {",
   '  width: 100%;',
   '  max-width: 92ch;',
@@ -3499,7 +3514,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
             disabled={(busy || !!permission || !!sessionOperation || !agent || disconnected) && 'Wait until current turn finishes'}
             onClick={newConversation}>New</button>
         </row>}
-        <scroll key="conversation" bar="always" stick={visibleEntries.length ? 'end' : undefined}
+        <scroll key="conversation" role="agy.conversation" bar="always" stick={visibleEntries.length ? 'end' : undefined}
           max={session?.caps.features.includes('styles') ? undefined : { h: layout.scrollMaxH }} gap="md" aria="Conversation">
           {hiddenCount > 0 && <row key="older-history" justify="between" align="center" gap="sm" wrap>
             <text><span s="muted">{hiddenCount} earlier {hiddenCount === 1 ? 'entry' : 'entries'} hidden for speed</span></text>

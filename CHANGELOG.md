@@ -2,6 +2,11 @@
 
 All notable changes to `agy-tern` are documented in this file.
 
+## [0.4.2] - 2026-11-24
+
+### Improved
+- Added responsive horizontal and vertical transcript padding inside `COMPOSER_LAYOUT_CSS` in [src/ui.tsx](src/ui.tsx) (`.sf-scroll[data-role='agy.conversation'] > .sf-scroll-view` and `[data-role='agy.tabs']`) so messages, thoughts, and tool outputs sit with balanced breathing room aligned to the centered composer column instead of flush against the left pane edge.
+
 ## [0.4.1] - 2026-11-24
 
 ### Improved
