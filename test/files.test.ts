@@ -7,6 +7,7 @@ import {
   atMentionQuery,
   detectGitStatus,
   discardGitPath,
+  drillDownAtMention,
   extractInlineReferenceDecor,
   filterWorkspaceEntries,
   filterWorkspaceFiles,
@@ -52,6 +53,28 @@ describe('workspace @file mention helpers', () => {
     expect(atMentionQuery('@', 1)).toEqual({ start: 0, end: 1, query: '' });
     expect(atMentionQuery('user@example.com', 16)).toBeUndefined();
     expect(atMentionQuery('check @src/ui now', 17)).toBeUndefined();
+    expect(atMentionQuery('check @"My Folder/Lap', 21)).toEqual({ start: 6, end: 21, query: 'My Folder/Lap', quoted: true });
+    expect(atMentionQuery('check @My\\ Folder/Lap', 21)).toEqual({ start: 6, end: 21, query: 'My Folder/Lap' });
+
+    const dirMention = atMentionQuery('inspect @docs', 13)!;
+    expect(drillDownAtMention({ text: 'inspect @docs', cursor: 13 }, dirMention, 'docs/')).toEqual({
+      text: 'inspect @docs/',
+      cursor: 14,
+    });
+    const spaceMention = atMentionQuery('inspect @my', 11)!;
+    const drilledSpace = drillDownAtMention({ text: 'inspect @my', cursor: 11 }, spaceMention, 'My Folder/');
+    expect(drilledSpace).toEqual({
+      text: 'inspect @"My Folder/',
+      cursor: 20,
+    });
+    expect(atMentionQuery(drilledSpace.text, drilledSpace.cursor)).toEqual({
+      start: 8,
+      end: 20,
+      query: 'My Folder/',
+      quoted: true,
+    });
+    expect(inlineAttachmentToken('My Folder/Laporan Akhir.pdf', 'file')).toBe('@"My Folder/Laporan Akhir.pdf"');
+    expect(inlineAttachmentToken('My Folder/', 'dir')).toBe('@"My Folder/"');
   });
 
   test('strips @mention cleanly when converting to chip', () => {
@@ -68,6 +91,30 @@ describe('workspace @file mention helpers', () => {
       'src/ui.tsx',
       'src/ui-format.ts',
       'docs/ui-revamp.md',
+    ]);
+
+    const mixed = [
+      'My Folder/',
+      'My Folder/Sub Folder/',
+      'My Folder/Laporan Akhir 2026.pdf',
+      'My Folder/Sub Folder/catatan.txt',
+      'src/task-monitor.ts',
+      'src/ui-format.ts',
+    ];
+    // Case-insensitive middle-word match
+    expect(filterWorkspaceFiles(mixed, 'MONITOR')).toEqual(['src/task-monitor.ts']);
+    expect(filterWorkspaceFiles(mixed, 'akhir')).toEqual(['My Folder/Laporan Akhir 2026.pdf']);
+    // Space-separated multi-token & compact match
+    expect(filterWorkspaceFiles(mixed, 'laporan 2026')).toEqual(['My Folder/Laporan Akhir 2026.pdf']);
+    expect(filterWorkspaceFiles(mixed, 'myfolder')).toContain('My Folder/');
+    // Ordered fuzzy subsequence match
+    expect(filterWorkspaceFiles(mixed, 'ufmt')).toEqual(['src/ui-format.ts']);
+    // Directory drill-down puts directory first, then immediate children, then deeper descendants
+    expect(filterWorkspaceFiles(mixed, 'My Folder/')).toEqual([
+      'My Folder/',
+      'My Folder/Sub Folder/',
+      'My Folder/Laporan Akhir 2026.pdf',
+      'My Folder/Sub Folder/catatan.txt',
     ]);
   });
 

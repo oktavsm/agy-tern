@@ -2,6 +2,12 @@
 
 All notable changes to `agy-tern` are documented in this file.
 
+## [0.4.1] - 2026-11-24
+
+### Improved
+- Interactive `@` directory drill-down in [src/files.ts](src/files.ts) and [src/ui.tsx](src/ui.tsx): pressing `Tab` on a directory keeps the `@` selector open and drills into that folder (`@dir/` or auto-quoted `@"dir with spaces/"`) so you can continue browsing nested subdirectories and files, while pressing `Enter` attaches the highlighted directory or file immediately.
+- Flexible, case-insensitive `@` attachment search (`filterWorkspaceEntries`, `searchWorkspacePrefix`, `atMentionQuery`): supports middle-of-name matches (`@akhir`, `@monitor`), space-separated multi-token queries via `@"..."` or `@a\ b`, compact separator-insensitive matching (`@myfolder`, `@uiformat`), ordered fuzzy subsequence matching (`@ufmt`), case-insensitive `git` pathspec lookup, and expanded result limits (16 matches / up to 8 visible popup rows on tall terminals).
+
 ## [0.4.0] - 2026-11-24
 
 ### Added

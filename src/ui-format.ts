@@ -1475,7 +1475,7 @@ export function computeResponsiveLayout(
   const proseMaxW = `${Math.max(34, Math.min(116, safeCols - 12))}ch` as const;
   const showKeyLegend = (opts.userShowKeyLegend && safeRows >= 18) || opts.hasPermission;
   const composerMaxLines = Math.min(opts.userComposerLines, Math.max(2, Math.floor(safeRows * 0.25)));
-  const dockPopupMaxLines = safeRows < 20 ? 3 : safeRows < 28 ? 4 : 6;
+  const dockPopupMaxLines = safeRows < 20 ? 3 : safeRows < 28 ? 4 : safeRows < 38 ? 6 : 8;
   const modalListMaxLines = Math.max(4, Math.min(12, Math.floor(safeRows * 0.45)));
   const dirListMaxLines = Math.max(6, Math.min(24, safeRows - 14));
   const inspectBodyMaxH = `${Math.max(5, safeRows - 9)}lines` as const;

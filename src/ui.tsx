@@ -68,6 +68,7 @@ import {
   atMentionQuery,
   detectGitStatus,
   discardGitPath,
+  drillDownAtMention,
   extractInlineReferenceDecor,
   filterWorkspaceEntries,
   formatPromptWithAttachments,
@@ -2657,9 +2658,10 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
 
   function triggerPrefixSearch(query: string): void {
     const clean = query.trim();
-    if (clean.length < 2 || prefixSearchCache.has(clean) || prefixSearchInFlight.has(clean) || quitting) return;
+    const minLen = clean.endsWith('/') ? 1 : 2;
+    if (clean.length < minLen || prefixSearchCache.has(clean) || prefixSearchInFlight.has(clean) || quitting) return;
     prefixSearchInFlight.add(clean);
-    void searchWorkspacePrefix(options.cwd, clean, 120, options.additionalDirectories).then(found => {
+    void searchWorkspacePrefix(options.cwd, clean, 180, options.additionalDirectories).then(found => {
       prefixSearchInFlight.delete(clean);
       if (prefixSearchCache.size >= 32) {
         const oldest = prefixSearchCache.keys().next().value;
@@ -2699,13 +2701,32 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       }
       available.push(entry);
     }
-    const matches = filterWorkspaceEntries(available, mention.query, 10);
+    const matches = filterWorkspaceEntries(available, mention.query, 16);
     cachedAtKey = key;
     cachedAtResult = matches;
-    if ((workspaceEntries.length >= 2_400 || (mention.query.includes('/') && matches.length < 5)) && !prefixExtra.length) {
+    if ((mention.query.endsWith('/') || workspaceEntries.length >= 2_400 || matches.length < 8) && !prefixExtra.length) {
       triggerPrefixSearch(mention.query);
     }
     return matches;
+  }
+
+  function browseDirectoryMention(entry: WorkspaceEntry): void {
+    const st = stateManager.getActive();
+    const mention = activeAtMention();
+    if (!mention) {
+      attachFile(entry);
+      return;
+    }
+    const dirPath = entry.path.endsWith('/') ? entry.path : `${entry.path}/`;
+    const nextDraft = drillDownAtMention(st.draft, mention, dirPath);
+    recordUndo(st.draft, nextDraft);
+    st.draft = nextDraft;
+    fileSelection = 0;
+    autocompleteDismissed = false;
+    cachedAtKey = '';
+    triggerPrefixSearch(dirPath);
+    render();
+    surface?.focus(DOCK_DRAFT_ID);
   }
 
   function isDirectoryTarget(targetPath: string): boolean {
@@ -3600,12 +3621,12 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
               const label = isDir ? `${basename(cleanPath) || cleanPath}/` : basename(entry.path);
               const detail = entry.ignored ? `${entry.path} [gitignored]` : entry.path;
               const value = isDir
-                ? (entry.ignored ? 'Dir · gitignored' : 'Directory')
+                ? (entry.ignored ? 'Tab open · Enter attach · gitignored' : 'Tab open · Enter attach')
                 : isImg
                   ? (entry.ignored ? 'Image · gitignored' : 'Image')
                   : (entry.ignored ? 'gitignored' : 'Attach');
               return <item key={`row-${index}`} icon={icon} label={label}
-                detail={detail} value={value} title={`Attach ${detail}`}
+                detail={detail} value={value} title={isDir ? `Tab to browse inside ${detail}, Enter/click to attach` : `Attach ${detail}`}
                 onClick={() => attachFile(entry)} />;
             })}
           </list>}
@@ -4877,7 +4898,12 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         continue;
       }
       if (fileMatches.length && !key.shift && (key.name === 'enter' || key.name === 'tab')) {
-        attachFile(fileMatches[Math.min(fileSelection, fileMatches.length - 1)]!);
+        const chosen = fileMatches[Math.min(fileSelection, fileMatches.length - 1)]!;
+        if (key.name === 'tab' && chosen.kind === 'dir') {
+          browseDirectoryMention(chosen);
+        } else {
+          attachFile(chosen);
+        }
         continue;
       }
       if (key.name === 'page_up' || key.name === 'page_down') {

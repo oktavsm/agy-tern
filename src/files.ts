@@ -380,17 +380,41 @@ export interface AtMention {
   start: number;
   end: number;
   query: string;
+  quoted?: boolean;
 }
 
-/** Detect an active `@file` or `@dir/` mention immediately preceding the caret. */
+/**
+ * Detect an active `@file`, `@dir/`, `@"path with spaces`, or `@path\ with\ spaces` mention
+ * immediately preceding the caret. Ignores email addresses and completed prose mentions.
+ */
 export function atMentionQuery(text: string, cursor: number): AtMention | undefined {
   const safeCursor = Math.max(0, Math.min(cursor, text.length));
   const before = text.slice(0, safeCursor);
-  const match = /(?:^|[\s(])@([^\s@]*)$/.exec(before);
+  const quotedMatch = /(?:^|[\s(])@"([^"@\n]*)$/.exec(before);
+  if (quotedMatch) {
+    const query = quotedMatch[1]!;
+    const start = safeCursor - query.length - 2;
+    return { start, end: safeCursor, query, quoted: true };
+  }
+  const match = /(?:^|[\s(])@((?:\\ |[^\s@])*)$/.exec(before);
   if (!match) return undefined;
-  const query = match[1]!;
-  const start = safeCursor - query.length - 1;
+  const raw = match[1]!;
+  const start = safeCursor - raw.length - 1;
+  const query = raw.replace(/\\ /g, ' ');
   return { start, end: safeCursor, query };
+}
+
+/** Replace the active `@query` with a directory drill-down prefix (`@dir/` or `@"dir with space/`) keeping autocomplete open. */
+export function drillDownAtMention(draft: Draft, mention: AtMention, dirPath: string): Draft {
+  const normalized = ensureTrailingSlash(dirPath.replace(/\\/g, '/'));
+  const needsQuote = Boolean(mention.quoted || /\s/.test(normalized));
+  const inserted = needsQuote ? `@"${normalized}` : `@${normalized}`;
+  const before = draft.text.slice(0, mention.start);
+  const after = draft.text.slice(mention.end);
+  return {
+    text: `${before}${inserted}${after}`,
+    cursor: mention.start + inserted.length,
+  };
 }
 
 /** Remove the `@query` token when turning it into an attached chip. */
@@ -405,7 +429,8 @@ export function stripAtMention(draft: Draft, mention: AtMention): Draft {
 /** Build the inline composer token displayed for an attached workspace path or image. */
 export function inlineAttachmentToken(pathValue: string, kind: 'file' | 'dir' | 'image'): string {
   if (kind === 'image') return `[Image: ${basename(pathValue)}]`;
-  return kind === 'dir' ? `@${ensureTrailingSlash(pathValue)}` : `@${pathValue}`;
+  const target = kind === 'dir' ? ensureTrailingSlash(pathValue) : pathValue;
+  return /\s/.test(target) ? `@"${target}"` : `@${target}`;
 }
 
 /** Replace the active `@query` span with an inline token and trailing space. */
@@ -547,17 +572,64 @@ function addAncestorDirs(
   }
 }
 
-function scoreEntryPath(entryPath: string, needle: string): number {
+function isOrderedSubsequence(haystack: string, needle: string): boolean {
+  if (!needle) return true;
+  let pos = 0;
+  for (let i = 0; i < haystack.length && pos < needle.length; i++) {
+    if (haystack[i] === needle[pos]) pos++;
+  }
+  return pos === needle.length;
+}
+
+function compactSearchKey(value: string): string {
+  return value.toLowerCase().replace(/[\s_-]+/g, '');
+}
+
+function scoreEntryPath(entryPath: string, rawNeedle: string): number {
+  const needle = rawNeedle.replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase();
   const cleanNeedle = trimTrailingSlash(needle);
-  const cleanPath = trimTrailingSlash(entryPath);
-  const lower = entryPath.toLowerCase();
+  const normalizedPath = entryPath.replace(/\\/g, '/');
+  const cleanPath = trimTrailingSlash(normalizedPath);
+  const lower = normalizedPath.toLowerCase();
   const cleanLower = cleanPath.toLowerCase();
   const base = basename(cleanPath).toLowerCase();
+
+  // Directory drill-down mode (`@dir/`): prioritize the directory itself, then immediate children, then deeper descendants.
+  if (needle.endsWith('/')) {
+    if (lower === needle) return 0;
+    if (lower.startsWith(needle)) {
+      const rest = trimTrailingSlash(cleanLower.slice(needle.length));
+      if (!rest.includes('/')) {
+        return normalizedPath.endsWith('/') ? 1 : 2;
+      }
+      return 3;
+    }
+    return -1;
+  }
+
   if (base === cleanNeedle || cleanLower === cleanNeedle || lower === needle) return 0;
-  if (base.startsWith(needle) || (!needle.endsWith('/') && base.startsWith(cleanNeedle))) return 1;
+  if (base.startsWith(cleanNeedle)) return 1;
   if (lower.startsWith(needle)) return 2;
   if (base.includes(cleanNeedle)) return 3;
   if (lower.includes(needle)) return 4;
+
+  const compactNeedle = compactSearchKey(cleanNeedle);
+  if (compactNeedle.length >= 2) {
+    const compactBase = compactSearchKey(base);
+    if (compactBase.includes(compactNeedle)) return 5;
+    const compactPath = compactSearchKey(cleanLower);
+    if (compactPath.includes(compactNeedle)) return 6;
+  }
+
+  const tokens = cleanNeedle.split(/[\s/_-]+/).filter(Boolean);
+  if (tokens.length > 1 && tokens.every(tok => lower.includes(tok))) {
+    return tokens.every(tok => base.includes(tok)) ? 5 : 7;
+  }
+
+  if (compactNeedle.length >= 2) {
+    if (isOrderedSubsequence(compactSearchKey(base), compactNeedle)) return 8;
+    if (isOrderedSubsequence(compactSearchKey(cleanLower), compactNeedle)) return 9;
+  }
   return -1;
 }
 
@@ -565,7 +637,7 @@ function scoreEntryPath(entryPath: string, needle: string): number {
 export function filterWorkspaceEntries(
   entries: readonly WorkspaceEntry[],
   query: string,
-  limit = 10,
+  limit = 16,
 ): WorkspaceEntry[] {
   const needle = query.trim().toLowerCase();
   if (!needle) {
@@ -587,7 +659,7 @@ export function filterWorkspaceEntries(
 }
 
 /** Rank workspace relative paths by basename/prefix/substring relevance. */
-export function filterWorkspaceFiles(files: readonly string[], query: string, limit = 10): string[] {
+export function filterWorkspaceFiles(files: readonly string[], query: string, limit = 16): string[] {
   return filterWorkspaceEntries(
     files.map(file => ({ path: file, kind: file.endsWith('/') ? 'dir' : 'file', ignored: false })),
     query,
@@ -603,8 +675,8 @@ export function formatPromptWithAttachments(
 ): string {
   if (!attachments.length && !directories.length) return text;
   const tags = [
-    ...attachments.map(file => `@${file}`),
-    ...directories.map(dir => `@${ensureTrailingSlash(dir)}`),
+    ...attachments.map(file => inlineAttachmentToken(file, 'file')),
+    ...directories.map(dir => inlineAttachmentToken(dir, 'dir')),
   ].filter(tag => findInlineTokenRanges(text, tag).length === 0);
   if (!tags.length) return text.trim() || text;
   const header = tags.join(' ');
@@ -740,15 +812,15 @@ export async function listWorkspaceEntries(
 }
 
 function sanitizePrefixPattern(query: string): { dirPrefix: string; pattern: string } | undefined {
-  const clean = query.trim().replace(/^@+/, '').replace(/\\/g, '/').replace(/^\/+/, '');
+  const clean = query.trim().replace(/^@+/, '').replace(/^"/, '').replace(/\\/g, '/').replace(/^\/+/, '');
   if (!clean || clean.includes('\0') || clean.startsWith('-') || clean.split('/').some(seg => seg === '..')) {
     return undefined;
   }
   const slashIdx = clean.lastIndexOf('/');
   const dirPrefix = slashIdx >= 0 ? clean.slice(0, slashIdx + 1) : '';
   const tail = clean.slice(slashIdx + 1);
-  if (dirPrefix) return { dirPrefix, pattern: tail ? `${dirPrefix}*${tail}*` : `${dirPrefix}**` };
-  return { dirPrefix: '', pattern: `*${clean}*` };
+  if (dirPrefix) return { dirPrefix, pattern: tail ? `:(icase)${dirPrefix}*${tail}*` : `${dirPrefix}` };
+  return { dirPrefix: '', pattern: `:(icase)*${clean}*` };
 }
 
 /**
@@ -841,14 +913,14 @@ export async function searchWorkspacePrefix(
   };
 
   const gitOk = await collectGit(cwd);
-  if (!gitOk && parsed.dirPrefix) {
+  if (parsed.dirPrefix && (!gitOk || map.size < limit)) {
     const targetDir = resolve(cwd, trimTrailingSlash(parsed.dirPrefix));
     const relTarget = relative(resolve(cwd), targetDir);
     if (!relTarget.startsWith('..') && !isAbsolute(relTarget)) {
       const walked = await walkDirectoryEntries(targetDir, limit, trimTrailingSlash(parsed.dirPrefix));
       for (const item of walked) {
         if (map.size >= limit) break;
-        map.set(item.path, item);
+        if (!map.has(item.path)) map.set(item.path, item);
       }
     }
   }

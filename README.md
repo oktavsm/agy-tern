@@ -152,7 +152,7 @@ agy-tern --doctor                                 # Verify agy, tern, Bun, and c
 <summary>Keyboard Controls & Slash Commands</summary>
 
 **Keyboard Controls**:
-- **Send / Queue**: `Enter` sends (or queues follow-up prompts while busy); `Shift+Enter` inserts a newline; multiline pastes stay in the draft.
+- **Send / Queue / `@` Attachments**: `Enter` sends (or queues follow-up prompts while busy); `Shift+Enter` inserts a newline; in `@` autocomplete press `Tab` on a directory to drill into its contents (auto-quoting folders with spaces as `@"..."`), `Enter` to attach, and search case-insensitively by middle words, multi-word tokens, or fuzzy subsequences.
 - **Composer Editing**: `Ctrl+A` / `Ctrl+E` (line start/end), `Ctrl+Left`/`Right` or `Alt+B`/`F` (word jump), `Up`/`Down` (wrapped lines or prompt history `History i/N`), `Ctrl+W`/`U`/`K`, `Ctrl+Z` (undo).
 - **Quick Panels & Session Tabs**: `Ctrl+K` opens the command palette, `Ctrl+Tab` / `Alt+1..6` switch between open session tabs, and `/keys` shows the full shortcut reference.
 - **Modals & Turns**: `Esc` closes overlays without cancelling a running turn; during an active turn with no modal open, `Esc` cancels the turn. `Ctrl+Q` quits cleanly.
