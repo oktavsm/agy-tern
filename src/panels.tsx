@@ -1719,6 +1719,7 @@ function renderFollowUpOverlay(
   const updateAnswer = (fieldName: string, value: QuestionAnswerValue, fieldIdx: number): void => {
     ctx.onUpdateFollowUp?.(draft => {
       draft.activeFieldIdx = fieldIdx;
+      draft.focusedInput = undefined;
       draft.answers[fieldName] = value;
       draft.customDrafts[fieldName] = '';
       draft.error = undefined;
@@ -1728,6 +1729,7 @@ function renderFollowUpOverlay(
   const toggleMultiOption = (fieldName: string, optionValue: string, fieldIdx: number): void => {
     ctx.onUpdateFollowUp?.(draft => {
       draft.activeFieldIdx = fieldIdx;
+      draft.focusedInput = undefined;
       const prev = Array.isArray(draft.answers[fieldName]) ? [...(draft.answers[fieldName] as string[])] : [];
       const existingIdx = prev.indexOf(optionValue);
       if (existingIdx >= 0) prev.splice(existingIdx, 1);
@@ -1785,7 +1787,7 @@ function renderFollowUpOverlay(
               {isActive && fields.length > 1 ? <span s="muted"> (active)</span> : ''}
             </text>
             {field.description && <text wrap="word"><span s="muted">{field.description}</span></text>}
-            {field.kind === 'single-select' && <col gap="xs">
+            {field.kind === 'single-select' && <col key="choices" gap="xs">
               {field.options.map((opt, optIdx) => {
                 const chosen = val === opt.value;
                 return <button key={`opt-${optIdx}`} size="sm" variant={chosen ? 'primary' : 'default'}
@@ -1796,17 +1798,22 @@ function renderFollowUpOverlay(
                 </button>;
               })}
               {field.allowCustom && <input key={`custom-${field.name}`}
+                variant="field"
                 aria={`Custom answer for ${field.label}`}
                 text={st?.customDrafts[field.name] ?? ''}
                 cursor={st?.draftCursors?.[`custom:${field.name}`]?.cursor ?? (st?.customDrafts[field.name] ?? '').length}
                 anchor={st?.draftCursors?.[`custom:${field.name}`]?.anchor}
                 placeholder="Or type a custom answer..."
                 onFocus={event => {
-                  ctx.onUpdateFollowUp?.(draft => { draft.activeFieldIdx = idx; });
+                  ctx.onUpdateFollowUp?.(draft => {
+                    draft.activeFieldIdx = idx;
+                    draft.focusedInput = 'custom';
+                  });
                   ctx.onFocus(event.id);
                 }}
                 onEdit={event => ctx.onUpdateFollowUp?.(draft => {
                   draft.activeFieldIdx = idx;
+                  draft.focusedInput = 'custom';
                   draft.answers[field.name] = '';
                   draft.customDrafts[field.name] = applyInputEdit(
                     draft,
@@ -1839,17 +1846,22 @@ function renderFollowUpOverlay(
             </row>}
             {(field.kind === 'text' || field.kind === 'number' || field.kind === 'integer') && (
               <input key={`input-${field.name}`}
+                variant="field"
                 aria={field.label}
                 text={typeof val === 'string' ? val : ''}
                 cursor={st?.draftCursors?.[`answer:${field.name}`]?.cursor ?? (typeof val === 'string' ? val.length : 0)}
                 anchor={st?.draftCursors?.[`answer:${field.name}`]?.anchor}
                 placeholder={field.kind === 'text' ? 'Type your answer...' : `Enter ${field.kind}...`}
                 onFocus={event => {
-                  ctx.onUpdateFollowUp?.(draft => { draft.activeFieldIdx = idx; });
+                  ctx.onUpdateFollowUp?.(draft => {
+                    draft.activeFieldIdx = idx;
+                    draft.focusedInput = 'answer';
+                  });
                   ctx.onFocus(event.id);
                 }}
                 onEdit={event => ctx.onUpdateFollowUp?.(draft => {
                   draft.activeFieldIdx = idx;
+                  draft.focusedInput = 'answer';
                   const prevText = typeof draft.answers[field.name] === 'string' ? (draft.answers[field.name] as string) : '';
                   draft.answers[field.name] = applyInputEdit(draft, `answer:${field.name}`, prevText, event);
                   draft.error = undefined;
@@ -1857,16 +1869,24 @@ function renderFollowUpOverlay(
             )}
           </col>;
         })}
-        {p.source === 'prompt' && <col gap="xs">
-          <text><span s="muted">Additional note (optional)</span></text>
+        {p.source === 'prompt' && <col key="note-wrap" gap="xs">
+          <text>
+            <span s="muted">Additional note (optional)</span>
+            {st?.focusedInput === 'note' && <span s="accent"> (active)</span>}
+          </text>
           <input key="free-note"
+            variant="field"
             aria="Additional note"
             text={st?.freeNote ?? ''}
             cursor={st?.draftCursors?.['free-note']?.cursor ?? (st?.freeNote ?? '').length}
             anchor={st?.draftCursors?.['free-note']?.anchor}
             placeholder="Add extra clarification if needed..."
-            onFocus={event => ctx.onFocus(event.id)}
+            onFocus={event => {
+              ctx.onUpdateFollowUp?.(draft => { draft.focusedInput = 'note'; });
+              ctx.onFocus(event.id);
+            }}
             onEdit={event => ctx.onUpdateFollowUp?.(draft => {
+              draft.focusedInput = 'note';
               draft.freeNote = applyInputEdit(draft, 'free-note', draft.freeNote, event);
             })} />
         </col>}

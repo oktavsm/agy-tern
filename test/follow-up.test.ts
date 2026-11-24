@@ -3,9 +3,13 @@ import {
   createFollowUpSessionState,
   extractMarkdownFollowUpQuestions,
   extractToolFollowUpQuestions,
+  FOLLOW_UP_FREE_NOTE_ID,
+  followUpAnswerInputId,
+  followUpCustomInputId,
   followUpFocusTarget,
   formatFollowUpPromptReply,
   parseElicitationRequest,
+  stepFollowUpKey,
   validateElicitationAnswers,
 } from '../src/follow-up';
 
@@ -175,5 +179,64 @@ describe('follow-up question and ACP elicitation helpers', () => {
       ok: true,
       content: { env: 'canary' },
     });
+  });
+
+  test('supports direct keyboard typing, Tab cycling, and deterministic focus targets across answer, custom, and free-note inputs', () => {
+    const k = (name: string, text?: string, extra: Partial<{ shift: boolean; ctrl: boolean; alt: boolean; meta: boolean }> = {}) => ({
+      name,
+      ...(text !== undefined ? { text } : {}),
+      ctrl: false,
+      alt: false,
+      shift: false,
+      meta: false,
+      ...extra,
+    });
+
+    // 1) Text question: direct typing + backspace + Tab to free-note.
+    const textState = createFollowUpSessionState('Follow-up', '', [
+      { kind: 'text', name: 'q1', label: 'Which branch?', required: false },
+    ]);
+    expect(followUpFocusTarget(textState)).toBe(followUpAnswerInputId('q1'));
+    expect(stepFollowUpKey(textState, k('m', 'm'), { hasFreeNote: true })).toEqual({
+      handled: true,
+      focusTarget: followUpAnswerInputId('q1'),
+    });
+    stepFollowUpKey(textState, k('a', 'a'), { hasFreeNote: true });
+    stepFollowUpKey(textState, k('x', 'x'), { hasFreeNote: true });
+    stepFollowUpKey(textState, k('backspace'), { hasFreeNote: true });
+    stepFollowUpKey(textState, k('i', 'i'), { hasFreeNote: true });
+    stepFollowUpKey(textState, k('n', 'n'), { hasFreeNote: true });
+    expect(textState.answers.q1).toBe('main');
+
+    const tabToNote = stepFollowUpKey(textState, k('tab'), { hasFreeNote: true });
+    expect(tabToNote).toEqual({ handled: true, focusTarget: FOLLOW_UP_FREE_NOTE_ID });
+    stepFollowUpKey(textState, k('o', 'o'), { hasFreeNote: true });
+    stepFollowUpKey(textState, k('k', 'k'), { hasFreeNote: true });
+    expect(textState.freeNote).toBe('ok');
+
+    // 2) Single-select with allowCustom: direct typing switches to custom input, Up/Down still cycles options, Tab cycles choice -> custom -> note.
+    const mcState = createFollowUpSessionState('Follow-up', '', [{
+      kind: 'single-select',
+      name: 'q1',
+      label: 'Pick option',
+      required: false,
+      allowCustom: true,
+      options: [{ value: 'A', label: 'A' }, { value: 'B', label: 'B' }],
+    }]);
+    expect(followUpFocusTarget(mcState)).toBeNull();
+    const typedCustom = stepFollowUpKey(mcState, k('c', 'c'), { hasFreeNote: true });
+    expect(typedCustom).toEqual({ handled: true, focusTarget: followUpCustomInputId('q1') });
+    stepFollowUpKey(mcState, k('paste', 'ustom value'), { hasFreeNote: true });
+    expect(mcState.customDrafts.q1).toBe('custom value');
+    expect(mcState.answers.q1).toBe('');
+
+    const cycledDown = stepFollowUpKey(mcState, k('down'), { hasFreeNote: true });
+    expect(cycledDown).toEqual({ handled: true, focusTarget: null });
+    expect(mcState.answers.q1).toBe('A');
+    expect(mcState.customDrafts.q1).toBe('');
+
+    expect(stepFollowUpKey(mcState, k('tab'), { hasFreeNote: true }).focusTarget).toBe(followUpCustomInputId('q1'));
+    expect(stepFollowUpKey(mcState, k('tab'), { hasFreeNote: true }).focusTarget).toBe(FOLLOW_UP_FREE_NOTE_ID);
+    expect(stepFollowUpKey(mcState, k('enter'), { hasFreeNote: true })).toEqual({ handled: true, submit: true });
   });
 });

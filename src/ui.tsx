@@ -12,6 +12,7 @@ import {
   followUpFocusTarget,
   formatFollowUpPromptReply,
   parseElicitationRequest,
+  stepFollowUpKey,
   validateElicitationAnswers,
   type FollowUpSessionState,
   type QuestionField,
@@ -4502,74 +4503,22 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
           continue;
         }
         if (current.kind === 'followup') {
-          if (key.name === 'page_up' || key.name === 'page_down' || key.name === 'home' || key.name === 'end') {
-            surface.scroll('layer.panel.overlay-scroll',
-              key.name === 'page_up' ? 'page-up'
-                : key.name === 'page_down' ? 'page-down'
-                : key.name === 'home' ? 'start' : 'end');
+          if (key.name === 'page_up' || key.name === 'page_down') {
+            surface.scroll('layer.panel.overlay-scroll', key.name === 'page_up' ? 'page-up' : 'page-down');
             continue;
           }
-          if (key.name === 'enter' && !key.shift) {
+          if (!followUpState) {
+            if (key.name === 'enter' && !key.shift) submitFollowUp();
+            continue;
+          }
+          const step = stepFollowUpKey(followUpState, key, { hasFreeNote: current.source === 'prompt' });
+          if (step.submit) {
             submitFollowUp();
             continue;
           }
-          if (followUpState && followUpState.fields.length > 0) {
-            const fields = followUpState.fields;
-            const activeField = fields[followUpState.activeFieldIdx];
-            if ((key.name === 'space' || (!key.ctrl && !key.meta && !key.alt && key.text === ' ')) &&
-              activeField?.kind === 'multi-select' && activeField.options.length > 0) {
-              const optIdx = followUpState.optionCursors?.[activeField.name] ?? 0;
-              const chosenOpt = activeField.options[optIdx];
-              if (chosenOpt) {
-                const prev = Array.isArray(followUpState.answers[activeField.name])
-                  ? [...(followUpState.answers[activeField.name] as string[])]
-                  : [];
-                const hit = prev.indexOf(chosenOpt.value);
-                if (hit >= 0) prev.splice(hit, 1);
-                else prev.push(chosenOpt.value);
-                followUpState.answers[activeField.name] = prev;
-                followUpState.error = undefined;
-                render();
-              }
-              continue;
-            }
-            if (key.name === 'tab' || key.name === 'up' || key.name === 'down' || key.name === 'left' || key.name === 'right') {
-              if ((key.name === 'up' || key.name === 'down') && activeField?.kind === 'single-select' && activeField.options.length > 0) {
-                const curVal = followUpState.answers[activeField.name];
-                const curIdx = activeField.options.findIndex(o => o.value === curVal);
-                const nextIdx = key.name === 'down'
-                  ? (curIdx + 1) % activeField.options.length
-                  : (curIdx <= 0 ? activeField.options.length - 1 : curIdx - 1);
-                followUpState.answers[activeField.name] = activeField.options[nextIdx]!.value;
-                followUpState.customDrafts[activeField.name] = '';
-                followUpState.error = undefined;
-                render();
-                continue;
-              }
-              if ((key.name === 'up' || key.name === 'down') && activeField?.kind === 'multi-select' && activeField.options.length > 0) {
-                const curIdx = followUpState.optionCursors?.[activeField.name] ?? 0;
-                const nextIdx = key.name === 'down'
-                  ? (curIdx + 1) % activeField.options.length
-                  : (curIdx <= 0 ? activeField.options.length - 1 : curIdx - 1);
-                followUpState.optionCursors = { ...(followUpState.optionCursors ?? {}), [activeField.name]: nextIdx };
-                render();
-                continue;
-              }
-              if ((key.name === 'up' || key.name === 'down' || key.name === 'left' || key.name === 'right') && activeField?.kind === 'boolean') {
-                const cur = followUpState.answers[activeField.name];
-                followUpState.answers[activeField.name] = cur === undefined ? true : !cur;
-                followUpState.error = undefined;
-                render();
-                continue;
-              }
-              if ((key.name === 'tab' || key.name === 'up' || key.name === 'down') && fields.length > 1) {
-                const step = key.name === 'up' || (key.name === 'tab' && key.shift) ? -1 : 1;
-                followUpState.activeFieldIdx = (followUpState.activeFieldIdx + fields.length + step) % fields.length;
-                render();
-                surface.focus(followUpFocusTarget(followUpState));
-                continue;
-              }
-            }
+          if (step.handled) {
+            render();
+            if (step.focusTarget !== undefined) surface.focus(step.focusTarget);
           }
           continue;
         }

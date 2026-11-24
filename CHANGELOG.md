@@ -2,6 +2,11 @@
 
 All notable changes to `agy-tern` are documented in this file.
 
+## [0.4.3] - 2026-11-24
+
+### Fixed
+- Fixed untypable textboxes inside the Follow-up modal ([src/follow-up.ts](src/follow-up.ts), [src/panels.tsx](src/panels.tsx), [src/ui.tsx](src/ui.tsx)): added `stepFollowUpKey` with full `draftKey` keyboard editing fallback for answer, custom-option, and additional-note inputs (previously all raw keystrokes were dropped by the modal key loop), added deterministic keyed container IDs (`choices`, `note-wrap`) and `variant="field"` on follow-up `<input>` controls so `surface.focus()` targets every textbox accurately, enabled full `Tab`/`Shift+Tab` cycling across choices, custom inputs, and `Additional note`, and stopped `Home`/`End` from hijacking text-cursor navigation to scroll the overlay.
+
 ## [0.4.2] - 2026-11-24
 
 ### Improved

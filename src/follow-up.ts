@@ -1,3 +1,4 @@
+import type { Key } from '@stencil-hq/tern';
 import type {
   CreateElicitationRequest,
   ElicitationContentValue,
@@ -5,6 +6,7 @@ import type {
   ElicitationSchema,
   ToolCallUpdate,
 } from '@agentclientprotocol/sdk';
+import { draftKey } from './draft';
 
 export interface QuestionOption {
   readonly value: string;
@@ -86,6 +88,7 @@ export interface FollowUpSessionState {
   answers: Record<string, QuestionAnswerValue>;
   customDrafts: Record<string, string>;
   freeNote: string;
+  focusedInput?: 'answer' | 'custom' | 'note';
   draftCursors?: Record<string, { cursor: number; anchor?: number }>;
   optionCursors?: Record<string, number>;
   error?: string;
@@ -513,15 +516,220 @@ export function extractMarkdownFollowUpQuestions(markdown: string): QuestionFiel
   }));
 }
 
+export const FOLLOW_UP_FREE_NOTE_ID = 'layer.panel.overlay-scroll.form.note-wrap.free-note';
+
+export function followUpAnswerInputId(fieldName: string): string {
+  return `layer.panel.overlay-scroll.form.field-${fieldName}.input-${fieldName}`;
+}
+
+export function followUpCustomInputId(fieldName: string): string {
+  return `layer.panel.overlay-scroll.form.field-${fieldName}.choices.custom-${fieldName}`;
+}
+
 /** Return the Tern focus target ID for the currently active follow-up input field, or null when a choice button leads. */
 export function followUpFocusTarget(state: FollowUpSessionState | undefined): string | null {
-  if (!state || !state.fields.length) return null;
+  if (!state) return null;
+  if (state.focusedInput === 'note') return FOLLOW_UP_FREE_NOTE_ID;
+  if (!state.fields.length) return null;
   const field = state.fields[state.activeFieldIdx] ?? state.fields[0];
   if (!field) return null;
   if (field.kind === 'text' || field.kind === 'number' || field.kind === 'integer') {
-    return `layer.panel.overlay-scroll.form.field-${field.name}.input-${field.name}`;
+    return followUpAnswerInputId(field.name);
+  }
+  if (field.kind === 'single-select' && field.allowCustom && state.focusedInput === 'custom') {
+    return followUpCustomInputId(field.name);
   }
   return null;
+}
+
+interface FollowUpTabStop {
+  fieldIdx: number;
+  focusedInput?: 'answer' | 'custom' | 'note';
+}
+
+function buildFollowUpTabStops(state: FollowUpSessionState, hasFreeNote: boolean): FollowUpTabStop[] {
+  const stops: FollowUpTabStop[] = [];
+  state.fields.forEach((field, idx) => {
+    if (field.kind === 'text' || field.kind === 'number' || field.kind === 'integer') {
+      stops.push({ fieldIdx: idx, focusedInput: 'answer' });
+    } else if (field.kind === 'single-select') {
+      stops.push({ fieldIdx: idx, focusedInput: undefined });
+      if (field.allowCustom) stops.push({ fieldIdx: idx, focusedInput: 'custom' });
+    } else {
+      stops.push({ fieldIdx: idx, focusedInput: undefined });
+    }
+  });
+  if (hasFreeNote) {
+    stops.push({ fieldIdx: Math.max(0, state.fields.length - 1), focusedInput: 'note' });
+  }
+  return stops;
+}
+
+function currentStopIndex(state: FollowUpSessionState, stops: readonly FollowUpTabStop[]): number {
+  if (state.focusedInput === 'note') {
+    const idx = stops.findIndex(s => s.focusedInput === 'note');
+    return idx >= 0 ? idx : 0;
+  }
+  const exact = stops.findIndex(s => s.fieldIdx === state.activeFieldIdx && s.focusedInput === state.focusedInput);
+  if (exact >= 0) return exact;
+  const byField = stops.findIndex(s => s.fieldIdx === state.activeFieldIdx);
+  return byField >= 0 ? byField : 0;
+}
+
+function isTextEditKey(key: Key): boolean {
+  if (key.name === 'paste' || key.name === 'backspace' || key.name === 'delete' ||
+    key.name === 'left' || key.name === 'right' || key.name === 'home' || key.name === 'end') {
+    return true;
+  }
+  if (key.ctrl && !key.alt && !key.meta && ['a', 'e', 'b', 'f', 'w', 'u', 'k', 'h', 'd'].includes(key.name)) {
+    return true;
+  }
+  if ((key.alt || key.meta) && !key.ctrl && ['a', 'b', 'f', 'd', 'left', 'right', 'backspace', 'delete'].includes(key.name)) {
+    return true;
+  }
+  return !key.ctrl && !key.alt && !key.meta && Boolean(key.text && key.text.length > 0);
+}
+
+function applyFollowUpDraftKey(
+  state: FollowUpSessionState,
+  cursorKey: string,
+  prevText: string,
+  key: Key,
+): { text: string; changed: boolean } {
+  const cur = state.draftCursors?.[cursorKey];
+  const prevDraft = {
+    text: prevText,
+    cursor: Math.min(cur?.cursor ?? prevText.length, prevText.length),
+    ...(cur?.anchor !== undefined ? { anchor: Math.min(cur.anchor, prevText.length) } : {}),
+  };
+  const { draft: next } = draftKey(prevDraft, key);
+  const changed = next.text !== prevDraft.text || next.cursor !== prevDraft.cursor || next.anchor !== prevDraft.anchor;
+  state.draftCursors = {
+    ...(state.draftCursors ?? {}),
+    [cursorKey]: { cursor: next.cursor, ...(next.anchor !== undefined ? { anchor: next.anchor } : {}) },
+  };
+  return { text: next.text, changed };
+}
+
+/**
+ * Handle a decoded keyboard press inside the follow-up modal, supporting option navigation,
+ * full Tab cycling across fields/custom inputs/free-note, and direct text editing fallback
+ * when Tern forwards raw keys instead of native EditEvents.
+ */
+export function stepFollowUpKey(
+  state: FollowUpSessionState,
+  key: Key,
+  options?: { hasFreeNote?: boolean },
+): { handled: boolean; submit?: boolean; focusTarget?: string | null } {
+  const hasFreeNote = Boolean(options?.hasFreeNote);
+  if (key.name === 'enter' && !key.shift) {
+    return { handled: true, submit: true };
+  }
+
+  const fields = state.fields;
+  const activeField = fields[state.activeFieldIdx];
+  const stops = buildFollowUpTabStops(state, hasFreeNote);
+
+  if (key.name === 'tab' && stops.length > 0) {
+    const curIdx = currentStopIndex(state, stops);
+    const step = key.shift ? -1 : 1;
+    const nextStop = stops[(curIdx + stops.length + step) % stops.length]!;
+    state.activeFieldIdx = nextStop.fieldIdx;
+    state.focusedInput = nextStop.focusedInput;
+    return { handled: true, focusTarget: followUpFocusTarget(state) };
+  }
+
+  if (state.focusedInput !== 'note' && activeField) {
+    if ((key.name === 'space' || (!key.ctrl && !key.meta && !key.alt && key.text === ' ')) &&
+      activeField.kind === 'multi-select' && activeField.options.length > 0) {
+      const optIdx = state.optionCursors?.[activeField.name] ?? 0;
+      const chosenOpt = activeField.options[optIdx];
+      if (chosenOpt) {
+        const prev = Array.isArray(state.answers[activeField.name])
+          ? [...(state.answers[activeField.name] as string[])]
+          : [];
+        const hit = prev.indexOf(chosenOpt.value);
+        if (hit >= 0) prev.splice(hit, 1);
+        else prev.push(chosenOpt.value);
+        state.answers[activeField.name] = prev;
+        state.error = undefined;
+      }
+      return { handled: true };
+    }
+
+    if ((key.name === 'up' || key.name === 'down') && activeField.kind === 'single-select' && activeField.options.length > 0) {
+      const curVal = state.answers[activeField.name];
+      const curIdx = activeField.options.findIndex(o => o.value === curVal);
+      const nextIdx = key.name === 'down'
+        ? (curIdx + 1) % activeField.options.length
+        : (curIdx <= 0 ? activeField.options.length - 1 : curIdx - 1);
+      state.answers[activeField.name] = activeField.options[nextIdx]!.value;
+      state.customDrafts[activeField.name] = '';
+      state.focusedInput = undefined;
+      state.error = undefined;
+      return { handled: true, focusTarget: null };
+    }
+
+    if ((key.name === 'up' || key.name === 'down') && activeField.kind === 'multi-select' && activeField.options.length > 0) {
+      const curIdx = state.optionCursors?.[activeField.name] ?? 0;
+      const nextIdx = key.name === 'down'
+        ? (curIdx + 1) % activeField.options.length
+        : (curIdx <= 0 ? activeField.options.length - 1 : curIdx - 1);
+      state.optionCursors = { ...(state.optionCursors ?? {}), [activeField.name]: nextIdx };
+      return { handled: true };
+    }
+
+    if ((key.name === 'up' || key.name === 'down' || key.name === 'left' || key.name === 'right') && activeField.kind === 'boolean') {
+      const cur = state.answers[activeField.name];
+      state.answers[activeField.name] = cur === undefined ? true : !cur;
+      state.error = undefined;
+      return { handled: true };
+    }
+  }
+
+  if ((key.name === 'up' || key.name === 'down') && stops.length > 1) {
+    const curIdx = currentStopIndex(state, stops);
+    const step = key.name === 'up' ? -1 : 1;
+    const nextStop = stops[(curIdx + stops.length + step) % stops.length]!;
+    state.activeFieldIdx = nextStop.fieldIdx;
+    state.focusedInput = nextStop.focusedInput;
+    return { handled: true, focusTarget: followUpFocusTarget(state) };
+  }
+
+  if (isTextEditKey(key)) {
+    if (state.focusedInput === 'note' && hasFreeNote) {
+      const { text } = applyFollowUpDraftKey(state, 'free-note', state.freeNote, key);
+      state.freeNote = text;
+      state.error = undefined;
+      return { handled: true, focusTarget: FOLLOW_UP_FREE_NOTE_ID };
+    }
+    if (activeField && (activeField.kind === 'text' || activeField.kind === 'number' || activeField.kind === 'integer')) {
+      state.focusedInput = 'answer';
+      const prevText = typeof state.answers[activeField.name] === 'string' ? (state.answers[activeField.name] as string) : '';
+      const { text } = applyFollowUpDraftKey(state, `answer:${activeField.name}`, prevText, key);
+      state.answers[activeField.name] = text;
+      state.error = undefined;
+      return { handled: true, focusTarget: followUpAnswerInputId(activeField.name) };
+    }
+    if (activeField && activeField.kind === 'single-select' && activeField.allowCustom) {
+      state.focusedInput = 'custom';
+      const prevText = state.customDrafts[activeField.name] ?? '';
+      const { text } = applyFollowUpDraftKey(state, `custom:${activeField.name}`, prevText, key);
+      state.customDrafts[activeField.name] = text;
+      if (text.length > 0) state.answers[activeField.name] = '';
+      state.error = undefined;
+      return { handled: true, focusTarget: followUpCustomInputId(activeField.name) };
+    }
+    if (hasFreeNote) {
+      state.focusedInput = 'note';
+      const { text } = applyFollowUpDraftKey(state, 'free-note', state.freeNote, key);
+      state.freeNote = text;
+      state.error = undefined;
+      return { handled: true, focusTarget: FOLLOW_UP_FREE_NOTE_ID };
+    }
+  }
+
+  return { handled: false };
 }
 
 /** Format user modal answers into a crisp prompt reply sent to the ACP session. */
