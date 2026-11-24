@@ -1,4 +1,6 @@
 import { execFile } from 'node:child_process';
+import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { promisify, stripVTControlCharacters } from 'node:util';
 import type { AgentOptions } from './contracts';
 
@@ -13,12 +15,18 @@ export interface McpServerEntry {
 
 export interface PluginEntry {
   name: string;
+  displayName?: string;
+  description?: string;
   enabled: boolean;
   version?: string;
   source?: string;
   path: string;
   skills: string[];
   rules: string[];
+  hasAuth?: boolean;
+  authProviders?: string[];
+  authClis?: string[];
+  suggestedPrompts?: string[];
 }
 
 export interface AgentEntry {
@@ -45,6 +53,15 @@ export interface McpAddSpec {
   type?: 'stdio' | 'http';
   commandOrUrl: string;
   args?: readonly string[];
+  env?: readonly string[];
+  headers?: readonly string[];
+}
+
+export interface RemoteControlStatus {
+  active: boolean;
+  statusText: string;
+  instanceName?: string;
+  raw: string;
 }
 
 function validateExtensionName(kind: string, name: string): string {
@@ -150,8 +167,75 @@ export async function setMcpServerEnabled(options: AgentOptions, name: string, e
   await runCliSubcommand(options, ['mcp', enabled ? 'enable' : 'disable', target], signal);
 }
 
+/** Enrich a plugin entry with non-secret local manifest metadata (`plugin.json` and `auth.json` provider names). */
+export function enrichPluginManifest(entry: PluginEntry): PluginEntry {
+  if (!entry.path) return entry;
+  let displayName = entry.displayName;
+  let description = entry.description;
+  let suggestedPrompts = entry.suggestedPrompts;
+  let hasAuth = entry.hasAuth;
+  let authProviders = entry.authProviders;
+  let authClis = entry.authClis;
+
+  try {
+    const manifestPath = join(entry.path, 'plugin.json');
+    if (existsSync(manifestPath)) {
+      const raw = JSON.parse(readFileSync(manifestPath, 'utf8')) as Record<string, unknown>;
+      if (typeof raw.displayName === 'string' && raw.displayName.trim()) displayName = raw.displayName.trim();
+      if (typeof raw.description === 'string' && raw.description.trim()) description = raw.description.trim();
+      if (Array.isArray(raw.suggestedPrompts)) {
+        const prompts = raw.suggestedPrompts
+          .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+          .slice(0, 4);
+        if (prompts.length) suggestedPrompts = prompts;
+      }
+    }
+  } catch {
+    // Ignore malformed plugin manifests safely.
+  }
+
+  try {
+    const authPath = join(entry.path, 'auth.json');
+    if (existsSync(authPath)) {
+      const raw = JSON.parse(readFileSync(authPath, 'utf8')) as Record<string, unknown>;
+      const providersObj = typeof raw.providers === 'object' && raw.providers !== null && !Array.isArray(raw.providers)
+        ? raw.providers as Record<string, unknown>
+        : undefined;
+      if (providersObj) {
+        const providerNames = Object.keys(providersObj).filter(Boolean);
+        if (providerNames.length) {
+          hasAuth = true;
+          authProviders = providerNames;
+          const clis = new Set<string>();
+          for (const val of Object.values(providersObj)) {
+            if (typeof val === 'object' && val !== null && Array.isArray((val as { clis?: unknown }).clis)) {
+              for (const cli of (val as { clis: unknown[] }).clis) {
+                if (typeof cli === 'string' && cli.trim()) clis.add(cli.trim());
+              }
+            }
+          }
+          if (clis.size) authClis = [...clis];
+        }
+      }
+    }
+  } catch {
+    // Ignore malformed auth metadata safely.
+  }
+
+  return {
+    ...entry,
+    ...(displayName ? { displayName } : {}),
+    ...(description ? { description } : {}),
+    ...(suggestedPrompts?.length ? { suggestedPrompts } : {}),
+    ...(hasAuth ? { hasAuth: true } : {}),
+    ...(authProviders?.length ? { authProviders } : {}),
+    ...(authClis?.length ? { authClis } : {}),
+  };
+}
+
 export async function listPlugins(options: AgentOptions, signal?: AbortSignal): Promise<PluginEntry[]> {
-  return parsePluginListJson(await runCliSubcommand(options, ['plugin', 'list', '--json'], signal));
+  return parsePluginListJson(await runCliSubcommand(options, ['plugin', 'list', '--json'], signal))
+    .map(enrichPluginManifest);
 }
 
 export async function setPluginEnabled(options: AgentOptions, name: string, enabled: boolean, signal?: AbortSignal): Promise<void> {
@@ -185,22 +269,47 @@ function tokenizeSimpleArgs(raw: string): string[] {
   return tokens;
 }
 
-/** Parse `[--type stdio|http] <name> <commandOrUrl> [args...]` safely without shell evaluation. */
+/** Parse `[--type stdio|http] [--env KEY=VAL]... [--header "Key: Val"]... <name> <commandOrUrl> [args...]` safely without shell evaluation. */
 export function parseMcpAddCommand(raw: string): McpAddSpec {
   const tokens = tokenizeSimpleArgs(raw.trim());
   let explicitType: 'stdio' | 'http' | undefined;
+  const env: string[] = [];
+  const headers: string[] = [];
   let index = 0;
-  if (tokens[index] === '--type') {
-    const value = tokens[index + 1];
-    if (value !== 'stdio' && value !== 'http') {
-      throw new Error('`--type` must be `stdio` or `http`.');
+  while (index < tokens.length) {
+    const tok = tokens[index];
+    if (tok === '--type' || tok === '-t') {
+      const value = tokens[index + 1];
+      if (value !== 'stdio' && value !== 'http') {
+        throw new Error('`--type` must be `stdio` or `http`.');
+      }
+      explicitType = value;
+      index += 2;
+      continue;
     }
-    explicitType = value;
-    index += 2;
+    if (tok === '--env' || tok === '-e') {
+      const value = tokens[index + 1];
+      if (!value || !value.includes('=') || /[\0-\u001f\u007f]/.test(value)) {
+        throw new Error('`--env` requires `KEY=value`.');
+      }
+      env.push(value);
+      index += 2;
+      continue;
+    }
+    if (tok === '--header' || tok === '-H') {
+      const value = tokens[index + 1];
+      if (!value || !value.includes(':') || /[\0-\u001f\u007f]/.test(value)) {
+        throw new Error('`--header` requires `"Key: Value"`.');
+      }
+      headers.push(value);
+      index += 2;
+      continue;
+    }
+    break;
   }
   const rest = tokens.slice(index);
   if (rest.length < 2) {
-    throw new Error('Expected `[--type stdio|http] <name> <commandOrUrl> [args...]`.');
+    throw new Error('Expected `[--type stdio|http] [--env KEY=VAL] [--header "K: V"] <name> <commandOrUrl> [args...]`.');
   }
   const name = validateExtensionName('MCP server', rest[0]!);
   const commandOrUrl = rest[1]!;
@@ -213,6 +322,8 @@ export function parseMcpAddCommand(raw: string): McpAddSpec {
     type,
     commandOrUrl,
     args: rest.slice(2),
+    ...(env.length ? { env } : {}),
+    ...(headers.length ? { headers } : {}),
   };
 }
 
@@ -223,7 +334,12 @@ export async function addMcpServer(options: AgentOptions, spec: McpAddSpec, sign
     throw new Error('Invalid MCP command or URL.');
   }
   const type = spec.type ?? (/^https?:\/\//i.test(target) ? 'http' : 'stdio');
-  const args = ['mcp', 'add', '--type', type, name, '--', target, ...(spec.args ?? [])];
+  const args = [
+    'mcp', 'add', '--type', type,
+    ...(spec.env ?? []).flatMap(item => ['--env', item]),
+    ...(spec.headers ?? []).flatMap(item => ['--header', item]),
+    name, '--', target, ...(spec.args ?? []),
+  ];
   await runCliSubcommand(options, args, signal);
 }
 
@@ -303,4 +419,49 @@ export async function installPlugin(options: AgentOptions, target: string, signa
 export async function uninstallPlugin(options: AgentOptions, name: string, signal?: AbortSignal): Promise<void> {
   const target = validateExtensionName('plugin', name);
   await runCliSubcommand(options, ['plugin', 'uninstall', target], signal);
+}
+
+export async function importPlugins(options: AgentOptions, source: string, signal?: AbortSignal): Promise<string> {
+  const cleaned = source.trim();
+  if (!cleaned || cleaned.startsWith('-') || /[\0-\u001f\u007f]/.test(cleaned)) {
+    throw new Error(`Invalid plugin import source: ${source}`);
+  }
+  return runCliSubcommand(options, ['plugin', 'import', cleaned], signal);
+}
+
+/** Parse stdout from `agy remote-control status`. */
+export function parseRemoteControlStatus(raw: string): RemoteControlStatus {
+  const clean = stripVTControlCharacters(raw).trim();
+  const statusMatch = /^daemon status:\s*(.+)$/im.exec(clean);
+  const instanceMatch = /^instance name:\s*(.+)$/im.exec(clean);
+  const statusText = statusMatch?.[1]?.trim() || (clean.split(/\r?\n/)[0]?.trim() || 'unknown');
+  const active = /\b(active|running|online|connected)\b/i.test(statusText) && !/\binactive|stopped|not running\b/i.test(statusText);
+  const rawInstance = instanceMatch?.[1]?.trim();
+  const instanceName = rawInstance && !/^not assigned/i.test(rawInstance) ? rawInstance : undefined;
+  return {
+    active,
+    statusText,
+    ...(instanceName ? { instanceName } : {}),
+    raw: clean,
+  };
+}
+
+export async function getRemoteControlStatus(options: AgentOptions, signal?: AbortSignal): Promise<RemoteControlStatus> {
+  try {
+    return parseRemoteControlStatus(await runCliSubcommand(options, ['remote-control', 'status'], signal));
+  } catch (error) {
+    if (typeof error === 'object' && error !== null && 'stdout' in error && typeof (error as { stdout?: unknown }).stdout === 'string') {
+      const stdout = (error as { stdout: string }).stdout.trim();
+      if (stdout) return parseRemoteControlStatus(stdout);
+    }
+    throw error;
+  }
+}
+
+export async function startRemoteControl(options: AgentOptions, signal?: AbortSignal): Promise<string> {
+  return runCliSubcommand(options, ['remote-control', 'start'], signal);
+}
+
+export async function stopRemoteControl(options: AgentOptions, signal?: AbortSignal): Promise<string> {
+  return runCliSubcommand(options, ['remote-control', 'stop'], signal);
 }

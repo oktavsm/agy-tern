@@ -6,6 +6,7 @@ import type { DiffHunk, JSX, NodeJson, Tone } from '@stencil-hq/tern';
 import type { ToolCallUpdate } from '@agentclientprotocol/sdk';
 import { contentText, type ToolStep, type TranscriptEntry } from './model';
 import type { DirectoryPreview } from './files';
+import type { PluginEntry } from './extensions';
 import type { DiffMode, UserPrefs } from './prefs';
 import {
   extractMarkdownFollowUpQuestions,
@@ -17,12 +18,15 @@ import {
   buildUnifiedDiffHunks,
   clipDiffHunks,
   clipInlinePreview,
+  extractActionableUrls,
   extractMarkdownImagePaths,
+  extractPluginCards,
   extractToolImagePaths,
   extractToolInlineImages,
   extractToolOutputText,
   formatPathLabel,
   splitMarkdownSegments,
+  stripPluginCardTags,
   summarizeThoughtTopic,
   summarizeToolCall,
 } from './ui-format';
@@ -488,6 +492,11 @@ export interface EntryCallbacks {
   onOpenFollowUp?(title: string, message: string, fields: readonly QuestionField[]): void;
   pinnedTurnIds?: ReadonlySet<string>;
   onTogglePin?(entryId: string): void;
+  pluginsList?: readonly PluginEntry[];
+  onOpenPluginCard?(catalogId: string): void;
+  onInstallPluginCard?(catalogId: string): void;
+  onHandoffOfficialAgy?(reason: string, returnPanel?: 'plugins' | 'mcp'): void;
+  onOpenExternalUrl?(url: string): void;
 }
 
 export function Entry({ entry, continued, streaming, recent, turnNumber, callbacks }: {
@@ -503,13 +512,18 @@ export function Entry({ entry, continued, streaming, recent, turnNumber, callbac
   switch (entry.type) {
     case 'message': {
       const withDivider = entry.role === 'user' && !!turnNumber && turnNumber > 1 && showAvatar;
-      const segments = entry.role === 'agent' && entry.text ? splitMarkdownSegments(entry.text) : undefined;
+      const pluginCards = entry.role === 'agent' && entry.text ? extractPluginCards(entry.text) : [];
+      const displayText = pluginCards.length ? stripPluginCardTags(entry.text) : entry.text;
+      const segments = entry.role === 'agent' && displayText ? splitMarkdownSegments(displayText) : undefined;
       const hasCodeBlocks = !!segments?.some(seg => seg.kind === 'code');
-      const mdImagePaths = entry.role === 'agent' && !streaming && entry.text
-        ? extractMarkdownImagePaths(entry.text, callbacks.cwd, checkPathExists)
+      const mdImagePaths = entry.role === 'agent' && !streaming && displayText
+        ? extractMarkdownImagePaths(displayText, callbacks.cwd, checkPathExists)
         : [];
-      const mdFollowUpQuestions = entry.role === 'agent' && !streaming && entry.text && callbacks.onOpenFollowUp
-        ? extractMarkdownFollowUpQuestions(entry.text)
+      const actionableUrls = entry.role === 'agent' && !streaming && entry.text
+        ? extractActionableUrls(entry.text)
+        : [];
+      const mdFollowUpQuestions = entry.role === 'agent' && !streaming && displayText && callbacks.onOpenFollowUp
+        ? extractMarkdownFollowUpQuestions(displayText)
         : [];
       const isPinned = entry.role === 'user' && (callbacks.pinnedTurnIds?.has(entry.id) ?? false);
       const msgNode = <message key={withDivider ? 'msg' : entry.id} variant="auto"
@@ -549,8 +563,8 @@ export function Entry({ entry, continued, streaming, recent, turnNumber, callbac
               onOpen={() => callbacks.onInspect('Message image', { type: 'image-blob', blob, mimeType: img.mimeType }, img.mimeType)} />
             : <text key={`img-${idx}`}><span s="muted">{`[Image: ${img.mimeType}]`}</span></text>;
         })}
-        {entry.text && (entry.role === 'user'
-          ? <text wrap="char">{entry.text}</text>
+        {displayText && (entry.role === 'user'
+          ? <text wrap="char">{displayText}</text>
           : hasCodeBlocks && segments
             ? <col gap="xs">
               {segments.map((seg, idx) => seg.kind === 'prose'
@@ -574,7 +588,44 @@ export function Entry({ entry, continued, streaming, recent, turnNumber, callbac
                   </row>
                 </col>)}
             </col>
-            : <md stream={streaming} max={{ w: callbacks.proseMaxW ?? '80ch' }}>{entry.text}</md>)}
+            : <md stream={streaming} max={{ w: callbacks.proseMaxW ?? '80ch' }}>{displayText}</md>)}
+        {pluginCards.length > 0 && <col key="plugin-cards" gap="xs">
+          {pluginCards.map(card => {
+            const installed = callbacks.pluginsList?.find(p => p.name.toLowerCase() === card.catalogId.toLowerCase());
+            const heading = installed?.displayName ? `${installed.displayName} (${card.catalogId})` : card.catalogId;
+            const statusText = installed
+              ? (installed.enabled ? 'Installed · Enabled' : 'Installed · Disabled')
+              : 'Antigravity plugin';
+            return <card key={`pcard-${card.catalogId}`} head={heading} meta={statusText} icon="compass">
+              <col gap="xs">
+                {installed?.description && <text wrap="word"><span s="muted">{installed.description}</span></text>}
+                <row gap="xs" wrap>
+                  {callbacks.onOpenPluginCard && <button size="sm" variant="default" onClick={() => callbacks.onOpenPluginCard?.(card.catalogId)}>
+                    Open /plugin
+                  </button>}
+                  {!installed && callbacks.onInstallPluginCard && <button size="sm" variant="primary" onClick={() => callbacks.onInstallPluginCard?.(card.catalogId)}>
+                    Install
+                  </button>}
+                  {(installed?.hasAuth || !installed) && callbacks.onHandoffOfficialAgy && <button size="sm" variant="quiet"
+                    onClick={() => callbacks.onHandoffOfficialAgy?.(`Sign in to ${card.catalogId} in official /plugin`, 'plugins')}>
+                    Sign in (official agy)
+                  </button>}
+                </row>
+              </col>
+            </card>;
+          })}
+        </col>}
+        {actionableUrls.length > 0 && <row key="oauth-links" gap="xs" wrap>
+          {actionableUrls.map((link, idx) => <row key={`url-${idx}`} gap="xs" align="center">
+            {callbacks.onOpenExternalUrl && <button size="sm" variant="default" icon="link"
+              onClick={() => callbacks.onOpenExternalUrl?.(link.url)}>
+              {`Open ${link.label}`}
+            </button>}
+            <button size="sm" variant="quiet" icon="copy" onClick={() => callbacks.onCopy(link.url)}>
+              Copy URL
+            </button>
+          </row>)}
+        </row>}
         {mdImagePaths.map((imgPath, idx) => {
           const label = formatPathLabel(imgPath, callbacks.cwd);
           return <InlineMediaPreview key={`md-img-${idx}`} caption={label} path={imgPath}

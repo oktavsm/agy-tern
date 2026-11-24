@@ -1,10 +1,10 @@
 import type { AvailableCommand, SessionConfigOption, SessionConfigSelectOption } from '@agentclientprotocol/sdk';
 
-export type LocalCommand = 'help' | 'keys' | 'update' | 'model' | 'settings' | 'usage' | 'credits' | 'changelog' | 'permissions' | 'sessions' | 'turns' | 'queue' | 'new' | 'rename' | 'account' | 'switch-account' | 'login' | 'changes' | 'commits' | 'find' | 'tasks' | 'paste-image' | 'export' | 'expand' | 'collapse' | 'mcp' | 'plugins' | 'agents' | 'templates' | 'exit';
+export type LocalCommand = 'help' | 'keys' | 'update' | 'model' | 'effort' | 'mode' | 'settings' | 'usage' | 'context' | 'credits' | 'changelog' | 'permissions' | 'sessions' | 'turns' | 'queue' | 'new' | 'rename' | 'account' | 'switch-account' | 'login' | 'changes' | 'commits' | 'tasks' | 'paste-image' | 'find' | 'export' | 'expand' | 'collapse' | 'mcp' | 'plugins' | 'agents' | 'templates' | 'remote-control' | 'agy' | 'exit';
 export type CommandCategory = 'frontend' | 'workflow' | 'skill';
 
 const CORE_WORKFLOWS = new Set([
-  'goal', 'compact', 'schedule', 'browser', 'plan', 'grill-me', 'teamwork', 'learn', 'boost', 'review', 'init', 'clear',
+  'goal', 'compact', 'schedule', 'browser', 'plan', 'grill-me', 'teamwork', 'learn', 'boost', 'review', 'init',
 ]);
 export interface Command {
   name: string;
@@ -14,8 +14,11 @@ export interface Command {
 }
 
 const LOCAL: readonly Command[] = [
-  { name: 'model', local: 'model', description: 'Choose a model offered by this agy session' },
-  { name: 'usage', local: 'usage', description: 'View session usage and the official account quota command' },
+  { name: 'model', local: 'model', description: 'Choose a model offered by this agy session', hint: 'model' },
+  { name: 'effort', local: 'effort', description: 'Choose reasoning effort level for this session', hint: 'low|medium|high|xhigh|max' },
+  { name: 'mode', local: 'mode', description: 'Switch execution mode (default, accept-edits, plan)', hint: 'mode' },
+  { name: 'context', local: 'context', description: 'Inspect context window capacity, attachments, and auto-compaction' },
+  { name: 'usage', local: 'usage', description: 'View session usage, activity heatmap, and official account quota' },
   { name: 'account', local: 'account', description: 'Sign in, switch accounts through official login, or check quota' },
   { name: 'switch-account', local: 'switch-account', description: 'Confirm logout and switch account via official login' },
   { name: 'login', local: 'login', description: 'Open official sign-in options, including while disconnected' },
@@ -30,9 +33,11 @@ const LOCAL: readonly Command[] = [
   { name: 'templates', local: 'templates', description: 'Save, browse, and insert reusable prompt templates for this workspace' },
   { name: 'expand', local: 'expand', description: 'Expand all thought and tool cards in the conversation' },
   { name: 'collapse', local: 'collapse', description: 'Collapse all thought and tool cards in the conversation' },
-  { name: 'mcp', local: 'mcp', description: 'Inspect and toggle official agy MCP servers' },
-  { name: 'plugins', local: 'plugins', description: 'Browse and toggle installed plugins and skills' },
+  { name: 'mcp', local: 'mcp', description: 'Inspect, toggle, add, remove, or reload official agy MCP servers' },
+  { name: 'plugins', local: 'plugins', description: 'Browse, toggle, install, import, validate, or sign in to official plugins' },
   { name: 'agents', local: 'agents', description: 'Inspect configured agents and active workspace roots' },
+  { name: 'remote-control', local: 'remote-control', description: 'Check, start, or stop the official agy remote-control daemon' },
+  { name: 'agy', local: 'agy', description: 'Hand off temporarily to official agy CLI (for /plugin sign-in, /fork, /btw) and return' },
   { name: 'settings', local: 'settings', description: 'Change model, reasoning and other session options' },
   { name: 'permissions', local: 'permissions', description: 'Inspect mode, approval policy and sandbox visibility' },
   { name: 'sessions', local: 'sessions', description: 'Browse and resume conversations in this workspace' },
@@ -46,7 +51,43 @@ const LOCAL: readonly Command[] = [
   { name: 'exit', local: 'exit', description: 'Close this frontend and its agy session' },
 ];
 const ALIASES: Readonly<Record<string, string>> = {
-  quota: 'usage', config: 'settings', preferences: 'settings', prefs: 'settings', quit: 'exit', commands: 'help', palette: 'help', shortcuts: 'keys', hotkeys: 'keys', upgrade: 'update', resume: 'sessions', conversation: 'sessions', switch: 'sessions', reauth: 'switch-account', diff: 'changes', heatmap: 'commits', contributions: 'commits', search: 'find', outline: 'turns', jump: 'turns', queued: 'queue', skills: 'plugins', agent: 'agents', snippets: 'templates', running: 'tasks', ps: 'tasks', clip: 'paste-image',
+  quota: 'usage',
+  config: 'settings',
+  preferences: 'settings',
+  prefs: 'settings',
+  quit: 'exit',
+  commands: 'help',
+  palette: 'help',
+  shortcuts: 'keys',
+  hotkeys: 'keys',
+  upgrade: 'update',
+  resume: 'sessions',
+  conversation: 'sessions',
+  switch: 'sessions',
+  reauth: 'switch-account',
+  diff: 'changes',
+  heatmap: 'commits',
+  contributions: 'commits',
+  search: 'find',
+  outline: 'turns',
+  jump: 'turns',
+  queued: 'queue',
+  plugin: 'plugins',
+  skills: 'plugins',
+  mcps: 'mcp',
+  agent: 'agents',
+  models: 'model',
+  thinking: 'effort',
+  ctx: 'context',
+  status: 'context',
+  clear: 'new',
+  rc: 'remote-control',
+  remote: 'remote-control',
+  official: 'agy',
+  snippets: 'templates',
+  running: 'tasks',
+  ps: 'tasks',
+  clip: 'paste-image',
 };
 const ALIAS_PATTERN = new RegExp(`^\\/(${Object.keys(ALIASES).join('|')})(?=\\s|$)`);
 

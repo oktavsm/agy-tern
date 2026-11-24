@@ -2,6 +2,13 @@
 
 All notable changes to `agy-tern` are documented in this file.
 
+## [0.4.0] - 2026-11-24
+
+### Added
+- Native inline `<plugin-card catalog-id="...">` rendering in [src/transcript-view.tsx](src/transcript-view.tsx) and [src/ui-format.ts](src/ui-format.ts): strips raw `<plugin-card>` XML from prose and renders interactive Tern `<card>` widgets enriched with local `plugin.json` / `auth.json` metadata plus `Open /plugin`, `Install`, and `Sign in (official agy)` actions, alongside direct `Open ... OAuth` and `Copy URL` buttons for OAuth sign-in URLs (via safe `openExternalUrl` in [src/tern-window.ts](src/tern-window.ts)).
+- Upgraded `/plugin` (`/plugins`) and `/mcp` managers in [src/extensions.ts](src/extensions.ts), [src/panels.tsx](src/panels.tsx), and [src/ui.tsx](src/ui.tsx): added `/plugin` and `/mcps` aliases, `plugin.json` / `auth.json` OAuth metadata display (`OAuth` badges, `Sign in / Accounts` handoff, `suggestedPrompts`), `agy plugin import` (`Import` modal), `Reload MCP` live session restart in `/mcp`, and `-e`/`--env` + `-H`/`--header` flag support in `agy mcp add`.
+- Added official `agy 1.5.15` slash command parity in [src/commands.ts](src/commands.ts), [src/panels.tsx](src/panels.tsx), [src/ui.tsx](src/ui.tsx), and [src/cli.tsx](src/cli.tsx): `/context` (`/ctx`, `/status`) capacity & `AGY_CLI_AUTO_COMPACT_OVERRIDE` breakdown modal, `/remote-control` (`/rc`, `/remote`) daemon status/start/stop overlay, direct `/effort` (`/thinking`) and `/mode` selectors, `/clear` (`/new`) & `/models` aliases, and `/agy` (`/official`) seamless interactive handoff to official `agy` CLI that automatically resumes your conversation back in `agy-tern` on exit.
+
 ## [0.3.6] - 2026-11-23
 
 ### Fixed

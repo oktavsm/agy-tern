@@ -4,6 +4,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   addMcpServer,
+  enrichPluginManifest,
+  importPlugins,
   installPlugin,
   listAgents,
   listMcpServers,
@@ -13,6 +15,7 @@ import {
   parseMcpList,
   parsePluginListJson,
   parsePluginValidationJson,
+  parseRemoteControlStatus,
   removeMcpServer,
   setMcpServerEnabled,
   setPluginEnabled,
@@ -156,5 +159,54 @@ describe('official agy extension parsers and runners', () => {
     expect(log).toContain('plugin install /tmp/good-plugin');
     expect(log).toContain('plugin uninstall good-plugin');
     expect(log).toContain('plugin validate /tmp/bad-plugin --json --strict');
+
+    expect(parseMcpAddCommand('-e TOKEN=abc -H "Authorization: Bearer x" api https://example.com/mcp')).toEqual({
+      name: 'api',
+      type: 'http',
+      commandOrUrl: 'https://example.com/mcp',
+      args: [],
+      env: ['TOKEN=abc'],
+      headers: ['Authorization: Bearer x'],
+    });
+
+    await importPlugins(opts, 'claude');
+    expect(await Bun.file(logFile).text()).toContain('plugin import claude');
+    await expect(importPlugins(opts, '--bad')).rejects.toThrow('Invalid plugin import source');
+
+    const pluginDir = await mkdtemp(join(tmpdir(), 'agy-plugin-meta-'));
+    tempDirs.push(pluginDir);
+    await writeFile(join(pluginDir, 'plugin.json'), JSON.stringify({
+      displayName: 'Google Drive',
+      description: 'Search and manage Drive files.',
+      suggestedPrompts: ['Find Q3 budget'],
+    }), 'utf8');
+    await writeFile(join(pluginDir, 'auth.json'), JSON.stringify({
+      providers: { google: { type: 'oauth2', clis: ['gdrive'], oauth2: { clientSecret: 'never-exposed' } } },
+    }), 'utf8');
+    const enriched = enrichPluginManifest({
+      name: 'gdrive',
+      enabled: true,
+      path: pluginDir,
+      skills: ['gdrive'],
+      rules: [],
+    });
+    expect(enriched.displayName).toBe('Google Drive');
+    expect(enriched.hasAuth).toBe(true);
+    expect(enriched.authProviders).toEqual(['google']);
+    expect(enriched.authClis).toEqual(['gdrive']);
+    expect(enriched.suggestedPrompts).toEqual(['Find Q3 budget']);
+    expect(JSON.stringify(enriched)).not.toContain('never-exposed');
+
+    expect(parseRemoteControlStatus('Daemon status: inactive\nInstance name: not assigned yet.')).toEqual({
+      active: false,
+      statusText: 'inactive',
+      raw: 'Daemon status: inactive\nInstance name: not assigned yet.',
+    });
+    expect(parseRemoteControlStatus('Daemon status: active (running)\nInstance name: dev-laptop')).toEqual({
+      active: true,
+      statusText: 'active (running)',
+      instanceName: 'dev-laptop',
+      raw: 'Daemon status: active (running)\nInstance name: dev-laptop',
+    });
   });
 });

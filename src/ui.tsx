@@ -21,6 +21,8 @@ import { Conversation, type ToolStep, type TranscriptEntry } from './model';
 import { commandCatalog, commandQuery, configLabel, configValues, filterCommands, modelOption, resolveCommand, type Command } from './commands';
 import {
   addMcpServer,
+  getRemoteControlStatus,
+  importPlugins,
   installPlugin,
   listAgents,
   listMcpServers,
@@ -29,12 +31,15 @@ import {
   removeMcpServer,
   setMcpServerEnabled,
   setPluginEnabled,
+  startRemoteControl,
+  stopRemoteControl,
   uninstallPlugin,
   validatePlugin,
   type AgentEntry,
   type McpServerEntry,
   type PluginEntry,
   type PluginValidationReport,
+  type RemoteControlStatus,
 } from './extensions';
 import { readOfficialReport, type OfficialReport } from './reports';
 import {
@@ -49,7 +54,7 @@ import {
 } from './history';
 import { SessionNames } from './session-names';
 import { PromptTemplatesStore, type PromptTemplate } from './templates';
-import { openInTernSplit, runCommandInTernSplit, sendDesktopNotification, sendTerminalAttention } from './tern-window';
+import { openExternalUrl, openInTernSplit, runCommandInTernSplit, sendDesktopNotification, sendTerminalAttention } from './tern-window';
 import {
   DEFAULT_MODEL_ID,
   DEFAULT_PREFS,
@@ -178,6 +183,7 @@ export interface ChatLaunchState {
   draft?: Draft;
   notice?: { text: string; error: boolean };
   openAccount?: boolean;
+  openPanel?: 'plugins' | 'mcp';
   previousSessionId?: string;
   continueLast?: boolean;
   conversationId?: string;
@@ -186,8 +192,11 @@ export interface ChatLaunchState {
   motion?: MotionPref;
 }
 
-export type NativeChatResult = { kind: 'unavailable' } | { kind: 'quit' } |
-  { kind: 'login'; method: AuthMethodTerminal; draft: Draft; previousSessionId?: string };
+export type NativeChatResult =
+  | { kind: 'unavailable' }
+  | { kind: 'quit' }
+  | { kind: 'login'; method: AuthMethodTerminal; draft: Draft; previousSessionId?: string }
+  | { kind: 'handoff'; reason: string; draft: Draft; previousSessionId?: string; returnPanel?: 'plugins' | 'mcp' };
 
 const DOCK_DRAFT_ID = 'dock.shell.composer.line.draft';
 
@@ -463,6 +472,8 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
   let mcpServers: McpServerEntry[] = [];
   let pluginsList: PluginEntry[] = [];
   let agentsList: AgentEntry[] = [];
+  let remoteControlStatus: RemoteControlStatus | undefined;
+  let remoteControlLoading = false;
   let extLoading = false;
   let extAbort: AbortController | undefined;
   let fileSelection = 0;
@@ -1204,7 +1215,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     if (current.kind === 'confirm') return current.returnTo;
     if (current.kind === 'template-save') return { kind: 'templates' };
     if (current.kind === 'mcp-add') return { kind: 'mcp' };
-    if (current.kind === 'plugin-install') return { kind: 'plugins' };
+    if (current.kind === 'plugin-install' || current.kind === 'plugin-import') return { kind: 'plugins' };
     if (current.kind === 'account-switch') return { kind: 'account' };
     if ((current.kind === 'permissions' || current.kind === 'account' || current.kind === 'config') && settingsChildPanel) {
       return { kind: 'settings' };
@@ -1613,6 +1624,93 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         openPanel({ kind: 'plugins' });
         showToast(`Uninstalled plugin ${name}`);
       }
+    });
+  }
+
+  function runImportPlugins(source: string): void {
+    runExtAction(async reqSignal => {
+      const out = await importPlugins({ ...options, signal }, source, reqSignal);
+      pluginsList = await listPlugins({ ...options, signal }, reqSignal);
+      if (!quitting) {
+        openPanel({ kind: 'plugins' });
+        showToast('Imported plugins', out.split(/\r?\n/)[0] || source.trim());
+      }
+    });
+  }
+
+  function loadRemoteControlStatus(): void {
+    if (quitting || remoteControlLoading) return;
+    remoteControlLoading = true;
+    panelError = '';
+    render();
+    void getRemoteControlStatus({ ...options, signal }).then(status => {
+      if (!quitting) remoteControlStatus = status;
+    }).catch(error => {
+      if (!quitting) panelError = error instanceof Error ? error.message : String(error);
+    }).finally(() => {
+      remoteControlLoading = false;
+      if (!quitting) render();
+    });
+  }
+
+  function runRemoteControlToggle(action: 'start' | 'stop'): void {
+    if (quitting || remoteControlLoading) return;
+    remoteControlLoading = true;
+    panelError = '';
+    render();
+    const task = action === 'start'
+      ? startRemoteControl({ ...options, signal })
+      : stopRemoteControl({ ...options, signal });
+    void task.then(async out => {
+      if (quitting) return;
+      remoteControlStatus = await getRemoteControlStatus({ ...options, signal }).catch(() => remoteControlStatus);
+      showToast(action === 'start' ? 'Remote Control started' : 'Remote Control stopped', out.split(/\r?\n/)[0] || undefined);
+    }).catch(error => {
+      if (!quitting) panelError = error instanceof Error ? error.message : String(error);
+    }).finally(() => {
+      remoteControlLoading = false;
+      if (!quitting) render();
+    });
+  }
+
+  function reloadMcpSession(): void {
+    if (quitting || agentConnecting || authBusy || busy || permissions.length || !connectRunner) {
+      showToast('Cannot reload MCP right now', busy ? 'Wait for the current turn to finish' : 'Session busy');
+      return;
+    }
+    const resumeId = stateManager.activeSessionId || undefined;
+    const oldAgent = agent;
+    agent = undefined;
+    disconnected = true;
+    closePanel();
+    showToast('Reloading agy ACP session', 'Applying MCP and plugin changes...');
+    void (oldAgent ? oldAgent.close().catch(() => {}) : Promise.resolve()).then(() => {
+      if (!quitting && connectRunner) startup = connectRunner(resumeId);
+    });
+  }
+
+  function handoffToOfficialAgy(reason: string, returnPanel?: 'plugins' | 'mcp'): void {
+    if (quitting || authBusy || busy || permissions.length) {
+      showToast('Wait for current activity to finish before handing off to official agy.');
+      return;
+    }
+    const sid = stateManager.activeSessionId || previousSessionId;
+    outcome = {
+      kind: 'handoff',
+      reason,
+      draft: stateManager.getActive().draft,
+      ...(sid ? { previousSessionId: sid } : {}),
+      ...(returnPanel ? { returnPanel } : {}),
+    };
+    quitting = true;
+    stopped.resolve(null);
+  }
+
+  function openUrlExternally(url: string): void {
+    void openExternalUrl(url).then(res => {
+      if (quitting) return;
+      if (res.ok) showToast('Opened URL in browser');
+      else showToast('Could not open URL', res.error);
     });
   }
 
@@ -2093,7 +2191,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     autocompleteDismissed = true;
     render();
     const needsCustomFocus = next.kind === 'rename' || next.kind === 'template-save' ||
-      next.kind === 'mcp-add' || next.kind === 'plugin-install' ||
+      next.kind === 'mcp-add' || next.kind === 'plugin-install' || next.kind === 'plugin-import' ||
       (next.kind === 'config' && metadata.configOptions.find(candidate => candidate.id === next.id)?.type === 'boolean');
     const isPickerPanel = next.kind === 'commands' || next.kind === 'config' || next.kind === 'sessions' ||
       next.kind === 'changes' || next.kind === 'find' || next.kind === 'turns' || next.kind === 'queue' ||
@@ -2108,6 +2206,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     if (next.kind === 'report') loadReport(next.report);
     if (next.kind === 'tasks' || next.kind === 'task-inspect') refreshLiveProcesses();
     if (next.kind === 'commits') loadCommitHistory();
+    if (next.kind === 'remote-control') loadRemoteControlStatus();
     if (next.kind === 'mcp' || next.kind === 'plugins' || next.kind === 'agents') loadExtensions(next.kind);
     if (next.kind === 'templates') loadTemplates();
     if (next.kind === 'sessions' && agent?.capabilities.listSessions) {
@@ -2245,8 +2344,8 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       return;
     }
     if (command.local) {
-      if (args && command.local !== 'model' && command.local !== 'sessions' && command.local !== 'rename' &&
-        command.local !== 'export' && command.local !== 'find' && command.local !== 'templates' && command.local !== 'help') {
+      if (args && command.local !== 'model' && command.local !== 'effort' && command.local !== 'mode' && command.local !== 'sessions' && command.local !== 'rename' &&
+        command.local !== 'export' && command.local !== 'find' && command.local !== 'turns' && command.local !== 'templates' && command.local !== 'help') {
         stateManager.getConversation().notice(`/${command.name} does not take arguments in this frontend.`, true);
         render();
         return;
@@ -2306,11 +2405,45 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
           if (args) { panelDraft = { text: args, cursor: args.length }; render(); }
           return;
         case 'usage': openPanel({ kind: 'report', report: 'usage' }); return;
+        case 'context': openPanel({ kind: 'context' }); return;
         case 'credits': openPanel({ kind: 'report', report: 'credits' }); return;
         case 'changelog': openPanel({ kind: 'report', report: 'changelog' }); return;
         case 'mcp': openPanel({ kind: 'mcp' }); return;
         case 'plugins': openPanel({ kind: 'plugins' }); return;
         case 'agents': openPanel({ kind: 'agents' }); return;
+        case 'remote-control': openPanel({ kind: 'remote-control' }); return;
+        case 'agy': handoffToOfficialAgy('Opened official agy CLI via /agy'); return;
+        case 'effort': {
+          const option = thinkingOption(metadata.configOptions);
+          if (!option) {
+            prefsPage = 'session';
+            openPanel({ kind: 'settings' });
+            showToast('Effort selector unavailable', 'This agy session did not supply a thinking level option');
+            return;
+          }
+          if (args) {
+            const value = configValues(option).find(v => v.value.toLowerCase() === args.toLowerCase() || v.name.toLowerCase() === args.toLowerCase());
+            openPanel({ kind: 'config', id: option.id });
+            if (value) changeConfig(option, value.value);
+            else { panelError = 'Choose one of the thinking levels supplied by this agy session.'; render(); }
+          } else openPanel({ kind: 'config', id: option.id });
+          return;
+        }
+        case 'mode': {
+          const option = modeOption();
+          if (!option) {
+            openPanel({ kind: 'permissions' });
+            showToast('Mode selector unavailable', 'This agy session did not supply a mode option');
+            return;
+          }
+          if (args) {
+            const value = configValues(option).find(v => v.value.toLowerCase() === args.toLowerCase() || v.name.toLowerCase() === args.toLowerCase());
+            openPanel({ kind: 'config', id: option.id });
+            if (value) changeConfig(option, value.value);
+            else { panelError = 'Choose one of the execution modes supplied by this agy session.'; render(); }
+          } else openPanel({ kind: 'config', id: option.id });
+          return;
+        }
         case 'templates':
           openPanel({ kind: 'templates' });
           if (args) { panelDraft = { text: args, cursor: args.length }; render(); }
@@ -2727,6 +2860,13 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         { label: 'Cancel', detail: 'Return to plugins.', choose: () => openPanel({ kind: 'plugins' }) },
       ];
     }
+    if (panel.kind === 'plugin-import') {
+      return [
+        { label: 'Import plugins', detail: 'Runs `agy plugin import <source>` (e.g. claude, gemini, or a directory).',
+          disabled: !panelDraft.text.trim() || extLoading, choose: () => runImportPlugins(panelDraft.text) },
+        { label: 'Cancel', detail: 'Return to plugins.', choose: () => openPanel({ kind: 'plugins' }) },
+      ];
+    }
     if (panel.kind === 'confirm') {
       const confirmPanel = panel;
       return [
@@ -3041,6 +3181,30 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       onInspectCommit: inspectCommit,
       usageHeatmap,
       usageHeatmapLoading,
+      onReloadMcpSession: reloadMcpSession,
+      onHandoffOfficialAgy: handoffToOfficialAgy,
+      onTriggerCompact: () => {
+        closePanel();
+        submitPrompt('/compact');
+      },
+      draftBudget: computeDraftContextBudget({
+        draftText: st.draft.text,
+        attachedFiles: st.attachedFiles,
+        attachedDirs: st.attachedDirs,
+        attachedImages: st.attachedImages,
+        fileSizes: attachmentSizes.snapshot,
+        usage: metadata.usage,
+      }),
+      attachedCounts: {
+        files: st.attachedFiles.length,
+        dirs: st.attachedDirs.length,
+        images: st.attachedImages.length,
+      },
+      remoteControl: remoteControlStatus,
+      remoteControlLoading,
+      onRefreshRemoteControl: loadRemoteControlStatus,
+      onStartRemoteControl: () => runRemoteControlToggle('start'),
+      onStopRemoteControl: () => runRemoteControlToggle('stop'),
     });
   }
 
@@ -3239,6 +3403,18 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         showToast(pinned ? 'Turn pinned' : 'Turn unpinned');
         render();
       },
+      pluginsList,
+      onOpenPluginCard(catalogId) {
+        openPanel({ kind: 'plugins' });
+        pickerSelected = catalogId;
+        render();
+      },
+      onInstallPluginCard(catalogId) {
+        openPanel({ kind: 'plugins' });
+        runInstallPlugin(catalogId);
+      },
+      onHandoffOfficialAgy: handoffToOfficialAgy,
+      onOpenExternalUrl: openUrlExternally,
     };
 
     const allEntries = conv.entries;
@@ -3874,12 +4050,17 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     void detectGitBranch(options.cwd).then(branch => {
       if (!quitting && branch) { gitBranch = branch; render(); }
     });
+    void listPlugins({ ...options, signal }).then(rows => {
+      if (!quitting && rows.length) { pluginsList = rows; render(); }
+    }).catch(() => {});
     if (launch?.openAccount) {
       openPanel({ kind: 'account' });
       panelError = launch.notice?.text ?? '';
+    } else if (launch?.openPanel) {
+      openPanel({ kind: launch.openPanel });
     }
     render();
-    surface.focus(launch?.openAccount ? null : DOCK_DRAFT_ID);
+    surface.focus(launch?.openAccount || launch?.openPanel ? (launch.openPanel ? 'layer.picker' : null) : DOCK_DRAFT_ID);
 
     const startAgentConnection = (resumeId?: string): Promise<void> => {
       if (quitting || agentConnecting) return Promise.resolve();
@@ -4356,9 +4537,9 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
           }
           continue;
         }
-        if ((current.kind === 'report' || current.kind === 'account' || current.kind === 'account-switch' || current.kind === 'permissions' || current.kind === 'keys') &&
+        if ((current.kind === 'report' || current.kind === 'account' || current.kind === 'account-switch' || current.kind === 'permissions' || current.kind === 'keys' || current.kind === 'context' || current.kind === 'remote-control') &&
           (key.name === 'page_up' || key.name === 'page_down' || key.name === 'home' || key.name === 'end' ||
-            (current.kind === 'keys' && (key.name === 'up' || key.name === 'down')))) {
+            ((current.kind === 'keys' || current.kind === 'context' || current.kind === 'remote-control') && (key.name === 'up' || key.name === 'down')))) {
           surface.scroll('layer.panel.overlay-scroll',
             key.name === 'up' ? 'line-up'
               : key.name === 'down' ? 'line-down'

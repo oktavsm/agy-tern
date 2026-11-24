@@ -624,5 +624,46 @@ describe('panel renderers & transcript view helpers', () => {
     expect(commitsJson).toContain('"token":"success"');
     expect(commitsJson).toContain('Contribution heatmap');
     expect(commitsJson).toContain('feat(ui): add commit heatmap');
+
+    const contextCtx = baseContext({ kind: 'context' });
+    contextCtx.metadata.usage = { used: 342_000, size: 1_000_000 };
+    contextCtx.attachedCounts = { files: 2, dirs: 1, images: 1 };
+    contextCtx.onTriggerCompact = () => {};
+    const contextJson = JSON.stringify(renderActivePanel(contextCtx));
+    expect(contextJson).toContain('Context window & session breakdown');
+    expect(contextJson).toContain('Auto-compaction threshold');
+    expect(contextJson).toContain('Compact (/compact)');
+
+    const rcCtx = baseContext({ kind: 'remote-control' });
+    rcCtx.remoteControl = { active: false, statusText: 'inactive', raw: 'Daemon status: inactive' };
+    rcCtx.onStartRemoteControl = () => {};
+    const rcJson = JSON.stringify(renderActivePanel(rcCtx));
+    expect(rcJson).toContain('Remote Control daemon');
+    expect(rcJson).toContain('Start daemon');
+
+    const pluginsAuthCtx = baseContext({ kind: 'plugins' });
+    pluginsAuthCtx.pluginsList = [{
+      name: 'gdrive',
+      displayName: 'Google Drive',
+      description: 'Search and upload files.',
+      enabled: true,
+      version: '0.0.11',
+      path: '/plugins/gdrive',
+      skills: ['gdrive'],
+      rules: [],
+      hasAuth: true,
+      authProviders: ['google'],
+      authClis: ['gdrive'],
+      suggestedPrompts: ['Find Q3 budget'],
+    }];
+    pluginsAuthCtx.onHandoffOfficialAgy = () => {};
+    const pluginsAuthJson = JSON.stringify(renderActivePanel(pluginsAuthCtx));
+    expect(pluginsAuthJson).toContain('Google Drive (gdrive)');
+    expect(pluginsAuthJson).toContain('Sign in / Accounts');
+    expect(pluginsAuthJson).toContain('Import');
+
+    const mcpReloadCtx = baseContext({ kind: 'mcp' });
+    mcpReloadCtx.onReloadMcpSession = () => {};
+    expect(JSON.stringify(renderActivePanel(mcpReloadCtx))).toContain('Reload MCP');
   });
 });

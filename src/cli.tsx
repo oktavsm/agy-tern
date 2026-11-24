@@ -190,6 +190,39 @@ async function main(): Promise<void> {
     }, launch);
     if (result.kind === 'unavailable') break;
     if (result.kind === 'quit') return;
+    if (result.kind === 'handoff') {
+      const handoffArgs = [
+        '--sandbox',
+        ...parsed.additionalDirectories.flatMap(dir => ['--add-dir', dir]),
+        ...(parsed.agentName ? ['--agent', parsed.agentName] : []),
+        ...(result.previousSessionId ? ['--conversation', result.previousSessionId] : []),
+      ];
+      console.error(`\n[agy-tern] ${result.reason}. Exit official agy (/exit or Ctrl+C) to return to agy-tern.\n`);
+      const child = spawn(executable, handoffArgs, { cwd: parsed.cwd, stdio: 'inherit' });
+      const forwardInterrupt = (): void => { child.kill('SIGINT'); };
+      const forwardTerminate = (): void => { child.kill('SIGTERM'); };
+      process.on('SIGINT', forwardInterrupt);
+      process.on('SIGTERM', forwardTerminate);
+      try {
+        const done = Promise.withResolvers<number | null>();
+        child.once('error', done.reject);
+        child.once('exit', code => done.resolve(code));
+        await done.promise;
+      } finally {
+        process.off('SIGINT', forwardInterrupt);
+        process.off('SIGTERM', forwardTerminate);
+      }
+      process.exitCode = undefined;
+      launch = {
+        draft: result.draft,
+        ...(result.previousSessionId ? { previousSessionId: result.previousSessionId, conversationId: result.previousSessionId } : {}),
+        ...(result.returnPanel ? { openPanel: result.returnPanel } : {}),
+        ...(parsed.maxFps !== undefined ? { maxFps: parsed.maxFps } : {}),
+        ...(parsed.motion !== undefined ? { motion: parsed.motion } : {}),
+        notice: { text: 'Returned from official agy CLI; refreshed session.', error: false },
+      };
+      continue;
+    }
     const { runTerminalLogin } = await import('./auth');
     const login = await runTerminalLogin({ cwd: parsed.cwd, executable }, result.method);
     if (login.status === 'terminated') {

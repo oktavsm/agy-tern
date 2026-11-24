@@ -866,6 +866,124 @@ export function extractMarkdownImagePaths(
   return extractMarkdownImageCandidates(text, cwd).filter(pathExists);
 }
 
+export interface PluginCardRef {
+  catalogId: string;
+}
+
+const PLUGIN_CARD_RE = /<plugin-card\b[^>]*\bcatalog-id=(?:"([^"]+)"|'([^']+)')[^>]*>(?:<\/plugin-card>)?/gi;
+
+/** Extract deduplicated `<plugin-card catalog-id="...">` references emitted in Antigravity prose. */
+export function extractPluginCards(text: string): PluginCardRef[] {
+  if (!text || !text.includes('<plugin-card')) return [];
+  const seen = new Set<string>();
+  const cards: PluginCardRef[] = [];
+  for (const match of text.matchAll(PLUGIN_CARD_RE)) {
+    const id = (match[1] ?? match[2] ?? '').trim();
+    if (!id || !/^[a-z0-9][a-z0-9._@-]{0,63}$/i.test(id) || seen.has(id)) continue;
+    seen.add(id);
+    cards.push({ catalogId: id });
+  }
+  return cards;
+}
+
+/** Strip raw `<plugin-card ...>` XML tags from markdown prose once rendered as native Tern cards. */
+export function stripPluginCardTags(text: string): string {
+  if (!text || !text.includes('<plugin-card')) return text;
+  return text.replace(PLUGIN_CARD_RE, '').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+export interface ActionableUrl {
+  url: string;
+  label: string;
+  isOAuth: boolean;
+}
+
+function labelActionableUrl(raw: string): ActionableUrl | undefined {
+  try {
+    const parsed = new URL(raw);
+    if (parsed.protocol !== 'https:') return undefined;
+    const host = parsed.hostname.replace(/^www\./, '');
+    const isOAuth =
+      (host === 'accounts.google.com' && parsed.pathname.includes('/oauth2')) ||
+      parsed.pathname.includes('/oauth') ||
+      parsed.pathname.includes('/authorize') ||
+      parsed.searchParams.has('code_challenge') ||
+      parsed.searchParams.has('client_id');
+    if (isOAuth) {
+      const scope = parsed.searchParams.get('scope') ?? '';
+      if (scope.includes('spreadsheets')) return { url: raw, label: 'Google Sheets OAuth', isOAuth: true };
+      if (scope.includes('documents')) return { url: raw, label: 'Google Docs OAuth', isOAuth: true };
+      if (scope.includes('/drive')) return { url: raw, label: 'Google Drive OAuth', isOAuth: true };
+      return { url: raw, label: `Sign in (${host})`, isOAuth: true };
+    }
+    return { url: raw, label: host, isOAuth: false };
+  } catch {
+    return undefined;
+  }
+}
+
+/** Extract interactive OAuth / external `https://` links from agent messages (prioritizing OAuth sign-in flows). */
+export function extractActionableUrls(text: string, limit = 6): ActionableUrl[] {
+  if (!text || !text.includes('https://')) return [];
+  const seen = new Set<string>();
+  const oauth: ActionableUrl[] = [];
+  const other: ActionableUrl[] = [];
+  for (const match of text.matchAll(/https:\/\/[^\s`"'<>)\]]+/g)) {
+    const raw = match[0].replace(/[.,;:!?]+$/, '');
+    if (seen.has(raw)) continue;
+    seen.add(raw);
+    const info = labelActionableUrl(raw);
+    if (!info) continue;
+    if (info.isOAuth) oauth.push(info);
+    else other.push(info);
+  }
+  // Surface OAuth sign-in buttons directly; keep generic links out unless OAuth URLs exist.
+  if (oauth.length > 0) return oauth.slice(0, limit);
+  return [];
+}
+
+export interface AutoCompactOverrideInfo {
+  raw: string;
+  tokens?: number;
+  percent?: number;
+  label: string;
+}
+
+/** Parse `AGY_CLI_AUTO_COMPACT_OVERRIDE` matching official agy 1.5.15 (`700000`, `800K`, `0.5M`, or `80%`). */
+export function parseAutoCompactOverride(
+  rawValue: string | undefined,
+  windowSize?: number,
+): AutoCompactOverrideInfo | undefined {
+  const raw = rawValue?.trim();
+  if (!raw) return undefined;
+  const pctMatch = /^(\d+(?:\.\d+)?)%$/.exec(raw);
+  if (pctMatch) {
+    const pct = Number(pctMatch[1]);
+    if (!Number.isFinite(pct) || pct <= 0 || pct > 100) return undefined;
+    const tokens = windowSize && windowSize > 0 ? Math.round((windowSize * pct) / 100) : undefined;
+    return {
+      raw,
+      percent: pct,
+      ...(tokens !== undefined ? { tokens } : {}),
+      label: tokens !== undefined ? `${pct}% (${tokens.toLocaleString()} tokens)` : `${pct}%`,
+    };
+  }
+  const unitMatch = /^(\d+(?:\.\d+)?)([kKmM])?$/.exec(raw);
+  if (!unitMatch) return undefined;
+  const num = Number(unitMatch[1]);
+  if (!Number.isFinite(num) || num <= 0) return undefined;
+  const unit = unitMatch[2]?.toLowerCase();
+  const multiplier = unit === 'm' ? 1_000_000 : unit === 'k' ? 1_000 : 1;
+  const tokens = Math.round(num * multiplier);
+  const percent = windowSize && windowSize > 0 ? Math.min(100, Math.round((tokens / windowSize) * 100)) : undefined;
+  return {
+    raw,
+    tokens,
+    ...(percent !== undefined ? { percent } : {}),
+    label: percent !== undefined ? `${tokens.toLocaleString()} tokens (${percent}%)` : `${tokens.toLocaleString()} tokens`,
+  };
+}
+
 /** Extract inline base64 image blocks delivered inside a tool call's content array. */
 export function extractToolInlineImages(call: ToolCallUpdate): InlineImage[] {
   const out: InlineImage[] = [];

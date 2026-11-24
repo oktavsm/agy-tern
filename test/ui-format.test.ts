@@ -6,7 +6,9 @@ import {
   collectSessionDiffs,
   computeResponsiveLayout,
   countSessionDiffs,
+  extractActionableUrls,
   extractMarkdownImagePaths,
+  extractPluginCards,
   extractToolImagePaths,
   extractToolInlineImages,
   extractToolLiveOutput,
@@ -22,10 +24,12 @@ import {
   formatTranscriptJson,
   formatTranscriptMarkdown,
   isRunnableCodeLang,
+  parseAutoCompactOverride,
   parseUnifiedGitDiff,
   searchTranscript,
   splitMarkdownSegments,
   selectSoonestQuotaReset,
+  stripPluginCardTags,
   summarizeQuotaRows,
   summarizeThoughtTopic,
   summarizeToolCall,
@@ -418,5 +422,17 @@ describe('ui formatting helpers', () => {
     expect(formatCompactWorkspacePath('/home/me/Code/repo', 30, '/home/me')).toBe('~/Code/repo');
     expect(formatCompactWorkspacePath('/home/me/Code/github.com/org/very-long-repo-name', 28, '/home/me'))
       .toContain('very-long-repo-name');
+
+    const pluginMsg = 'Sign in below:\n\n<plugin-card catalog-id="gdrive"></plugin-card>\n<plugin-card catalog-id="gdocs" />\n<plugin-card catalog-id="gdrive"></plugin-card>';
+    expect(extractPluginCards(pluginMsg)).toEqual([{ catalogId: 'gdrive' }, { catalogId: 'gdocs' }]);
+    expect(stripPluginCardTags(pluginMsg)).toBe('Sign in below:');
+
+    const oauthMsg = 'Open `https://accounts.google.com/o/oauth2/v2/auth?client_id=1&scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive` and `https://accounts.google.com/o/oauth2/v2/auth?client_id=1&scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fspreadsheets`';
+    expect(extractActionableUrls(oauthMsg).map(u => u.label)).toEqual(['Google Drive OAuth', 'Google Sheets OAuth']);
+
+    expect(parseAutoCompactOverride('800K', 1_000_000)).toMatchObject({ tokens: 800_000, percent: 80 });
+    expect(parseAutoCompactOverride('0.5M', 1_000_000)).toMatchObject({ tokens: 500_000, percent: 50 });
+    expect(parseAutoCompactOverride('75%', 1_000_000)).toMatchObject({ tokens: 750_000, percent: 75 });
+    expect(parseAutoCompactOverride('invalid', 1_000_000)).toBeUndefined();
   });
 });

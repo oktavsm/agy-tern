@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { buildAttentionSequence, openInTernSplit, resolveTernTarget, runCommandInTernSplit, sendDesktopNotification, sendTerminalAttention } from '../src/tern-window';
+import { buildAttentionSequence, isSafeExternalUrl, openExternalUrl, openInTernSplit, resolveTernTarget, runCommandInTernSplit, sendDesktopNotification, sendTerminalAttention } from '../src/tern-window';
 
 const dirs: string[] = [];
 
@@ -94,5 +94,27 @@ exit 0
       platform: 'linux',
       hasCommand: () => false,
     })).toBe(false);
+  });
+
+  test('validates and opens only safe external https or localhost http URLs', async () => {
+    expect(isSafeExternalUrl('https://accounts.google.com/o/oauth2/v2/auth?client_id=1')).toBe(true);
+    expect(isSafeExternalUrl('http://127.0.0.1:33313/callback')).toBe(true);
+    expect(isSafeExternalUrl('file:///etc/passwd')).toBe(false);
+    expect(isSafeExternalUrl('javascript:alert(1)')).toBe(false);
+
+    const calls: Array<{ cmd: string; args: readonly string[] }> = [];
+    const opened = await openExternalUrl('https://accounts.google.com/o/oauth2/v2/auth', {
+      platform: 'linux',
+      hasCommand: cmd => cmd === 'xdg-open',
+      exec: async (cmd, args) => { calls.push({ cmd, args }); },
+    });
+    expect(opened.ok).toBe(true);
+    expect(calls[0]).toEqual({ cmd: 'xdg-open', args: ['https://accounts.google.com/o/oauth2/v2/auth'] });
+
+    const blocked = await openExternalUrl('file:///etc/passwd', {
+      platform: 'linux',
+      hasCommand: () => true,
+    });
+    expect(blocked.ok).toBe(false);
   });
 });

@@ -169,3 +169,62 @@ export async function sendDesktopNotification(
     return false;
   }
 }
+
+/** Validate that a URL is safe to open externally (`https:` or loopback `http:`). */
+export function isSafeExternalUrl(rawUrl: string): boolean {
+  const trimmed = rawUrl.trim();
+  if (!trimmed || /[\u0000-\u001f\u007f\s]/.test(trimmed)) return false;
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol === 'https:') return true;
+    if (parsed.protocol === 'http:' && (parsed.hostname === '127.0.0.1' || parsed.hostname === 'localhost' || parsed.hostname === '[::1]')) {
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+/** Open a validated external `https:` (or localhost `http:`) URL in the user's default browser without shell execution. */
+export async function openExternalUrl(
+  rawUrl: string,
+  options: {
+    platform?: NodeJS.Platform;
+    hasCommand?: (cmd: string) => boolean;
+    exec?: DesktopExecFn;
+  } = {},
+): Promise<TernOpenResult> {
+  const url = rawUrl.trim();
+  if (!isSafeExternalUrl(url)) {
+    return { ok: false, error: 'Only https:// or localhost http:// URLs can be opened.' };
+  }
+  const platform = options.platform ?? process.platform;
+  const hasCmd = options.hasCommand ?? ((cmd: string) => !!Bun.which(cmd));
+  const exec = options.exec ?? (async (cmd: string, args: readonly string[]) => {
+    const child = spawn(cmd, [...args], {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true,
+    });
+    child.unref();
+  });
+  try {
+    if (platform === 'darwin') {
+      if (!hasCmd('open')) return { ok: false, error: '`open` command not found.' };
+      await exec('open', [url]);
+      return { ok: true, target: url };
+    }
+    if (hasCmd('xdg-open')) {
+      await exec('xdg-open', [url]);
+      return { ok: true, target: url };
+    }
+    if (hasCmd('gio')) {
+      await exec('gio', ['open', url]);
+      return { ok: true, target: url };
+    }
+    return { ok: false, error: 'No browser opener found (install xdg-utils for xdg-open).' };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+}

@@ -6,7 +6,9 @@ import { terminalLoginProblem, type AgentAuthentication, type AgentMetadata, typ
 import type { ToolStep, TranscriptEntry } from './model';
 import { editDraft, type Draft } from './draft';
 import { configLabel, configValues, commandCategory, filterCommands, modelOption, type Command } from './commands';
-import type { AgentEntry, McpServerEntry, PluginEntry } from './extensions';
+import type { AgentEntry, McpServerEntry, PluginEntry, RemoteControlStatus } from './extensions';
+import type { DraftContextBudget } from './context-budget';
+import { formatCompactTokens } from './context-budget';
 import type { OfficialReport } from './reports';
 import { parseQuotaReport } from './reports';
 import type { SessionPreview } from './history';
@@ -36,6 +38,7 @@ import {
   formatPathLabel,
   formatQuotaResetCountdown,
   formatQuotaResetDisplay,
+  parseAutoCompactOverride,
   searchTranscript,
   searchTranscriptCached,
   selectSoonestQuotaReset,
@@ -106,6 +109,9 @@ export type Panel =
   | { kind: 'template-save' }
   | { kind: 'mcp-add' }
   | { kind: 'plugin-install' }
+  | { kind: 'plugin-import' }
+  | { kind: 'context' }
+  | { kind: 'remote-control' }
   | { kind: 'confirm'; title: string; detail: string; actionLabel: string; returnTo?: Panel; onConfirm(): void }
   | { kind: 'inspect'; title: string; subtitle?: string; item: InspectTarget }
   | { kind: 'keys' }
@@ -253,6 +259,16 @@ export interface PanelRenderContext {
   onInspectCommit?(commit: CommitEntry): void;
   usageHeatmap?: UsageHeatmapData;
   usageHeatmapLoading?: boolean;
+  onReloadMcpSession?(): void;
+  onHandoffOfficialAgy?(reason: string, returnPanel?: 'plugins' | 'mcp'): void;
+  onTriggerCompact?(): void;
+  draftBudget?: DraftContextBudget;
+  attachedCounts?: { files: number; dirs: number; images: number };
+  remoteControl?: RemoteControlStatus;
+  remoteControlLoading?: boolean;
+  onRefreshRemoteControl?(): void;
+  onStartRemoteControl?(): void;
+  onStopRemoteControl?(): void;
 }
 
 function renderPrefsPanel(ctx: PanelRenderContext): JSX.Element {
@@ -1133,6 +1149,7 @@ function renderMcpPicker(ctx: PanelRenderContext): JSX.Element {
     preview={highlighted ? 'below' : 'none'}
     actions={[
       { id: 'refresh', label: 'Refresh', disabled: ctx.extLoading ? (true as const) : undefined },
+      ...(ctx.onReloadMcpSession ? [{ id: 'reload', label: 'Reload MCP', disabled: ctx.extLoading || ctx.busy ? (true as const) : undefined }] : []),
       { id: 'add', label: 'Add', disabled: ctx.extLoading ? (true as const) : undefined },
       { id: 'remove', label: 'Remove', disabled: !canToggle ? (true as const) : undefined },
       { id: 'close', label: 'Close', keys: ['esc'] },
@@ -1147,6 +1164,7 @@ function renderMcpPicker(ctx: PanelRenderContext): JSX.Element {
         if (typeof event.value === 'string') ctx.onSetPickerTab(event.value, true);
       },
       refresh: () => ctx.onLoadExtensions('mcp'),
+      reload: () => ctx.onReloadMcpSession?.(),
       add: () => ctx.onOpenPanel({ kind: 'mcp-add' }),
       remove: () => {
         if (!canToggle || !highlighted) return;
@@ -1178,9 +1196,10 @@ function renderPluginsPicker(ctx: PanelRenderContext): JSX.Element {
   const highlighted = filtered.find(p => p.name === selectedId);
   const items: PickerItem[] = filtered.map(plugin => ({
     id: plugin.name,
-    label: plugin.name,
-    detail: `${plugin.skills.length} skill${plugin.skills.length === 1 ? '' : 's'}${plugin.rules.length ? ` · ${plugin.rules.length} rule` : ''}`,
+    label: plugin.displayName ? `${plugin.displayName} (${plugin.name})` : plugin.name,
+    detail: `${plugin.skills.length} skill${plugin.skills.length === 1 ? '' : 's'}${plugin.rules.length ? ` · ${plugin.rules.length} rule` : ''}${plugin.description ? ` · ${plugin.description}` : ''}`,
     badges: [
+      ...(plugin.hasAuth ? [{ text: 'OAuth', tone: 'info' as const }] : []),
       ...(plugin.version ? [{ text: `v${plugin.version}`, tone: 'neutral' as const }] : []),
       { text: plugin.enabled ? 'enabled' : 'disabled', tone: plugin.enabled ? 'success' as const : 'muted' as const },
     ],
@@ -1204,9 +1223,11 @@ function renderPluginsPicker(ctx: PanelRenderContext): JSX.Element {
     preview={highlighted ? 'below' : 'none'}
     actions={[
       { id: 'refresh', label: 'Refresh', disabled: ctx.extLoading ? (true as const) : undefined },
+      ...(highlighted?.hasAuth && ctx.onHandoffOfficialAgy ? [{ id: 'signin', label: 'Sign in / Accounts', disabled: ctx.extLoading || ctx.busy ? (true as const) : undefined }] : []),
       ...(highlighted?.enabled && highlighted.skills.length ? [{ id: 'useSkill', label: `Use /${highlighted.skills[0]}`, disabled: ctx.extLoading ? (true as const) : undefined }] : []),
       { id: 'validate', label: 'Validate', disabled: !highlighted?.path || ctx.extLoading ? (true as const) : undefined },
       { id: 'install', label: 'Install', disabled: ctx.extLoading ? (true as const) : undefined },
+      { id: 'importPlugin', label: 'Import', disabled: ctx.extLoading ? (true as const) : undefined },
       { id: 'uninstall', label: 'Uninstall', disabled: !canToggle ? (true as const) : undefined },
       { id: 'close', label: 'Close', keys: ['esc'] },
       { id: 'toggle', label: highlighted ? (targetEnabled ? 'Enable' : 'Disable') : 'Toggle', primary: true, keys: ['enter'],
@@ -1220,6 +1241,9 @@ function renderPluginsPicker(ctx: PanelRenderContext): JSX.Element {
         if (typeof event.value === 'string') ctx.onSetPickerTab(event.value, true);
       },
       refresh: () => ctx.onLoadExtensions('plugins'),
+      signin: () => {
+        if (highlighted) ctx.onHandoffOfficialAgy?.(`Sign in or manage accounts for "${highlighted.name}" in official /plugin`, 'plugins');
+      },
       useSkill: () => {
         const skillName = highlighted?.skills[0];
         if (!skillName) return;
@@ -1229,6 +1253,7 @@ function renderPluginsPicker(ctx: PanelRenderContext): JSX.Element {
       },
       validate: () => { if (highlighted && !ctx.extLoading) ctx.onValidatePlugin(highlighted); },
       install: () => ctx.onOpenPanel({ kind: 'plugin-install' }),
+      importPlugin: () => ctx.onOpenPanel({ kind: 'plugin-import' }),
       uninstall: () => {
         if (!canToggle || !highlighted) return;
         ctx.onOpenPanel({
@@ -1244,8 +1269,10 @@ function renderPluginsPicker(ctx: PanelRenderContext): JSX.Element {
     }}>
     {highlighted && <col key="pv" gap="xs">
       <kv items={[
-        { k: 'Plugin', v: `${highlighted.name}${highlighted.version ? ` (v${highlighted.version})` : ''}` },
+        { k: 'Plugin', v: `${highlighted.displayName ? `${highlighted.displayName} (${highlighted.name})` : highlighted.name}${highlighted.version ? ` v${highlighted.version}` : ''}` },
         { k: 'Status', v: highlighted.enabled ? 'Enabled' : 'Disabled' },
+        ...(highlighted.description ? [{ k: 'About', v: highlighted.description }] : []),
+        ...(highlighted.hasAuth ? [{ k: 'Accounts', v: `OAuth2 (${highlighted.authProviders?.join(', ') ?? 'provider'})${highlighted.authClis?.length ? ` · CLI: ${highlighted.authClis.join(', ')}` : ''} · Use "Sign in / Accounts" for multi-account OAuth` }] : []),
         ...(highlighted.source ? [{ k: 'Source', v: highlighted.source }] : []),
         { k: 'Path', v: highlighted.path || 'Not reported' },
         ...(highlighted.rules.length ? [{ k: 'Rules', v: highlighted.rules.join(', ') }] : []),
@@ -1254,6 +1281,16 @@ function renderPluginsPicker(ctx: PanelRenderContext): JSX.Element {
         <span s="muted">Skills: </span>
         <span>{highlighted.skills.map(s => `/${s}`).join(', ')}</span>
       </text>}
+      {highlighted.suggestedPrompts && highlighted.suggestedPrompts.length > 0 && <row gap="xs" wrap>
+        {highlighted.suggestedPrompts.slice(0, 2).map((prompt, idx) => <button key={`sp-${idx}`} size="sm" variant="quiet"
+          onClick={() => {
+            ctx.onClosePanel();
+            ctx.onSetDraft({ text: prompt, cursor: prompt.length });
+            ctx.onFocus('dock.draft');
+          }}>
+          {`Try: ${prompt.length > 36 ? `${prompt.slice(0, 33)}...` : prompt}`}
+        </button>)}
+      </row>}
     </col>}
   </picker>;
 }
@@ -2059,6 +2096,104 @@ function renderCommitsOverlay(ctx: PanelRenderContext): JSX.Element {
   </overlay>;
 }
 
+function renderContextOverlay(ctx: PanelRenderContext): JSX.Element {
+  const usage = ctx.metadata.usage;
+  const contextUsage = formatContextUsage(usage);
+  const autoCompact = parseAutoCompactOverride(process.env.AGY_CLI_AUTO_COMPACT_OVERRIDE, usage?.size);
+  const model = modelOption(ctx.metadata.configOptions);
+  const thinking = thinkingOption(ctx.metadata.configOptions);
+  const mode = ctx.modeOption;
+  const userCount = ctx.entries.filter(e => e.type === 'message' && e.role === 'user').length;
+  const agentCount = ctx.entries.filter(e => e.type === 'message' && e.role === 'agent').length;
+  const thoughtCount = ctx.entries.filter(e => e.type === 'thought').length;
+  const toolCount = ctx.entries.filter(e => e.type === 'tool').length;
+  const attached = ctx.attachedCounts ?? { files: 0, dirs: 0, images: 0 };
+  const remaining = usage && usage.size > 0 ? Math.max(0, usage.size - usage.used) : undefined;
+
+  return <overlay key="panel" head="Context window & session breakdown" icon="context" modal size={ctx.rLayout.panelSize}
+    meta={contextUsage ? contextUsage.summary : 'Waiting for first ACP usage update'}
+    end={<button keys={['esc']} variant="quiet" onClick={ctx.onClosePanel}>Close</button>}
+    foot={<row gap="xs" justify="between" align="center" wrap>
+      <text><span s="muted">Set AGY_CLI_AUTO_COMPACT_OVERRIDE (e.g. 800K, 0.5M, 80%) before launch to adjust auto-compaction</span></text>
+      <row gap="xs">
+        <button size="sm" variant="quiet" onClick={() => ctx.onOpenPanel({ kind: 'report', report: 'usage' })}>Usage & Quota</button>
+        {ctx.onTriggerCompact && <button size="sm" variant="primary" disabled={ctx.busy || !ctx.agent || ctx.disconnected}
+          onClick={ctx.onTriggerCompact}>
+          Compact (/compact)
+        </button>}
+      </row>
+    </row>}>
+    <scroll key="overlay-scroll" bar="always" max={{ h: ctx.rLayout.inspectBodyMaxH }}>
+      <col gap="md">
+        <section head="Capacity">
+          <col gap="sm">
+            {contextUsage && usage ? <>
+              <meter style="bar" size="md" value={contextUsage.percent / 100}
+                thresholds={{ warn: 0.75, bad: 0.9 }}
+                label={`${usage.used.toLocaleString()} / ${usage.size.toLocaleString()} tokens (${contextUsage.percent}%)`} />
+              <kv items={[
+                { k: 'Used', v: `${usage.used.toLocaleString()} tokens (${contextUsage.percent}%)` },
+                { k: 'Window', v: `${usage.size.toLocaleString()} tokens` },
+                ...(remaining !== undefined ? [{ k: 'Remaining', v: `${remaining.toLocaleString()} tokens` }] : []),
+                { k: 'Auto-compaction threshold', v: autoCompact ? `${autoCompact.label} (AGY_CLI_AUTO_COMPACT_OVERRIDE=${autoCompact.raw})` : 'Model default (override via AGY_CLI_AUTO_COMPACT_OVERRIDE)' },
+                ...(usage.cost ? [{ k: 'Session cost', v: `${usage.cost.amount} ${usage.cost.currency}` }] : []),
+              ]} />
+            </> : <kv items={[
+              { k: 'Usage', v: 'Not reported yet by agy ACP (updates after the first turn).' },
+              { k: 'Auto-compaction threshold', v: autoCompact ? `${autoCompact.label} (AGY_CLI_AUTO_COMPACT_OVERRIDE=${autoCompact.raw})` : 'Model default' },
+            ]} />}
+          </col>
+        </section>
+        <section head="Active Session & Draft">
+          <kv items={[
+            { k: 'Session', v: `${ctx.sessionTitle(ctx.activeSessionId)} (${ctx.activeSessionId ? ctx.activeSessionId.slice(0, 8) : 'starting'})` },
+            { k: 'Workspace', v: ctx.options.cwd },
+            ...(model ? [{ k: 'Model', v: configLabel(model) }] : []),
+            ...(thinking ? [{ k: 'Thinking effort', v: configLabel(thinking) }] : []),
+            ...(mode ? [{ k: 'Mode', v: configLabel(mode) }] : []),
+            { k: 'Transcript items', v: `${userCount} prompt(s) · ${agentCount} reply(ies) · ${toolCount} tool(s) · ${thoughtCount} thought(s)` },
+            { k: 'Draft attachments', v: `${attached.files} file(s) · ${attached.dirs} dir(s) · ${attached.images} image(s)` },
+            ...(ctx.draftBudget && ctx.draftBudget.totalEstimatedTokens > 0
+              ? [{ k: 'Estimated next prompt', v: `~${formatCompactTokens(ctx.draftBudget.totalEstimatedTokens)} tokens` }]
+              : []),
+          ]} />
+        </section>
+      </col>
+    </scroll>
+  </overlay>;
+}
+
+function renderRemoteControlOverlay(ctx: PanelRenderContext): JSX.Element {
+  const rc = ctx.remoteControl;
+  const busyAction = Boolean(ctx.remoteControlLoading || ctx.extLoading);
+  return <overlay key="panel" head="Remote Control daemon" icon="link" modal size={ctx.rLayout.panelSize}
+    meta={rc ? (rc.active ? `Active${rc.instanceName ? ` · ${rc.instanceName}` : ''}` : rc.statusText) : 'Checking official agy remote-control...'}
+    end={<button keys={['esc']} variant="quiet" onClick={ctx.onClosePanel}>Close</button>}
+    foot={<row gap="xs" justify="between" align="center" wrap>
+      <text><span s="muted">Managed through official `agy remote-control status|start|stop`</span></text>
+      <row gap="xs">
+        {ctx.onRefreshRemoteControl && <button size="sm" variant="quiet" disabled={busyAction} onClick={ctx.onRefreshRemoteControl}>Refresh</button>}
+        {rc?.active
+          ? (ctx.onStopRemoteControl && <button size="sm" variant="danger" disabled={busyAction} onClick={ctx.onStopRemoteControl}>Stop daemon</button>)
+          : (ctx.onStartRemoteControl && <button size="sm" variant="primary" disabled={busyAction} onClick={ctx.onStartRemoteControl}>Start daemon</button>)}
+      </row>
+    </row>}>
+    <scroll key="overlay-scroll" bar="always" max={{ h: ctx.rLayout.inspectBodyMaxH }}>
+      <col gap="md">
+        {busyAction && <spinner label="Querying official `agy remote-control`..." />}
+        {ctx.panelError && <text wrap="word"><span s="error">{ctx.panelError}</span></text>}
+        {rc && <>
+          <kv items={[
+            { k: 'Daemon status', v: rc.statusText },
+            { k: 'Instance name', v: rc.instanceName ?? 'Not assigned yet' },
+          ]} />
+          <code wrap>{rc.raw}</code>
+        </>}
+      </col>
+    </scroll>
+  </overlay>;
+}
+
 /** Render the active modal picker, prefs window, report overlay, or inspector dialog. */
 export function renderActivePanel(ctx: PanelRenderContext): JSX.Element {
   const currentPanel = ctx.panel;
@@ -2066,6 +2201,8 @@ export function renderActivePanel(ctx: PanelRenderContext): JSX.Element {
   if (currentPanel.kind === 'followup') return renderFollowUpOverlay(ctx, currentPanel);
   if (currentPanel.kind === 'keys') return renderKeysOverlay(ctx);
   if (currentPanel.kind === 'commits') return renderCommitsOverlay(ctx);
+  if (currentPanel.kind === 'context') return renderContextOverlay(ctx);
+  if (currentPanel.kind === 'remote-control') return renderRemoteControlOverlay(ctx);
   const config = currentPanel.kind === 'config' ? ctx.metadata.configOptions.find(option => option.id === currentPanel.id) : undefined;
   if (currentPanel.kind === 'config' && config?.type === 'select') return renderSelectConfigPicker(ctx, config);
   if (currentPanel.kind === 'commands') return renderCommandsPicker(ctx);
@@ -2089,6 +2226,7 @@ export function renderActivePanel(ctx: PanelRenderContext): JSX.Element {
     : currentPanel.kind === 'template-save' ? 'Save prompt template'
     : currentPanel.kind === 'mcp-add' ? 'Add MCP server'
     : currentPanel.kind === 'plugin-install' ? 'Install Antigravity plugin'
+    : currentPanel.kind === 'plugin-import' ? 'Import plugins'
     : currentPanel.kind === 'confirm' ? currentPanel.title
     : currentPanel.kind === 'account' ? 'Account & sign-in'
     : currentPanel.kind === 'account-switch' ? 'Change shared account?'
@@ -2243,18 +2381,22 @@ export function renderActivePanel(ctx: PanelRenderContext): JSX.Element {
       </scroll>}
       {currentPanel.kind === 'rename' && <text wrap="word">Local to agy-tern; does not rename the conversation in Antigravity. Up to 160 characters. Leave empty to use agy’s title.</text>}
       {currentPanel.kind === 'template-save' && <text wrap="word">Enter a short template name (e.g. review-diff). Saved locally per workspace in your XDG state directory.</text>}
-      {currentPanel.kind === 'mcp-add' && <text wrap="word">Syntax: [--type stdio|http] &lt;name&gt; &lt;commandOrUrl&gt; [args...]. Executed via `agy mcp add`.</text>}
+      {currentPanel.kind === 'mcp-add' && <text wrap="word">Syntax: [--type stdio|http] [--env KEY=VAL] [--header "K: V"] &lt;name&gt; &lt;commandOrUrl&gt; [args...]. Executed via `agy mcp add`.</text>}
       {currentPanel.kind === 'plugin-install' && <text wrap="word">Enter a local plugin directory path or `plugin@marketplace` identifier. Executed via `agy plugin install`.</text>}
+      {currentPanel.kind === 'plugin-import' && <text wrap="word">Enter `claude`, `gemini`, or a local plugin directory to import. Executed via `agy plugin import`.</text>}
       {currentPanel.kind === 'confirm' && <text wrap="word">{currentPanel.detail}</text>}
       {currentPanel.kind !== 'permissions' && currentPanel.kind !== 'account' && currentPanel.kind !== 'account-switch' && currentPanel.kind !== 'confirm' && <input key="query"
         aria={currentPanel.kind === 'rename' ? 'Local conversation name' : currentPanel.kind === 'template-save' ? 'Template name'
-          : currentPanel.kind === 'mcp-add' ? 'MCP server command' : currentPanel.kind === 'plugin-install' ? 'Plugin target'
+          : currentPanel.kind === 'mcp-add' ? 'MCP server command'
+          : currentPanel.kind === 'plugin-install' ? 'Plugin target'
+          : currentPanel.kind === 'plugin-import' ? 'Plugin import source'
           : `Filter ${title.toLowerCase()}`}
         text={ctx.panelDraft.text} cursor={ctx.panelDraft.cursor} anchor={ctx.panelDraft.anchor}
         placeholder={currentPanel.kind === 'rename' ? 'Conversation name (local)'
           : currentPanel.kind === 'template-save' ? 'e.g. audit-security'
-          : currentPanel.kind === 'mcp-add' ? 'e.g. --type stdio github npx -y @modelcontextprotocol/server-github'
-          : currentPanel.kind === 'plugin-install' ? 'e.g. /path/to/plugin or my-plugin@official'
+          : currentPanel.kind === 'mcp-add' ? 'e.g. --env GITHUB_TOKEN=xxx gh npx -y @modelcontextprotocol/server-github'
+          : currentPanel.kind === 'plugin-install' ? 'e.g. /path/to/plugin or gdrive@antigravity-plugins-official'
+          : currentPanel.kind === 'plugin-import' ? 'e.g. claude or gemini'
           : `Filter ${title.toLowerCase()}`}
         onFocus={() => ctx.onFocus('layer.panel.query')}
         onEdit={ctx.onEditPanelDraft} />}

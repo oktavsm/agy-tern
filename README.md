@@ -173,8 +173,10 @@ agy-tern --doctor                                 # Verify agy, tern, Bun, and c
 | `/commits`, `/heatmap` | View GitHub-style daily commit contribution heatmap, streak stats, and inspect recent commit patches |
 | `/tasks`, `/running`, `/ps` | Inspect live child processes and tool activity, view live streaming command output (`Enter`), or kill running processes |
 | `/templates [query]` | Save, search, insert, or delete workspace prompt templates |
-| `/mcp`, `/plugins`, `/agents` | Manage `agy` MCP servers, plugins/skills, and custom agent profiles |
-| `/new`, `/rename [name]` | Start a new session or set a local display label |
+| `/mcp`, `/plugins` (`/plugin`), `/agents` | Manage `agy` MCP servers (with `Reload MCP` + `--env`/`--header`), plugins/skills (`Import`, `Validate`, OAuth account handoff), and agents |
+| `/context` (`/ctx`, `/status`), `/effort`, `/mode` | Inspect context window & `AGY_CLI_AUTO_COMPACT_OVERRIDE` breakdown, or switch thinking effort and execution mode directly |
+| `/remote-control` (`/rc`), `/agy` (`/official`) | Manage the official `agy remote-control` daemon or hand off temporarily to the official `agy` CLI (and auto-return on exit) |
+| `/new` (`/clear`), `/rename [name]` | Start a new session or set a local display label |
 | `/export [file.md\|json]` | Export transcript as Markdown or JSON inside the workspace |
 | `/expand`, `/collapse` | Expand or collapse all thought and tool cards |
 | `/paste-image`, `/clip` | Attach clipboard image (`Ctrl+V` / `Alt+V`) |
