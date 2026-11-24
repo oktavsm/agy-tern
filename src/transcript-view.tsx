@@ -800,6 +800,12 @@ export function Entry({ entry, continued, streaming, recent, turnNumber, callbac
           </button>
         </row>;
       }
+      if (entry.items && entry.items.length > 0) {
+        return <card key={entry.id} icon="check" head={entry.title ?? 'Your response'} meta="Submitted"
+          end={<button size="sm" variant="quiet" icon="copy" onClick={() => callbacks.onCopy(entry.text)}>Copy</button>}>
+          <kv items={entry.items.map(item => ({ k: item.label, v: item.value }))} />
+        </card>;
+      }
       return <rule key={entry.id} variant="note" icon="info" label={entry.text} />;
     case 'compaction': {
       const status = entry.status === 'failed' || entry.status === 'cancelled'

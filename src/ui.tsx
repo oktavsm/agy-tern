@@ -10,6 +10,7 @@ import {
   extractMarkdownFollowUpQuestions,
   extractToolFollowUpQuestions,
   followUpFocusTarget,
+  formatFollowUpAnswerItems,
   formatFollowUpPromptReply,
   parseElicitationRequest,
   stepFollowUpKey,
@@ -411,6 +412,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
   let sessionTask: Promise<void> | undefined;
   const permissions: PermissionPrompt[] = [];
   const elicitations: ElicitationPrompt[] = [];
+  let elicitationAnsweredInTurn = false;
   let followUpState: FollowUpSessionState | undefined;
   let session: Session | null = null;
   let surface: Surface | undefined;
@@ -797,11 +799,19 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         surface?.focus(followUpFocusTarget(followUpState));
         return;
       }
+      const answeredItems = formatFollowUpAnswerItems(followUpState);
+      const answeredText = formatFollowUpPromptReply(followUpState);
+      const answeredTitle = followUpState.title || panel.title || 'Your response';
       elicitations.shift();
+      elicitationAnsweredInTurn = true;
       followUpState = undefined;
+      if (answeredItems.length > 0) {
+        stateManager.getConversation().recordFollowUpResponse(answeredTitle, answeredItems, answeredText);
+      }
       active.answer({ action: 'accept', content: checked.content });
       activateNextElicitation();
       render();
+      surface?.scroll('main.conversation', 'end');
       return;
     }
     if (!followUpState) { closePanel(); return; }
@@ -2504,6 +2514,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     stateManager.setRetryPayload(text, images, attachedFilePaths, attachedDirPaths);
     const activeConv = stateManager.getConversation();
     busy = true;
+    elicitationAnsweredInTurn = false;
     stateManager.getActive().focusedTurnIndex = undefined;
     turnStartedAt = Date.now();
     turnStreamChars = 0;
@@ -2595,10 +2606,11 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
           : [];
         if (mdQuestions.length > 0) {
           openFollowUpModal('Follow-up questions', 'Select an option or enter your answer below.', mdQuestions);
-        } else {
+        } else if (!elicitationAnsweredInTurn) {
           const toolPrompt = [...turnEntries]
             .reverse()
-            .filter(entry => entry.type === 'tool')
+            .filter((entry): entry is ToolStep => entry.type === 'tool' &&
+              !(entry.call.status === 'completed' && (entry.call.rawOutput !== undefined || (entry.call.content?.length ?? 0) > 0)))
             .map(entry => ({ entry, parsed: extractToolFollowUpQuestions(entry.call) }))
             .find(item => item.parsed && item.parsed.fields.length > 0);
           if (toolPrompt?.parsed) {

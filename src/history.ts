@@ -115,7 +115,7 @@ export class PromptHistoryStore {
 }
 
 function sanitizeEntryForDisk(entry: TranscriptEntry): TranscriptEntry | undefined {
-  if (entry.type === 'notice' && !entry.error) return undefined;
+  if (entry.type === 'notice' && !entry.error && !entry.items?.length) return undefined;
   if (entry.type === 'message' && entry.images?.length) {
     // Drop heavy base64 image payloads from disk snapshots so state stays small and fast.
     const labels = entry.images.map(img => `[Image: ${img.mimeType}]`).join(' ');

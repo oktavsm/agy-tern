@@ -45,6 +45,8 @@ export interface NoticeEntry {
   error: boolean;
   retryable?: boolean;
   action?: 'load_deeper_history';
+  title?: string;
+  items?: Array<{ label: string; value: string }>;
 }
 
 export interface CompactionEntry {
@@ -151,6 +153,25 @@ export class Conversation {
   notice(text: string, error = false, retryable = false): NoticeEntry {
     this.closeThought();
     const entry: NoticeEntry = { type: 'notice', id: `entry-${++this.sequence}`, text, error, ...(retryable ? { retryable } : {}) };
+    this.entries.push(entry);
+    this.touch(entry);
+    return entry;
+  }
+
+  recordFollowUpResponse(
+    title: string,
+    items: ReadonlyArray<{ label: string; value: string }>,
+    text: string,
+  ): NoticeEntry {
+    this.closeThought();
+    const entry: NoticeEntry = {
+      type: 'notice',
+      id: `entry-${++this.sequence}`,
+      text,
+      error: false,
+      title,
+      items: items.map(item => ({ label: item.label, value: item.value })),
+    };
     this.entries.push(entry);
     this.touch(entry);
     return entry;

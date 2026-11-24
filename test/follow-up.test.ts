@@ -7,6 +7,7 @@ import {
   followUpAnswerInputId,
   followUpCustomInputId,
   followUpFocusTarget,
+  formatFollowUpAnswerItems,
   formatFollowUpPromptReply,
   parseElicitationRequest,
   stepFollowUpKey,
@@ -238,5 +239,10 @@ describe('follow-up question and ACP elicitation helpers', () => {
     expect(stepFollowUpKey(mcState, k('tab'), { hasFreeNote: true }).focusTarget).toBe(followUpCustomInputId('q1'));
     expect(stepFollowUpKey(mcState, k('tab'), { hasFreeNote: true }).focusTarget).toBe(FOLLOW_UP_FREE_NOTE_ID);
     expect(stepFollowUpKey(mcState, k('enter'), { hasFreeNote: true })).toEqual({ handled: true, submit: true });
+
+    expect(formatFollowUpAnswerItems(textState)).toEqual([
+      { label: 'Which branch?', value: 'main' },
+      { label: 'Additional context', value: 'ok' },
+    ]);
   });
 });

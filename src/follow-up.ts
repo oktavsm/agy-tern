@@ -732,9 +732,9 @@ export function stepFollowUpKey(
   return { handled: false };
 }
 
-/** Format user modal answers into a crisp prompt reply sent to the ACP session. */
-export function formatFollowUpPromptReply(state: FollowUpSessionState): string {
-  const lines: string[] = [];
+/** Format follow-up answers as structured label/value pairs for transcript response cards. */
+export function formatFollowUpAnswerItems(state: FollowUpSessionState): Array<{ label: string; value: string }> {
+  const items: Array<{ label: string; value: string }> = [];
   for (const field of state.fields) {
     const ans = state.answers[field.name];
     const custom = (state.customDrafts[field.name] ?? '').trim();
@@ -750,11 +750,26 @@ export function formatFollowUpPromptReply(state: FollowUpSessionState): string {
       display = ans.trim();
     }
     if (display) {
-      lines.push(state.fields.length === 1 ? `${field.label}\nAnswer: ${display}` : `- ${field.label}: ${display}`);
+      items.push({ label: field.label, value: display });
     }
   }
   if (state.freeNote.trim()) {
-    lines.push(lines.length ? `Additional context: ${state.freeNote.trim()}` : state.freeNote.trim());
+    items.push({ label: 'Additional context', value: state.freeNote.trim() });
+  }
+  return items;
+}
+
+/** Format user modal answers into a crisp prompt reply sent to the ACP session. */
+export function formatFollowUpPromptReply(state: FollowUpSessionState): string {
+  const items = formatFollowUpAnswerItems(state);
+  const lines: string[] = [];
+  const answerItems = items.filter(it => it.label !== 'Additional context');
+  for (const item of answerItems) {
+    lines.push(state.fields.length === 1 ? `${item.label}\nAnswer: ${item.value}` : `- ${item.label}: ${item.value}`);
+  }
+  const note = items.find(it => it.label === 'Additional context');
+  if (note) {
+    lines.push(lines.length ? `Additional context: ${note.value}` : note.value);
   }
   return lines.join('\n');
 }

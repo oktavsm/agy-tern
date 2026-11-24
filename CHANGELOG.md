@@ -2,6 +2,12 @@
 
 All notable changes to `agy-tern` are documented in this file.
 
+## [0.4.4] - 2026-11-24
+
+### Improved
+- Rendered submitted ACP follow-up (`elicitation`) answers directly in the conversation transcript as a persisted native Tern `<card head="..." meta="Submitted">` (`recordFollowUpResponse` in [src/model.ts](src/model.ts), [src/transcript-view.tsx](src/transcript-view.tsx), [src/history.ts](src/history.ts)) with `<kv>` question/answer rows and a `Copy` button.
+- Prevented duplicate post-turn follow-up popups when an `ask_question` tool call was already answered via ACP elicitation during the same turn ([src/ui.tsx](src/ui.tsx)).
+
 ## [0.4.3] - 2026-11-24
 
 ### Fixed
