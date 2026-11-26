@@ -106,6 +106,26 @@ export async function runCommandInTernSplit(
   return runTernSubcommand(ternPath, args, workdir, '`tern split` timed out.', cleaned);
 }
 
+/** Launch the official `agy` CLI side-by-side inside a Tern split pane (for `/plugin` OAuth sign-in) without closing agy-tern. */
+export async function openOfficialAgyInTernSplit(
+  cwd: string,
+  options: { executable?: string; mode?: 'right' | 'down'; block?: string; ternBin?: string } = {},
+): Promise<TernOpenResult> {
+  const execBin = (options.executable ?? 'agy').trim();
+  if (!execBin || execBin.startsWith('-') || /[\0-\u001f\u007f]/.test(execBin)) {
+    return { ok: false, error: `Invalid agy executable: ${execBin || '(empty)'}` };
+  }
+  const ternPath = options.ternBin ?? Bun.which('tern');
+  if (!ternPath) {
+    return { ok: false, error: '`tern` CLI not found on PATH.' };
+  }
+  const mode = options.mode ?? 'right';
+  const block = options.block?.trim() || process.env.TERN_PANE?.trim() || '@focused';
+  const workdir = resolve(cwd);
+  const args = ['split', block, mode, '--cwd', workdir, '--', execBin, '--sandbox'];
+  return runTernSubcommand(ternPath, args, workdir, '`tern split` timed out.', `${execBin} --sandbox`);
+}
+
 function sanitizeOscText(value: string): string {
   return value.replace(/[\u0000-\u001f\u007f;]/g, ' ').replace(/\s+/g, ' ').trim();
 }

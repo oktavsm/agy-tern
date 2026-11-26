@@ -56,7 +56,7 @@ import {
 } from './history';
 import { SessionNames } from './session-names';
 import { PromptTemplatesStore, type PromptTemplate } from './templates';
-import { openExternalUrl, openInTernSplit, runCommandInTernSplit, sendDesktopNotification, sendTerminalAttention } from './tern-window';
+import { openExternalUrl, openInTernSplit, openOfficialAgyInTernSplit, runCommandInTernSplit, sendDesktopNotification, sendTerminalAttention } from './tern-window';
 import {
   DEFAULT_MODEL_ID,
   DEFAULT_PREFS,
@@ -1716,6 +1716,25 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
     });
   }
 
+  function openOfficialAgySplit(catalogId: string, returnPanel?: 'plugins' | 'mcp'): void {
+    if (quitting) return;
+    void openOfficialAgyInTernSplit(options.cwd, { executable: options.executable }).then(res => {
+      if (quitting) return;
+      if (res.ok) {
+        showToast(
+          `Opened official agy in Tern split (${catalogId})`,
+          'Run /plugin to sign in or add accounts, then click Reload session.',
+        );
+        return;
+      }
+      if (!authBusy && !busy && !permissions.length) {
+        handoffToOfficialAgy(`Sign in to ${catalogId} in official /plugin`, returnPanel);
+      } else {
+        showToast('Could not open official agy split', res.error);
+      }
+    });
+  }
+
   function handoffToOfficialAgy(reason: string, returnPanel?: 'plugins' | 'mcp'): void {
     if (quitting || authBusy || busy || permissions.length) {
       showToast('Wait for current activity to finish before handing off to official agy.');
@@ -3231,6 +3250,7 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
       usageHeatmap,
       usageHeatmapLoading,
       onReloadMcpSession: reloadMcpSession,
+      onSignInPluginSplit: pluginName => openOfficialAgySplit(pluginName, 'plugins'),
       onHandoffOfficialAgy: handoffToOfficialAgy,
       onTriggerCompact: () => {
         closePanel();
@@ -3462,6 +3482,10 @@ export async function runNativeChat(options: AgentOptions, launch?: ChatLaunchSt
         openPanel({ kind: 'plugins' });
         runInstallPlugin(catalogId);
       },
+      onSignInPluginSplit(catalogId) {
+        openOfficialAgySplit(catalogId, 'plugins');
+      },
+      onReloadSession: reloadMcpSession,
       onHandoffOfficialAgy: handoffToOfficialAgy,
       onOpenExternalUrl: openUrlExternally,
     };

@@ -2,6 +2,12 @@
 
 All notable changes to `agy-tern` are documented in this file.
 
+## [0.4.5] - 2026-11-26
+
+### Improved
+- Opened official `agy` side-by-side inside a Tern split pane (`openOfficialAgyInTernSplit` in [src/tern-window.ts](src/tern-window.ts)) from inline `<plugin-card>` widgets (`Sign in (split)`) and the `/plugin` manager (`Sign in / Add account`) so you can sign in or add multiple OAuth accounts without closing `agy-tern` (automatically falling back to full handoff when Tern split is unavailable).
+- Added one-click `Reload session` buttons directly on `<plugin-card>` widgets ([src/transcript-view.tsx](src/transcript-view.tsx)) and in the `/plugin` picker ([src/panels.tsx](src/panels.tsx)) to restart `agy acp` in-place after plugin sign-in and pick up newly authorized accounts immediately, plus multi-account `AGY_ACCOUNT=<email>` hints.
+
 ## [0.4.4] - 2026-11-24
 
 ### Improved

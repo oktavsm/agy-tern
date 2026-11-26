@@ -495,6 +495,8 @@ export interface EntryCallbacks {
   pluginsList?: readonly PluginEntry[];
   onOpenPluginCard?(catalogId: string): void;
   onInstallPluginCard?(catalogId: string): void;
+  onSignInPluginSplit?(catalogId: string): void;
+  onReloadSession?(): void;
   onHandoffOfficialAgy?(reason: string, returnPanel?: 'plugins' | 'mcp'): void;
   onOpenExternalUrl?(url: string): void;
 }
@@ -606,9 +608,17 @@ export function Entry({ entry, continued, streaming, recent, turnNumber, callbac
                   {!installed && callbacks.onInstallPluginCard && <button size="sm" variant="primary" onClick={() => callbacks.onInstallPluginCard?.(card.catalogId)}>
                     Install
                   </button>}
-                  {(installed?.hasAuth || !installed) && callbacks.onHandoffOfficialAgy && <button size="sm" variant="quiet"
-                    onClick={() => callbacks.onHandoffOfficialAgy?.(`Sign in to ${card.catalogId} in official /plugin`, 'plugins')}>
-                    Sign in (official agy)
+                  {(installed?.hasAuth || !installed) && (callbacks.onSignInPluginSplit || callbacks.onHandoffOfficialAgy) && <button size="sm"
+                    variant={installed?.hasAuth ? 'primary' : 'quiet'}
+                    onClick={() => {
+                      if (callbacks.onSignInPluginSplit) callbacks.onSignInPluginSplit(card.catalogId);
+                      else callbacks.onHandoffOfficialAgy?.(`Sign in to ${card.catalogId} in official /plugin`, 'plugins');
+                    }}>
+                    {callbacks.onSignInPluginSplit ? 'Sign in (split)' : 'Sign in (official agy)'}
+                  </button>}
+                  {installed?.hasAuth && callbacks.onReloadSession && <button size="sm" variant="quiet"
+                    onClick={() => callbacks.onReloadSession?.()}>
+                    Reload session
                   </button>}
                 </row>
               </col>

@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { buildAttentionSequence, isSafeExternalUrl, openExternalUrl, openInTernSplit, resolveTernTarget, runCommandInTernSplit, sendDesktopNotification, sendTerminalAttention } from '../src/tern-window';
+import { buildAttentionSequence, isSafeExternalUrl, openExternalUrl, openInTernSplit, openOfficialAgyInTernSplit, resolveTernTarget, runCommandInTernSplit, sendDesktopNotification, sendTerminalAttention } from '../src/tern-window';
 
 const dirs: string[] = [];
 
@@ -59,6 +59,17 @@ exit 0
 
     const emptyCmd = await runCommandInTernSplit(dir, '   ', { ternBin: fakeTern });
     expect(emptyCmd.ok).toBe(false);
+
+    const agySplit = await openOfficialAgyInTernSplit(dir, { block: '@focused', ternBin: fakeTern });
+    expect(agySplit).toEqual({ ok: true, target: 'agy --sandbox' });
+    expect(await readFile(logFile, 'utf8')).toContain(`split @focused right --cwd ${dir} -- agy --sandbox`);
+
+    const customAgySplit = await openOfficialAgyInTernSplit(dir, { executable: '/usr/local/bin/agy', mode: 'down', block: '@focused', ternBin: fakeTern });
+    expect(customAgySplit).toEqual({ ok: true, target: '/usr/local/bin/agy --sandbox' });
+    expect(await readFile(logFile, 'utf8')).toContain(`split @focused down --cwd ${dir} -- /usr/local/bin/agy --sandbox`);
+
+    const badAgySplit = await openOfficialAgyInTernSplit(dir, { executable: '--bad', ternBin: fakeTern });
+    expect(badAgySplit.ok).toBe(false);
   });
 
   test('sanitizes and emits OSC 9 attention sequence only on TTY streams', () => {

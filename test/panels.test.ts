@@ -656,10 +656,14 @@ describe('panel renderers & transcript view helpers', () => {
       authClis: ['gdrive'],
       suggestedPrompts: ['Find Q3 budget'],
     }];
+    pluginsAuthCtx.onSignInPluginSplit = () => {};
+    pluginsAuthCtx.onReloadMcpSession = () => {};
     pluginsAuthCtx.onHandoffOfficialAgy = () => {};
     const pluginsAuthJson = JSON.stringify(renderActivePanel(pluginsAuthCtx));
     expect(pluginsAuthJson).toContain('Google Drive (gdrive)');
-    expect(pluginsAuthJson).toContain('Sign in / Accounts');
+    expect(pluginsAuthJson).toContain('Sign in / Add account');
+    expect(pluginsAuthJson).toContain('Reload session');
+    expect(pluginsAuthJson).toContain('AGY_ACCOUNT=<email>');
     expect(pluginsAuthJson).toContain('Import');
 
     const mcpReloadCtx = baseContext({ kind: 'mcp' });

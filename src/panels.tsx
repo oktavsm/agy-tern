@@ -260,6 +260,7 @@ export interface PanelRenderContext {
   usageHeatmap?: UsageHeatmapData;
   usageHeatmapLoading?: boolean;
   onReloadMcpSession?(): void;
+  onSignInPluginSplit?(pluginName: string): void;
   onHandoffOfficialAgy?(reason: string, returnPanel?: 'plugins' | 'mcp'): void;
   onTriggerCompact?(): void;
   draftBudget?: DraftContextBudget;
@@ -1223,7 +1224,8 @@ function renderPluginsPicker(ctx: PanelRenderContext): JSX.Element {
     preview={highlighted ? 'below' : 'none'}
     actions={[
       { id: 'refresh', label: 'Refresh', disabled: ctx.extLoading ? (true as const) : undefined },
-      ...(highlighted?.hasAuth && ctx.onHandoffOfficialAgy ? [{ id: 'signin', label: 'Sign in / Accounts', disabled: ctx.extLoading || ctx.busy ? (true as const) : undefined }] : []),
+      ...(highlighted?.hasAuth && (ctx.onSignInPluginSplit || ctx.onHandoffOfficialAgy) ? [{ id: 'signin', label: 'Sign in / Add account', disabled: ctx.extLoading ? (true as const) : undefined }] : []),
+      ...(ctx.onReloadMcpSession ? [{ id: 'reload', label: 'Reload session', disabled: ctx.extLoading || ctx.busy ? (true as const) : undefined }] : []),
       ...(highlighted?.enabled && highlighted.skills.length ? [{ id: 'useSkill', label: `Use /${highlighted.skills[0]}`, disabled: ctx.extLoading ? (true as const) : undefined }] : []),
       { id: 'validate', label: 'Validate', disabled: !highlighted?.path || ctx.extLoading ? (true as const) : undefined },
       { id: 'install', label: 'Install', disabled: ctx.extLoading ? (true as const) : undefined },
@@ -1242,8 +1244,11 @@ function renderPluginsPicker(ctx: PanelRenderContext): JSX.Element {
       },
       refresh: () => ctx.onLoadExtensions('plugins'),
       signin: () => {
-        if (highlighted) ctx.onHandoffOfficialAgy?.(`Sign in or manage accounts for "${highlighted.name}" in official /plugin`, 'plugins');
+        if (!highlighted) return;
+        if (ctx.onSignInPluginSplit) ctx.onSignInPluginSplit(highlighted.name);
+        else ctx.onHandoffOfficialAgy?.(`Sign in or manage accounts for "${highlighted.name}" in official /plugin`, 'plugins');
       },
+      reload: () => ctx.onReloadMcpSession?.(),
       useSkill: () => {
         const skillName = highlighted?.skills[0];
         if (!skillName) return;
@@ -1272,7 +1277,7 @@ function renderPluginsPicker(ctx: PanelRenderContext): JSX.Element {
         { k: 'Plugin', v: `${highlighted.displayName ? `${highlighted.displayName} (${highlighted.name})` : highlighted.name}${highlighted.version ? ` v${highlighted.version}` : ''}` },
         { k: 'Status', v: highlighted.enabled ? 'Enabled' : 'Disabled' },
         ...(highlighted.description ? [{ k: 'About', v: highlighted.description }] : []),
-        ...(highlighted.hasAuth ? [{ k: 'Accounts', v: `OAuth2 (${highlighted.authProviders?.join(', ') ?? 'provider'})${highlighted.authClis?.length ? ` · CLI: ${highlighted.authClis.join(', ')}` : ''} · Use "Sign in / Accounts" for multi-account OAuth` }] : []),
+        ...(highlighted.hasAuth ? [{ k: 'Accounts', v: `OAuth2 (${highlighted.authProviders?.join(', ') ?? 'provider'})${highlighted.authClis?.length ? ` · CLI: ${highlighted.authClis.join(', ')}` : ''} · Multi-account: AGY_ACCOUNT=<email> · Click "Sign in / Add account", then "Reload session"` }] : []),
         ...(highlighted.source ? [{ k: 'Source', v: highlighted.source }] : []),
         { k: 'Path', v: highlighted.path || 'Not reported' },
         ...(highlighted.rules.length ? [{ k: 'Rules', v: highlighted.rules.join(', ') }] : []),
